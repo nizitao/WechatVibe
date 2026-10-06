@@ -4,7 +4,7 @@
 
 ## 内嵌 Laya 源码
 
-`electron/laya/` 中的 `types.ts`、`pyjson.ts`、`tokenizer.ts`、`questions.ts`、`prompt.ts`、`calibration.ts` 和 `agent.ts` 来自 [mizchi/laya-mlx](https://github.com/mizchi/laya-mlx) 的 `web/packages/laya-web/src`，提交 `dc3aa6b150cb861d0788fbd421cfd1303de4ed57`。上游采用 Apache-2.0；完整条款和上游声明保留在 [electron/laya/LICENSE](electron/laya/LICENSE) 与 [electron/laya/NOTICE](electron/laya/NOTICE)。这些文件的相对 import 扩展名和来源头注释经过适配；目录中其余 TypeScript 文件为本项目实现。
+`electron/laya/` 中的 `types.ts`、`pyjson.ts`、`tokenizer.ts`、`questions.ts`、`prompt.ts`、`calibration.ts` 和 `agent.ts` 来自 [mizchi/laya-mlx](https://github.com/mizchi/laya-mlx) 的 `web/packages/laya-web/src`，提交 `dc3aa6b150cb861d0788fbd421cfd1303de4ed57`。上游采用 Apache-2.0；完整条款和上游声明保留在 [electron/laya/LICENSE](electron/laya/LICENSE) 与 [electron/laya/NOTICE](electron/laya/NOTICE)。这些文件的相对 import 扩展名和来源头注释经过适配；其中 `tokenizer.ts`、`prompt.ts`、`agent.ts`另有不改变 token id 的本地性能改动（`encode` 记忆化、复用已编码的 state），逐项列在各自文件头与 NOTICE 中；目录中其余 TypeScript 文件为本项目实现。
 
 ## 分析模型
 

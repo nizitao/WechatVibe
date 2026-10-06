@@ -6,9 +6,8 @@ Vendored from laya-mlx (Apache-2.0):
   Source revision: dc3aa6b150cb861d0788fbd421cfd1303de4ed57
   Source directory: web/packages/laya-web/src
 
-The following seven files are copied from that revision with only import
-specifier changes ("./x.ts" -> "./x", see README.md) and a provenance header
-added:
+The following seven files are copied from that revision with import specifier
+changes ("./x.ts" -> "./x", see README.md) and a provenance header added:
 
   types.ts
   pyjson.ts
@@ -17,6 +16,19 @@ added:
   prompt.ts
   calibration.ts
   agent.ts
+
+Three of them carry local, behaviour-preserving changes on top of that, each
+listed in its own provenance header:
+
+  tokenizer.ts  `encode` memoizes its result in a bounded FIFO cache; the
+                per-character `\p{White_Space}` regex became an equivalent
+                code-point test; token accumulation uses index loops.
+  prompt.ts     `buildSequence` accepts optional precomputed state ids.
+  agent.ts      `prepare` encodes the shared state once and passes the ids to
+                `buildSequence` instead of re-encoding per question.
+
+Token ids, sequences and answers are unchanged; `tests/laya-tokenizer.test.ts`
+pins that.
 
 The tokenizer/sequence/answer parity test fixture
 (tests/fixtures/laya-parity-multilingual.json) is also copied from that

@@ -1,7 +1,9 @@
 // Vendored from laya-mlx (Apache-2.0).
 // Source: https://github.com/mizchi/laya-mlx @ dc3aa6b150cb861d0788fbd421cfd1303de4ed57
 // Path: web/packages/laya-web/src/prompt.ts
-// Modified: relative imports made extensionless ("./x.ts" -> "./x"). Logic unchanged.
+// Modified: relative imports made extensionless ("./x.ts" -> "./x"). `buildSequence` takes an
+// optional precomputed state id list so a caller preparing many questions against one state
+// encodes that state once instead of once per question. Logic otherwise unchanged.
 
 import { pyJson } from "./pyjson";
 import { renderOptions } from "./questions";
@@ -58,20 +60,26 @@ export function buildPrefix(
   return { ids, markers };
 }
 
-/** Python `build_sequence`: prefix + state tokens (right-truncated) + [SEP], capped at maxLen. */
+/**
+ * Python `build_sequence`: prefix + state tokens (right-truncated) + [SEP], capped at maxLen.
+ *
+ * `stateIds` is the already-encoded `serializeState(state)` with the mask token blanked. It is
+ * an optimization hook only: pass it when the same state is being encoded for several
+ * questions. It is sliced, never mutated, so the caller's array stays intact.
+ */
 export function buildSequence(
   tokenizer: LayaTokenizer,
   state: State,
   q: InternalQuestion,
   maxLen: number,
   headMaxLen: number,
+  stateIds?: number[],
 ): PreparedItem {
   const prefix = buildPrefix(tokenizer, q, headMaxLen);
   const room = Math.max(0, maxLen - prefix.ids.length - 1);
-  const stateIds = tokenizer
-    .encode(serializeState(state).replaceAll(tokenizer.maskToken, " "))
-    .slice(0, room);
-  const ids = [...prefix.ids, ...stateIds, tokenizer.sepTokenId].slice(0, maxLen);
+  const encoded = stateIds ?? tokenizer.encode(serializeState(state).replaceAll(tokenizer.maskToken, " "));
+  const stateSlice = encoded.slice(0, room);
+  const ids = [...prefix.ids, ...stateSlice, tokenizer.sepTokenId].slice(0, maxLen);
   return { ids, markers: prefix.markers.filter((m) => m < maxLen), qtype: QTYPES[q.t] };
 }
 
