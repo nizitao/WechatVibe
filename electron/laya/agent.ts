@@ -1,10 +1,12 @@
 // Vendored from laya-mlx (Apache-2.0).
 // Source: https://github.com/mizchi/laya-mlx @ dc3aa6b150cb861d0788fbd421cfd1303de4ed57
 // Path: web/packages/laya-web/src/agent.ts
-// Modified: relative imports made extensionless ("./x.ts" -> "./x"). Logic unchanged.
+// Modified: relative imports made extensionless ("./x.ts" -> "./x"). `prepare` encodes the
+// state once and passes the ids to every `buildSequence` call instead of re-encoding the same
+// text per question. Answers and sequences are unchanged.
 
 import { formatAnswers } from "./calibration";
-import { buildSequence, collate } from "./prompt";
+import { buildSequence, collate, serializeState } from "./prompt";
 import { renderOptions, toInternal } from "./questions";
 import type { LayaTokenizer } from "./tokenizer";
 import type {
@@ -67,6 +69,11 @@ export class LayaAgent {
     }
     const items: PreparedItem[] = [];
     const internal: InternalQuestion[] = [];
+    // Every question embeds the same state, so encode it once and hand the ids to each
+    // `buildSequence`. `buildSequence` only slices them.
+    const stateIds = this.tokenizer.encode(
+      serializeState(state).replaceAll(this.tokenizer.maskToken, " "),
+    );
     for (const [qid, definition] of Object.entries(questions)) {
       const q = toInternal(definition);
       const item = buildSequence(
@@ -75,6 +82,7 @@ export class LayaAgent {
         q,
         this.config.max_len,
         this.config.head_max_len,
+        stateIds,
       );
       if (item.markers.length !== renderOptions(q).length) {
         throw new Error(
