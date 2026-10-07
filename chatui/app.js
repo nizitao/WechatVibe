@@ -61,7 +61,7 @@ function getVisibleUnreadCount(session) {
   if (hasNewTime || hasNewPreview) return serverUnread;
   return 0;
 }
-const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false };
+const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false, analyzeSelfStyle: false };
 const CURRENT_LABEL_SCHEMA = "generic-v9";
 const GENERIC_INTENT_LABELS = Object.freeze({
   small_talk: "闲聊", share_news: "分享", ask_question: "提问", seek_help: "求助", deny: "否认",
@@ -101,6 +101,9 @@ if (typeof settingsState.settings.intent !== "boolean") settingsState.settings.i
 // Analysing every added chat in the background is opt-in: it can keep the CPU or GPU busy
 // for hours on a large account.
 if (typeof settingsState.settings.backgroundAnalyze !== "boolean") settingsState.settings.backgroundAnalyze = false;
+// Reading and advising on the user's own dialogue style costs an extra judgement and
+// is opt-in; when it is off the advice only ever describes the other person.
+if (typeof settingsState.settings.analyzeSelfStyle !== "boolean") settingsState.settings.analyzeSelfStyle = false;
 const save = () => localStorage.setItem("real-ui-settings-1", JSON.stringify(settingsState.settings));
 chatState.sessions = new Map();
 chatState.selectedConversations = new Set();
@@ -415,6 +418,7 @@ function placeReplyPrediction(scroll = true) {
 function resetAccountView(message = "当前微信账号未就绪", preserveOtherCaches = false) {
   cancelApiInsightWork();
   cancelApiPortraitPoll();
+  cancelGuidancePoll();
   clearTimeout(startupAccountRetryTimer);
   startupAccountRetryTimer = null;
   clearInlineIntentPending();
@@ -781,6 +785,7 @@ function clearUnselectedConversation() {
     portraitState.profileGeneration++;
     cancelApiInsightWork();
     cancelApiPortraitPoll();
+    cancelGuidancePoll();
     chatState.currentUser = null;
     chatState.messages = [];
     labelState.results = {};
@@ -890,8 +895,13 @@ settingsState.analysisOverviewSnapshot = null;
 settingsState.workerSettings = null;
 async function backgroundAnalyzeAll() {
   if (settingsState.sweepBusy || !settingsState.settings.backgroundAnalyze) return;
-  if (!canAnalyzeLocal() || !chatState.messageSourceReady || chatState.historyState ||
-      !chatState.selectionLoadedAccount ||
+  if (!chatState.messageSourceReady || chatState.historyState ||
+      !chatState.selectionLoadedAccount) return;
+  // API mode has no worker pool and needs no per-conversation read here: the bridge knows
+  // which messages still lack labels and answers a repeated POST with the running job, so
+  // one cheap POST per conversation is enough to keep several provider turns in flight.
+  if (usingApiInsights()) return sweepApiInsights();
+  if (!canAnalyzeLocal() ||
       settingsState.suppressedLocalAccounts.has(chatState.currentAccount)) return;
   const account = chatState.currentAccount;
   settingsState.sweepBusy = true;
@@ -916,6 +926,38 @@ async function backgroundAnalyzeAll() {
   } finally {
     settingsState.sweepBusy = false;
     void loadAnalysisOverview();
+  }
+}
+// Messages per conversation an API sweep asks for. The bridge picks the ones that still
+// lack labels, so this is a ceiling rather than a batch size.
+const API_SWEEP_WINDOW = 80;
+function usingApiInsights() {
+  return settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api" &&
+    !!settingsState.settings.intent;
+}
+function apiInsightSweepSourceKey() {
+  return JSON.stringify([chatState.currentAccount, settingsState.modelSourceSnapshot.sourceId]);
+}
+async function sweepApiInsights() {
+  if (settingsState.suppressedApiSources.has(apiInsightSweepSourceKey())) return;
+  const account = chatState.currentAccount;
+  // The conversation being read goes first; it already has a foreground request, and the
+  // bridge answers a repeated POST for it with that same job.
+  const order = [...chatState.sessions.keys()];
+  if (chatState.currentUser && order.includes(chatState.currentUser)) {
+    order.splice(order.indexOf(chatState.currentUser), 1);
+    order.unshift(chatState.currentUser);
+  }
+  for (const id of order) {
+    if (!settingsState.settings.backgroundAnalyze || !usingApiInsights() ||
+        account !== chatState.currentAccount ||
+        settingsState.suppressedApiSources.has(apiInsightSweepSourceKey())) return;
+    if (!chatState.selectedConversations.has(id)) continue;
+    try {
+      await api("/api/model-insights", { method: "POST", body: JSON.stringify({
+        account, user: id, limit: API_SWEEP_WINDOW,
+      }) });
+    } catch { /* one broken conversation must not stop the sweep */ }
   }
 }
 // Whole-account progress behind the sidebar bar: how many conversations the local
@@ -1020,6 +1062,50 @@ async function changeWorkerSettings(delta, elastic) {
     return;
   }
   renderWorkerSettings();
+}
+// How many API provider turns may run at once. The bridge owns the analyzer pool and
+// steps it down on provider rate limits; this row only mirrors and edits the ceiling.
+async function loadApiWorkerSettings() {
+  try {
+    settingsState.apiWorkerSettings = await api("/api/api-workers");
+  } catch {
+    settingsState.apiWorkerSettings = null;
+  }
+  renderApiWorkerSettings();
+}
+function renderApiWorkerSettings() {
+  const hint = byId("apiWorkerLimitHint");
+  if (!hint) return;
+  const row = hint.parentElement;
+  const settings = settingsState.apiWorkerSettings;
+  if (!settings) {
+    byId("apiWorkerValue").textContent = "\u2014";
+    row.classList.remove("show");
+    return;
+  }
+  byId("apiWorkerValue").textContent = String(settings.workers);
+  byId("btnApiWorkerMinus").disabled = settings.workers <= 1;
+  byId("btnApiWorkerPlus").disabled = settings.workers >= (settings.max || 4);
+  row.classList.add("show");
+  const live = Number(settings.limit) > 1 && Number(settings.limit) < Number(settings.workers)
+    ? "\u5f53\u524d " + settings.limit + " / " + settings.workers + " \u8def\uff08\u9047\u5230\u63a5\u53e3\u9650\u6d41\u81ea\u52a8\u964d\u6863\uff09"
+    : "\u56fa\u5b9a " + settings.workers + " \u8def\u5e76\u884c";
+  hint.textContent = (Number(settings.workers) > 1
+    ? "\u591a\u4e2a\u4f1a\u8bdd\u540c\u65f6\u8bf7\u6c42\u63a5\u53e3\uff0c\u5e76\u884c\u8d8a\u9ad8\u8d8a\u5bb9\u6613\u89e6\u53d1\u4f9b\u5e94\u5546\u9650\u6d41\uff1b"
+    : "\u5355\u8def\u6700\u7701\u8d44\u6e90\uff1b") + live + "\u3002";
+}
+async function changeApiWorkerSettings(delta) {
+  const current = settingsState.apiWorkerSettings;
+  if (!current) return;
+  const max = current.max || 4;
+  const workers = Math.max(1, Math.min(max, (Number(current.workers) || 1) + delta));
+  try {
+    settingsState.apiWorkerSettings = await api("/api/api-workers", { method: "POST",
+      body: JSON.stringify({ workers }) });
+  } catch {
+    return;
+  }
+  renderApiWorkerSettings();
 }
 function showChatEmptyState() {
   const container = byId("chatMessages");
@@ -2210,6 +2296,7 @@ function switchView(target) {
   if (target === "persona" && (!chatState.messageSourceReady || !chatState.currentUser)) return;
   if (target !== "chat") clearReplyPrediction();
   if (target !== "persona") cancelApiPortraitPoll();
+  if (target !== "persona") cancelGuidancePoll();
   chatState.view = target;
   byId("chatView").classList.toggle("active", target === "chat");
   byId("personaView").classList.toggle("active", target === "persona");
@@ -3307,6 +3394,7 @@ byId("btnRetryApiPortrait").addEventListener("click", () => {
 async function loadProfile(member = "", retry = false) {
   if (!chatState.currentUser || !settingsState.modelSourceResolved) return;
   const apiMode = syncPortraitMode();
+  syncGuidanceMode();
   const token = ++portraitState.profileGeneration;
   const account = chatState.currentAccount;
   const user = chatState.currentUser;
@@ -3316,7 +3404,9 @@ async function loadProfile(member = "", retry = false) {
   if (chatState.sessions.get(user)?.isGroup) rememberProfileMember(account, user, member);
   if (apiMode) {
     portraitState.profilePending = false;
+    cancelGuidancePoll();
     void loadApiPortrait(member);
+    void loadGuidance();
     return;
   }
   if (key !== portraitState.renderedProfileKey) {
@@ -3381,9 +3471,324 @@ function applySettings() {
   byId("btnToggleBackgroundAnalyze").classList.toggle("active", settingsState.settings.backgroundAnalyze);
   byId("btnToggleBackgroundAnalyze").setAttribute("aria-pressed", String(settingsState.settings.backgroundAnalyze));
   byId("btnToggleBackgroundAnalyze").textContent = settingsState.settings.backgroundAnalyze ? "已开启" : "已关闭";
+  byId("chkAnalyzeSelfStyle").checked = settingsState.settings.analyzeSelfStyle;
+  text("analyzeSelfStyleState", settingsState.settings.analyzeSelfStyle ? "已开启" : "已关闭");
   if (settingsState.analysisOverviewSnapshot) renderAnalysisOverview(settingsState.analysisOverviewSnapshot);
   refreshLabels();
+  // A saved result carries the switch it was produced with, so the memo is dropped and
+  // the next read redraws the card instead of leaving a stale self block on screen.
+  portraitState.guidanceRenderedKey = null;
 }
+
+// ---------------------------------------------------------------------------
+// Deep semantic reading + scenario simulation (API mode)
+// One provider turn produces both, so the per-message reading and the advice beside
+// it always describe the same conversation. The card only exists in API mode.
+// ---------------------------------------------------------------------------
+const GUIDANCE_VERSION = "api-guidance-v1";
+const GUIDANCE_SCENARIOS = ["general", "leader"];
+const GUIDANCE_POLARITIES = ["positive", "neutral", "negative", "mixed"];
+const GUIDANCE_STATUSES = ["ok", "uncertain", "insufficient"];
+const GUIDANCE_POLARITY_LABELS = { positive: "偏正面", neutral: "中性", negative: "偏负面", mixed: "好坏参半" };
+const GUIDANCE_ERRORS = {
+  "context-too-long": "模型不支持当前请求上下文，请调整设置中的上下文大小",
+  "invalid-output": "模型返回格式不正确", "invalid-guidance": "模型返回的分析结果不完整",
+  "guidance-version-invalid": "分析规则已更新，请重新分析",
+  "invalid-request": "当前请求超出分析范围",
+  "timeout": "模型响应超时", "rate-limit": "接口请求受限", "empty-response": "模型未返回内容",
+  "response-too-large": "模型返回内容过长", "auth": "API Key 无效", "network": "网络连接失败",
+  "provider-error": "模型服务返回错误", "model-source-changed": "模型来源已切换",
+};
+const guidanceSubtextLimit = 6;
+portraitState.guidanceSnapshot = null;
+portraitState.guidanceRendered = null;
+portraitState.guidanceRenderedKey = null;
+portraitState.guidanceRequest = 0;
+portraitState.guidancePollTimer = null;
+portraitState.guidanceLoadingKey = null;
+portraitState.guidanceBusy = false;
+portraitState.guidanceSubmitError = "";
+portraitState.guidanceScenario = "general";
+
+function guidanceScopeKey() {
+  return JSON.stringify([chatState.currentAccount, chatState.currentUser,
+    settingsState.modelSourceSnapshot.sourceId, portraitState.activeMember || chatState.currentUser]);
+}
+function guidanceText(value, maximum) {
+  return typeof value === "string" ? value.trim().slice(0, maximum) : "";
+}
+// Shape check only. The backend already validated the payload against the stored
+// contract; this keeps a stale or foreign response from reaching the renderer.
+function normalizeGuidance(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.version !== GUIDANCE_VERSION || !GUIDANCE_SCENARIOS.includes(value.scenario) ||
+      typeof value.analyzeSelf !== "boolean" || !Array.isArray(value.subtexts) ||
+      !value.subtexts.length || value.subtexts.length > 12) return null;
+  const subtexts = [];
+  const seen = new Set();
+  for (const item of value.subtexts) {
+    if (!item || typeof item !== "object" || typeof item.id !== "string" || !item.id ||
+        seen.has(item.id) || !GUIDANCE_STATUSES.includes(item.status)) return null;
+    seen.add(item.id);
+    if (item.status !== "ok") { subtexts.push({ id: item.id, status: item.status }); continue; }
+    const sentiment = item.sentiment && typeof item.sentiment === "object" &&
+      GUIDANCE_POLARITIES.includes(item.sentiment.polarity)
+      ? { polarity: item.sentiment.polarity, label: guidanceText(item.sentiment.label, 6) } : null;
+    const surface = guidanceText(item.surface, 24);
+    const implied = guidanceText(item.implied, 48);
+    const tactic = guidanceText(item.tactic, 10);
+    if (!surface && !implied && !tactic && !sentiment) return null;
+    subtexts.push({ id: item.id, status: "ok", surface, implied, tactic, sentiment });
+  }
+  const advice = value.advice;
+  if (!advice || typeof advice !== "object" || Array.isArray(advice)) return null;
+  const others = advice.forOthers;
+  if (!others || typeof others !== "object" || Array.isArray(others) ||
+      !Array.isArray(others.strategies) || !others.strategies.length || others.strategies.length > 4 ||
+      !Array.isArray(others.replies) || !others.replies.length || others.replies.length > 3) return null;
+  const reading = guidanceText(others.reading, 80);
+  const strategies = others.strategies.map(item => guidanceText(item, 48)).filter(Boolean);
+  if (!reading || !strategies.length) return null;
+  const replies = [];
+  for (const reply of others.replies) {
+    const text = reply && typeof reply === "object" ? guidanceText(reply.text, 90) : "";
+    if (!text) return null;
+    replies.push({ tone: guidanceText(reply.tone, 8), text });
+  }
+  const forOthers = { reading, strategies, replies };
+  let forSelf = null;
+  if (value.analyzeSelf) {
+    const self = advice.forSelf;
+    if (!self || typeof self !== "object" || Array.isArray(self) || !Array.isArray(self.strengths) ||
+        !Array.isArray(self.improvements) || !self.strengths.length || self.strengths.length > 3 ||
+        !self.improvements.length || self.improvements.length > 3) return null;
+    const summary = guidanceText(self.summary, 80);
+    const strengths = self.strengths.map(item => guidanceText(item, 36)).filter(Boolean);
+    const improvements = self.improvements.map(item => guidanceText(item, 36)).filter(Boolean);
+    if (!summary || !strengths.length || !improvements.length) return null;
+    forSelf = { summary, strengths, improvements };
+  } else if (advice.forSelf !== null && advice.forSelf !== undefined) return null;
+  return { scenario: value.scenario, analyzeSelf: value.analyzeSelf, subtexts, advice: { forOthers, forSelf } };
+}
+function guidanceGroup(title) {
+  const group = element("div", "guidance-group");
+  group.appendChild(element("div", "guidance-group-title", title));
+  return group;
+}
+function guidanceBullets(items) {
+  const list = element("ul", "guidance-points");
+  for (const item of items) list.appendChild(element("li", "", item));
+  return list;
+}
+function renderGuidanceBody(guidance) {
+  const container = byId("guidanceBody");
+  container.replaceChildren();
+  portraitState.guidanceRendered = guidance;
+  if (!guidance) {
+    container.appendChild(element("div", "guidance-empty", "还没有分析结果，点击“开始分析”生成潜台词解读与沟通建议。"));
+    return;
+  }
+  const readable = guidance.subtexts.filter(item => item.status === "ok");
+  if (readable.length) {
+    const group = guidanceGroup(`潜台词解读 · 最近 ${Math.min(readable.length, guidanceSubtextLimit)} 条`);
+    const list = element("div", "guidance-subtexts");
+    for (const item of readable.slice(-guidanceSubtextLimit)) {
+      const row = element("div", "guidance-subtext");
+      row.dataset.status = item.status;
+      const meta = element("div", "guidance-subtext-meta");
+      if (item.tactic) meta.appendChild(element("span", "guidance-tag", item.tactic));
+      if (item.sentiment) {
+        const tag = element("span", "guidance-tag",
+          item.sentiment.label || GUIDANCE_POLARITY_LABELS[item.sentiment.polarity] || "");
+        tag.dataset.polarity = item.sentiment.polarity;
+        meta.appendChild(tag);
+      }
+      if (meta.childNodes.length) row.appendChild(meta);
+      if (item.surface) {
+        const line = element("div", "guidance-subtext-row");
+        line.append(element("b", "", "表层"), document.createTextNode(item.surface));
+        row.appendChild(line);
+      }
+      if (item.implied) {
+        const line = element("div", "guidance-subtext-row");
+        line.append(element("b", "", "真实意图"), document.createTextNode(item.implied));
+        row.appendChild(line);
+      }
+      list.appendChild(row);
+    }
+    group.appendChild(list);
+    container.appendChild(group);
+  }
+  const others = guidanceGroup("针对他人");
+  others.appendChild(element("div", "guidance-reading", guidance.advice.forOthers.reading));
+  others.appendChild(guidanceBullets(guidance.advice.forOthers.strategies));
+  const replies = element("ul", "guidance-replies");
+  for (const reply of guidance.advice.forOthers.replies) {
+    const item = element("li", "guidance-reply");
+    if (reply.tone) item.appendChild(element("div", "guidance-reply-tone", reply.tone));
+    item.appendChild(element("div", "guidance-reply-text", reply.text));
+    replies.appendChild(item);
+  }
+  others.appendChild(replies);
+  container.appendChild(others);
+  // The two sets stay separate: the self block exists only when the switch is on.
+  if (guidance.advice.forSelf) {
+    const self = guidanceGroup("针对自己");
+    self.appendChild(element("div", "guidance-reading", guidance.advice.forSelf.summary));
+    self.appendChild(element("div", "guidance-subtext-row", "做得好的地方"));
+    self.appendChild(guidanceBullets(guidance.advice.forSelf.strengths));
+    self.appendChild(element("div", "guidance-subtext-row", "可以调整的地方"));
+    self.appendChild(guidanceBullets(guidance.advice.forSelf.improvements));
+    container.appendChild(self);
+  }
+}
+function renderGuidance(data) {
+  const scope = guidanceScopeKey();
+  portraitState.guidanceSnapshot = { ...data, _scope: scope };
+  const job = data.job || {};
+  const running = ["queued", "running"].includes(job.status);
+  const guidance = normalizeGuidance(data.guidance);
+  const key = JSON.stringify([scope, guidance, job.status, job.error || ""]);
+  if (portraitState.guidanceRenderedKey !== key) {
+    renderGuidanceBody(guidance);
+    portraitState.guidanceRenderedKey = key;
+  }
+  let state = "";
+  if (data.suspended) state = "分析缓存已暂停";
+  else if (job.status === "error") state = GUIDANCE_ERRORS[job.error] || "分析失败，请重试";
+  else if (running) state = "正在分析潜台词与沟通建议…";
+  else if (job.status === "insufficient") state = "暂无对方文本，无法分析潜台词";
+  else if (guidance) state = guidance.scenario === "leader" ? "与领导／上级 · 已更新" : "普通联系人 · 已更新";
+  else state = "待分析";
+  text("guidanceStatus", state);
+  text("guidanceBadge", guidance ? (guidance.analyzeSelf ? "含自我分析" : "仅对方") : "待分析");
+  const run = byId("btnRunGuidance");
+  const recompute = byId("btnRecomputeGuidance");
+  run.hidden = running || !!portraitState.guidanceSubmitError;
+  run.disabled = running || portraitState.guidanceBusy;
+  // Recompute needs a previous result to compare against; otherwise the same button
+  // would ask for feedback before anything has been generated.
+  recompute.hidden = running || !guidance;
+  recompute.disabled = running || portraitState.guidanceBusy;
+}
+function syncGuidanceMode() {
+  const apiMode = settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api";
+  byId("guidanceCard").hidden = !apiMode;
+  if (apiMode) byId("selectGuidanceScenario").value = portraitState.guidanceScenario;
+  if (!apiMode) {
+    cancelGuidancePoll();
+    portraitState.guidanceSnapshot = null;
+    portraitState.guidanceRendered = null;
+    portraitState.guidanceRenderedKey = null;
+    portraitState.guidanceSubmitError = "";
+    byId("guidanceBody").replaceChildren();
+    text("guidanceStatus", "");
+  }
+  return apiMode;
+}
+function cancelGuidancePoll() {
+  ++portraitState.guidanceRequest;
+  clearTimeout(portraitState.guidancePollTimer);
+  portraitState.guidancePollTimer = null;
+  portraitState.guidanceLoadingKey = null;
+}
+async function loadGuidance() {
+  if (!chatState.currentUser || !chatState.currentAccount ||
+      !settingsState.modelSourceResolved || settingsState.modelSourceSnapshot.mode !== "api") return;
+  const account = chatState.currentAccount, user = chatState.currentUser, member = portraitState.activeMember;
+  const sourceId = settingsState.modelSourceSnapshot.sourceId;
+  const loadingKey = guidanceScopeKey();
+  if (portraitState.guidanceLoadingKey === loadingKey) return;
+  portraitState.guidanceLoadingKey = loadingKey;
+  const token = ++portraitState.guidanceRequest;
+  const params = new URLSearchParams({ user });
+  if (member) params.set("member", member);
+  try {
+    const data = await api("/api/model-guidance?" + params, {}, chatState.controller?.signal);
+    if (token !== portraitState.guidanceRequest || loadingKey !== guidanceScopeKey()) return;
+    if (!data || data.account !== account || data.sourceId !== sourceId ||
+        data.subject !== (member || user) || data.version !== GUIDANCE_VERSION) throw new Error("分析数据无效");
+    renderGuidance(data);
+    if (data.suspended || ["queued", "running"].includes(data.job?.status))
+      portraitState.guidancePollTimer = setTimeout(() => { void loadGuidance(); }, 2200);
+  } catch (error) {
+    if (token === portraitState.guidanceRequest && error?.name !== "AbortError") {
+      text("guidanceStatus", "分析读取失败，请稍后重试");
+      byId("btnRunGuidance").hidden = false;
+      byId("btnRunGuidance").disabled = false;
+    }
+  } finally {
+    if (portraitState.guidanceLoadingKey === loadingKey) portraitState.guidanceLoadingKey = null;
+  }
+}
+async function startGuidance(feedback = "") {
+  const account = chatState.currentAccount, user = chatState.currentUser;
+  const member = portraitState.activeMember, sourceId = settingsState.modelSourceSnapshot.sourceId;
+  if (!account || !user || settingsState.modelSourceSnapshot.mode !== "api" || portraitState.guidanceBusy) return;
+  portraitState.guidanceBusy = true;
+  portraitState.guidanceSubmitError = "";
+  byId("btnRunGuidance").disabled = true;
+  byId("btnRecomputeGuidance").disabled = true;
+  text("guidanceStatus", feedback ? "正在按你的反馈重新生成…" : "正在提交分析…");
+  try {
+    const body = { account, user, scenario: portraitState.guidanceScenario,
+      analyzeSelf: settingsState.settings.analyzeSelfStyle };
+    if (member) body.member = member;
+    const note = guidanceText(feedback, 400);
+    if (note) body.feedback = note;
+    const data = await api("/api/model-guidance", { method: "POST", body: JSON.stringify(body) });
+    if (account !== chatState.currentAccount || user !== chatState.currentUser ||
+        sourceId !== settingsState.modelSourceSnapshot.sourceId) return;
+    if (data?.account !== account || data.sourceId !== sourceId) throw new Error("分析任务不匹配");
+    cancelGuidancePoll();
+    await loadGuidance();
+  } catch (error) {
+    if (account !== chatState.currentAccount || user !== chatState.currentUser) return;
+    const reason = modelSourceRequestError(error);
+    portraitState.guidanceSubmitError = reason;
+    text("guidanceStatus", "提交失败（" + reason + "）");
+    byId("btnRunGuidance").hidden = false;
+  } finally {
+    portraitState.guidanceBusy = false;
+    byId("btnRunGuidance").disabled = false;
+    byId("btnRecomputeGuidance").disabled = false;
+  }
+}
+function openFeedbackDialog() {
+  byId("feedbackInput").value = "";
+  byId("feedbackError").hidden = true;
+  byId("feedbackModal").classList.add("show");
+  byId("feedbackInput").focus();
+}
+function closeFeedbackDialog() {
+  byId("feedbackModal").classList.remove("show");
+}
+byId("feedbackModal").addEventListener("click", (event) => {
+  if (event.target === byId("feedbackModal")) closeFeedbackDialog();
+});
+byId("btnCloseFeedback").addEventListener("click", closeFeedbackDialog);
+byId("btnCancelFeedback").addEventListener("click", closeFeedbackDialog);
+byId("btnSubmitFeedback").addEventListener("click", () => {
+  const feedback = byId("feedbackInput").value.trim();
+  if (feedback.length > 400) {
+    text("feedbackError", "请控制在 400 字以内");
+    byId("feedbackError").hidden = false;
+    return;
+  }
+  closeFeedbackDialog();
+  void startGuidance(feedback);
+});
+byId("btnRunGuidance").addEventListener("click", () => {
+  const selected = byId("selectGuidanceScenario").value;
+  portraitState.guidanceScenario = GUIDANCE_SCENARIOS.includes(selected) ? selected : "general";
+  void startGuidance();
+});
+byId("selectGuidanceScenario").addEventListener("change", (event) => {
+  portraitState.guidanceScenario = GUIDANCE_SCENARIOS.includes(event.target.value) ?
+    event.target.value : "general";
+});
+byId("btnRecomputeGuidance").addEventListener("click", openFeedbackDialog);
+
 settingsState.runtimeSnapshot = null;
 settingsState.runtimeRequest = 0;
 settingsState.runtimeBusy = false;
@@ -3607,7 +4012,7 @@ byId("inputDataRoot").addEventListener("keydown", event => {
   if (event.key === "Enter") { event.preventDefault(); void changeDataRoot(); }
 });
 const MODEL_SOURCE_PROTOCOLS = new Set(["anthropic", "responses", "chat_completions", "gemini", "ollama"]);
-settingsState.modelSourceSnapshot = { mode: "local", api: null, sourceId: "local", status: "idle" };
+settingsState.modelSourceSnapshot = { mode: "local", api: null, profiles: [], label: "", sourceId: "local", status: "idle" };
 settingsState.modelSourceResolved = false;
 settingsState.modelSourceReadRequest = 0;
 settingsState.modelSourceLoadController = null;
@@ -3621,15 +4026,42 @@ settingsState.modelSourceBusy = false;
 settingsState.modelListBusy = false;
 settingsState.modelTestBusy = false;
 settingsState.modelSourceDraftDirty = false;
+settingsState.apiProfileId = "";
+settingsState.apiProfileBusy = false;
+const LOCAL_MODEL_LABEL = "本地 Laya";
+function validModelProfile(item) {
+  return !!item && typeof item.id === "string" && /^[0-9a-f]{32}$/u.test(item.id) &&
+    typeof item.name === "string" && !!item.name && typeof item.model === "string" &&
+    typeof item.baseUrl === "string" && MODEL_SOURCE_PROTOCOLS.has(item.protocol) &&
+    typeof item.hasKey === "boolean" &&
+    (item.contextTokens == null || (Number.isSafeInteger(item.contextTokens) &&
+      item.contextTokens >= 4096 && item.contextTokens <= 1000000));
+}
 function validModelSource(data) {
   return !!data && ["local", "api"].includes(data.mode) &&
     typeof data.sourceId === "string" && !!data.sourceId &&
+    typeof data.label === "string" &&
+    Array.isArray(data.profiles) && data.profiles.every(validModelProfile) &&
     (data.mode !== "api" || !!data.api) &&
     (data.api === null || (!!data.api && MODEL_SOURCE_PROTOCOLS.has(data.api.protocol) &&
       typeof data.api.baseUrl === "string" && typeof data.api.model === "string" &&
       (data.api.contextTokens == null || Number.isSafeInteger(data.api.contextTokens) &&
         data.api.contextTokens >= 4096 && data.api.contextTokens <= 1000000) &&
       typeof data.api.hasKey === "boolean"));
+}
+function modelProfiles() {
+  const snapshot = settingsState.modelSourceSnapshot;
+  return settingsState.modelSourceResolved && Array.isArray(snapshot.profiles) ? snapshot.profiles : [];
+}
+function activeProfileId() {
+  const snapshot = settingsState.modelSourceSnapshot;
+  return snapshot.mode === "api" && snapshot.api ? (snapshot.api.id || "") : "";
+}
+function currentModelLabel() {
+  const snapshot = settingsState.modelSourceSnapshot;
+  if (!settingsState.modelSourceResolved) return "";
+  if (snapshot.mode === "api") return snapshot.label || snapshot.api?.model || "";
+  return snapshot.label || LOCAL_MODEL_LABEL;
 }
 function usingLocalFine() {
   return settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "local";
@@ -3655,6 +4087,7 @@ function applyActiveModelSource(data) {
   settingsState.modelSourceSnapshot = data;
   settingsState.modelSourceResolved = true;
   syncPortraitMode();
+  renderModelBadge();
   if (changed) {
     cancelApiPortraitPoll();
     if (portraitSourceChanged) {
@@ -3712,13 +4145,18 @@ function updateModelSourceControls() {
   byId("localModelActions").hidden = !settingsState.modelSourceResolved || settingsState.modelSourceSnapshot.mode !== "api" ||
     byId("selectModelSource").value !== "local";
   byId("btnActivateLocal").disabled = !settingsState.modelSourceResolved || settingsState.modelSourceLoading || settingsState.modelSourceBusy || settingsState.modelSourceSnapshot.mode === "local";
-  for (const id of ["selectApiProtocol", "inputApiBaseUrl", "inputApiKey", "selectApiModel", "inputApiModelId", "inputApiContextTokens"])
-    byId(id).disabled = settingsState.modelSourceLoading || settingsState.modelSourceBusy ||
+  for (const id of ["selectApiProfile", "selectApiProtocol", "inputApiProfileName", "inputApiBaseUrl", "inputApiKey", "selectApiModel", "inputApiModelId", "inputApiContextTokens"])
+    byId(id).disabled = settingsState.modelSourceLoading || settingsState.modelSourceBusy || settingsState.apiProfileBusy ||
       (id === "selectApiModel" && byId(id).options.length < 2);
+  byId("btnDeleteApiProfile").hidden = !settingsState.apiProfileId;
+  byId("btnDeleteApiProfile").disabled = settingsState.modelSourceLoading || settingsState.modelSourceBusy || settingsState.apiProfileBusy || !settingsState.apiProfileId;
   byId("btnFetchApiModels").disabled = !settingsState.modelSourceResolved || settingsState.modelSourceLoading || settingsState.modelSourceBusy || settingsState.modelListBusy;
   byId("btnTestApiModel").disabled = !settingsState.modelSourceResolved || settingsState.modelSourceLoading || settingsState.modelSourceBusy || settingsState.modelTestBusy;
-  byId("btnActivateApi").disabled = !settingsState.modelSourceResolved || settingsState.modelSourceLoading || settingsState.modelSourceBusy || settingsState.modelTestBusy;
+  byId("btnSaveApiProfile").disabled = !settingsState.modelSourceResolved || settingsState.modelSourceLoading || settingsState.modelSourceBusy || settingsState.modelTestBusy || settingsState.apiProfileBusy;
+  byId("btnActivateApi").disabled = !settingsState.modelSourceResolved || settingsState.modelSourceLoading || settingsState.modelSourceBusy || settingsState.modelTestBusy || settingsState.apiProfileBusy;
   byId("btnClearApiKey").disabled = !settingsState.modelSourceResolved || settingsState.modelSourceLoading || settingsState.modelSourceBusy;
+  byId("modelBadge").disabled = settingsState.modelSourceBusy || settingsState.apiProfileBusy;
+  renderModelBadge();
   syncRuntimeControl();
 }
 function showModelSourceMode() {
@@ -3726,6 +4164,93 @@ function showModelSourceMode() {
   byId("localModelSettings").hidden = isApi;
   byId("apiModelSettings").hidden = !isApi;
   updateModelSourceControls();
+}
+function modelBadgeOption(profile) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "model-badge-option";
+  button.dataset.profileId = profile.id;
+  button.setAttribute("role", "menuitemradio");
+  const active = profile.id === activeProfileId();
+  button.setAttribute("aria-checked", active ? "true" : "false");
+  const tick = document.createElement("span");
+  tick.className = "model-badge-tick";
+  tick.textContent = active ? "✓" : "";
+  const body = document.createElement("span");
+  body.className = "model-badge-text";
+  const name = document.createElement("span");
+  name.className = "model-badge-name";
+  name.textContent = profile.name;
+  const model = document.createElement("span");
+  model.className = "model-badge-model";
+  model.textContent = profile.model;
+  body.appendChild(name, model);
+  button.appendChild(tick, body);
+  return button;
+}
+function localModelBadgeOption() {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "model-badge-option";
+  button.dataset.profileId = "";
+  button.setAttribute("role", "menuitemradio");
+  button.setAttribute("aria-checked", settingsState.modelSourceSnapshot.mode === "local" ? "true" : "false");
+  const tick = document.createElement("span");
+  tick.className = "model-badge-tick";
+  tick.textContent = settingsState.modelSourceSnapshot.mode === "local" ? "✓" : "";
+  const body = document.createElement("span");
+  body.className = "model-badge-text";
+  const name = document.createElement("span");
+  name.className = "model-badge-name";
+  name.textContent = LOCAL_MODEL_LABEL;
+  const model = document.createElement("span");
+  model.className = "model-badge-model";
+  model.textContent = "内置本地模型";
+  body.appendChild(name, model);
+  button.appendChild(tick, body);
+  return button;
+}
+function renderModelBadgeMenu() {
+  const menu = byId("modelBadgeMenu");
+  if (menu.hidden) return;
+  const profiles = modelProfiles();
+  if (!profiles.length) {
+    const empty = document.createElement("p");
+    empty.className = "model-badge-busy";
+    empty.textContent = "尚无已保存的 API 配置，请先在设置中添加";
+    menu.replaceChildren(empty);
+    return;
+  }
+  const foot = document.createElement("button");
+  foot.type = "button";
+  foot.className = "model-badge-option model-badge-menu-foot";
+  foot.dataset.manage = "1";
+  foot.setAttribute("role", "menuitem");
+  foot.textContent = "管理 API 配置…";
+  menu.replaceChildren(...profiles.map(modelBadgeOption), localModelBadgeOption(), foot);
+}
+function closeModelBadgeMenu() {
+  byId("modelBadgeMenu").hidden = true;
+  byId("modelBadge").setAttribute("aria-expanded", "false");
+}
+function toggleModelBadgeMenu() {
+  const menu = byId("modelBadgeMenu");
+  if (menu.hidden) {
+    menu.hidden = false;
+    renderModelBadgeMenu();
+    byId("modelBadge").setAttribute("aria-expanded", "true");
+  } else closeModelBadgeMenu();
+}
+function renderModelBadge() {
+  const wrap = byId("modelBadgeWrap");
+  if (!settingsState.modelSourceResolved) {
+    wrap.hidden = true;
+    closeModelBadgeMenu();
+    return;
+  }
+  wrap.hidden = false;
+  text("modelBadgeLabel", currentModelLabel());
+  renderModelBadgeMenu();
 }
 function clearModelList() {
   const select = byId("selectApiModel");
@@ -3763,23 +4288,79 @@ function invalidateModelTest() {
   text("modelSourceStatus", "");
   updateModelSourceControls();
 }
+function editedApiProfile() {
+  return modelProfiles().find(item => item.id === settingsState.apiProfileId) || null;
+}
 function syncSavedApiKeyHint() {
-  const saved = settingsState.modelSourceSnapshot.api;
-  const reusable = !!saved?.hasKey && saved.protocol === byId("selectApiProtocol").value &&
-    saved.baseUrl.replace(/\/+$/, "") === byId("inputApiBaseUrl").value.trim().replace(/\/+$/, "");
+  const profile = editedApiProfile();
+  const reusable = !!profile?.hasKey && profile.protocol === byId("selectApiProtocol").value &&
+    profile.baseUrl.replace(/\/+$/, "") === byId("inputApiBaseUrl").value.trim().replace(/\/+$/, "");
   byId("apiKeySaved").hidden = !reusable;
-  byId("btnClearApiKey").hidden = !saved?.hasKey;
+  byId("btnClearApiKey").hidden = !profile?.hasKey;
   byId("inputApiKey").placeholder = reusable ? "留空沿用已保存密钥" : "按服务要求填写 API Key";
+}
+function showApiProfiles() {
+  const select = byId("selectApiProfile");
+  const profiles = modelProfiles();
+  select.replaceChildren();
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = profiles.length ? "新建配置" : "尚无已保存配置";
+  select.appendChild(blank);
+  const active = activeProfileId();
+  for (const profile of profiles) {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = profile.id === active ? `${profile.name}（当前）` : profile.name;
+    select.appendChild(option);
+  }
+  select.value = profiles.some(item => item.id === settingsState.apiProfileId)
+    ? settingsState.apiProfileId : "";
+}
+function loadApiProfileDraft(profileId, markDirty = true) {
+  const profile = modelProfiles().find(item => item.id === profileId) || null;
+  settingsState.apiProfileId = profile?.id || "";
+  byId("inputApiProfileName").value = profile?.name || "";
+  byId("selectApiProtocol").value = profile?.protocol || "responses";
+  byId("inputApiBaseUrl").value = profile?.baseUrl || "";
+  byId("inputApiModelId").value = profile?.model || "";
+  byId("inputApiContextTokens").value = profile?.contextTokens || "";
+  byId("inputApiKey").value = "";
+  if (markDirty) settingsState.modelSourceDraftDirty = true;
+  invalidateModelDiscovery();
+  syncSavedApiKeyHint();
+  updateModelSourceControls();
+}
+function resolveEditedProfileId(fallbackId) {
+  // Keep editing the same profile across refreshes and header switches; only fall back
+  // to the active one when that profile no longer exists.
+  const kept = settingsState.apiProfileId;
+  settingsState.apiProfileId = modelProfiles().some(item => item.id === kept) ? kept : fallbackId;
+  return settingsState.apiProfileId;
+}
+function applyModelSourceSnapshot(data) {
+  if (settingsState.modelSourceDraftDirty) {
+    // A header switch must not throw away edits the user has not saved yet.
+    applyActiveModelSource(data);
+    resolveEditedProfileId(data.mode === "api" ? (data.api?.id || "") : "");
+    showApiProfiles();
+    text("modelSourceActive", data.mode === "api" ? "当前 API" : "当前本地");
+    syncSavedApiKeyHint();
+  } else showModelSource(data);
 }
 function showModelSource(data) {
   applyActiveModelSource(data);
   settingsState.modelSourceDraftDirty = false;
   text("modelSourceActive", data.mode === "api" ? "当前 API" : "当前本地");
+  resolveEditedProfileId(data.mode === "api" ? (data.api?.id || "") : "");
   byId("selectModelSource").value = data.mode;
-  byId("selectApiProtocol").value = data.api?.protocol || "responses";
-  byId("inputApiBaseUrl").value = data.api?.baseUrl || "";
-  byId("inputApiModelId").value = data.api?.model || "";
-  byId("inputApiContextTokens").value = data.api?.contextTokens || "";
+  showApiProfiles();
+  const profile = editedApiProfile();
+  byId("inputApiProfileName").value = profile?.name || "";
+  byId("selectApiProtocol").value = profile?.protocol || data.api?.protocol || "responses";
+  byId("inputApiBaseUrl").value = profile?.baseUrl || data.api?.baseUrl || "";
+  byId("inputApiModelId").value = profile?.model || data.api?.model || "";
+  byId("inputApiContextTokens").value = profile?.contextTokens || data.api?.contextTokens || "";
   byId("inputApiKey").value = "";
   syncSavedApiKeyHint();
   invalidateModelDiscovery();
@@ -3854,6 +4435,11 @@ function apiModelDraft(requireModel, requireContext = false) {
   return draft;
 }
 async function fetchApiModels() {
+  // Model discovery and the connection probe share one lane in the API worker
+  // (`probeTasks.size >= 2` -> "rate-limit"). Overlapping them would refuse the second
+  // request before it ever reaches the provider and report it as a provider throttle.
+  if (settingsState.modelListBusy || settingsState.modelTestBusy ||
+      settingsState.modelSourceBusy) return;
   let draft;
   try { draft = apiModelDraft(false); }
   catch (error) { text("apiModelCount", error.message); return; }
@@ -3910,7 +4496,9 @@ async function fetchApiModels() {
   }
 }
 async function testApiModel() {
-  if (settingsState.modelSourceBusy || settingsState.modelTestBusy) return;
+  // Same shared lane as `fetchApiModels`: one probe at a time, whoever started first.
+  if (settingsState.modelSourceBusy || settingsState.modelTestBusy ||
+      settingsState.modelListBusy) return;
   let draft;
   try { draft = apiModelDraft(true); }
   catch (error) { text("apiModelTestStatus", error.message); return; }
@@ -3942,24 +4530,27 @@ async function testApiModel() {
     }
   }
 }
-async function activateModelSource(mode) {
-  if (settingsState.modelSourceBusy || settingsState.modelTestBusy || !["local", "api"].includes(mode)) return;
-  let payload = { mode };
-  if (mode === "api") {
-    try { payload = { ...payload, ...apiModelDraft(true, true) }; }
-    catch (error) { text("modelSourceStatus", error.message); return; }
-  }
+function apiProfilePayload(draft) {
+  const payload = { ...draft };
+  const name = byId("inputApiProfileName").value.trim();
+  if (name) payload.name = name;
+  if (settingsState.apiProfileId) payload.profileId = settingsState.apiProfileId;
+  return payload;
+}
+async function postApiModelSource(path, payload, messages) {
   settingsState.modelSourceBusy = true;
   const abortController = new AbortController();
-  const timeoutId = setTimeout(() => abortController.abort(), mode === "local" ? 15_000 : 30_000);
-  text("modelSourceStatus", "正在启用…");
+  const timeoutId = setTimeout(() => abortController.abort(), messages.timeoutMs || 30_000);
+  text("modelSourceStatus", messages.busy);
   updateModelSourceControls();
   try {
-    const data = await api("/api/model-source/activate", { method: "POST", body: JSON.stringify(payload) },
+    const data = await api(path, { method: "POST", body: JSON.stringify(payload) },
       abortController.signal);
-    if (!validModelSource(data) || data.mode !== mode) throw new Error("activation failed");
-    showModelSource(data);
-    text("modelSourceStatus", mode === "api" ? "API 模型已启用" : "本地模型已启用");
+    if (!validModelSource(data)) throw new Error("invalid model source");
+    messages.accept?.(data);
+    applyModelSourceSnapshot(data);
+    text("modelSourceStatus", messages.done);
+    return data;
   } catch (error) {
     if (!Number.isInteger(error?.status)) {
       beginUnknownModelSource();
@@ -3967,42 +4558,87 @@ async function activateModelSource(mode) {
       void loadModelSource(true);
     }
     text("modelSourceStatus", settingsState.modelSourceResolved ?
-      `启用失败（${abortController.signal.aborted ? "连接超时" : modelSourceRequestError(error)}），当前仍为${settingsState.modelSourceSnapshot.mode === "api" ? " API" : "本地"}` :
+      `${messages.failed}（${abortController.signal.aborted ? "连接超时" : modelSourceRequestError(error)}），当前仍为${settingsState.modelSourceSnapshot.mode === "api" ? " API" : "本地"}` :
       "启用状态待读取");
+    return null;
   } finally {
     clearTimeout(timeoutId);
     settingsState.modelSourceBusy = false;
     updateModelSourceControls();
   }
 }
-async function clearStoredApiKey() {
-  if (settingsState.modelSourceBusy || !settingsState.modelSourceSnapshot.api?.hasKey) return;
-  settingsState.modelSourceBusy = true;
-  text("modelSourceStatus", "正在清除密钥…");
+async function saveApiProfileDraft(activate) {
+  let draft;
+  try { draft = apiModelDraft(true, true); }
+  catch (error) { text("modelSourceStatus", error.message); return null; }
+  const data = await postApiModelSource(
+    activate ? "/api/model-source/activate" : "/api/model-source/profiles",
+    { ...(activate ? { mode: "api" } : {}), ...apiProfilePayload(draft) },
+    { busy: activate ? "正在启用…" : "正在保存配置…", done: activate ? "API 模型已启用" : "配置已保存",
+      failed: activate ? "启用失败" : "保存失败",
+      accept: data => {
+        if (typeof data.profile === "string") settingsState.apiProfileId = data.profile;
+      } });
+  if (data && activate && data.mode !== "api") text("modelSourceStatus", "启用失败（来源未切换）");
+  return data;
+}
+async function saveApiProfile() { await saveApiProfileDraft(false); }
+async function activateApiDraft() { await saveApiProfileDraft(true); }
+async function activateModelSource(mode) {
+  if (settingsState.modelSourceBusy || settingsState.modelTestBusy || !["local", "api"].includes(mode)) return;
+  if (mode === "api") return activateApiDraft();
+  return postApiModelSource("/api/model-source/activate", { mode }, {
+    busy: "正在启用…", done: "本地模型已启用", failed: "启用失败", timeoutMs: 15_000 });
+}
+async function activateModelProfile(profileId) {
+  closeModelBadgeMenu();
+  if (settingsState.modelSourceBusy || !settingsState.modelSourceResolved) return;
+  const mode = profileId ? "api" : "local";
+  if (settingsState.modelSourceSnapshot.mode === mode &&
+      (mode === "local" || activeProfileId() === profileId)) return;
+  await postApiModelSource("/api/model-source/activate",
+    profileId ? { mode: "api", profileId } : { mode: "local" },
+    { busy: "正在切换模型…", done: mode === "api" ? "已切换模型" : "已切换到本地模型",
+      failed: "切换失败" });
+}
+function showApiProfileDeleteConfirm(show) {
+  byId("apiProfileDeleteConfirm").hidden = !show;
+  if (!show) return;
+  const profile = editedApiProfile();
+  text("apiProfileDeleteQuestion",
+    `删除配置「${profile?.name || settingsState.apiProfileId}」？该配置保存的密钥会一并删除；若它正在使用，将切回本地模型。`);
+}
+async function deleteApiProfile() {
+  const profileId = settingsState.apiProfileId;
+  if (!profileId || settingsState.apiProfileBusy) return;
+  settingsState.apiProfileBusy = true;
+  showApiProfileDeleteConfirm(false);
   updateModelSourceControls();
-  let cleared = false;
-  try {
-    await api("/api/model-source/clear-key", { method: "POST", body: "{}" });
-    cleared = true;
+  const data = await postApiModelSource("/api/model-source/profiles/delete", { profileId },
+    { busy: "正在删除配置…", done: "配置已删除", failed: "删除失败",
+      accept: () => {
+        // The saved profile is gone, so the form must not keep editing its fields.
+        settingsState.apiProfileId = "";
+        settingsState.modelSourceDraftDirty = false;
+      } });
+  settingsState.apiProfileBusy = false;
+  if (data) {
+    byId("inputApiProfileName").value = "";
     byId("inputApiKey").value = "";
-    const data = await api("/api/model-source");
-    if (!validModelSource(data)) throw new Error("invalid model source");
-    showModelSource(data);
-    text("modelSourceStatus", "密钥已清除");
-  } catch (error) {
-    if (cleared) {
-      settingsState.modelSourceSnapshot = { ...settingsState.modelSourceSnapshot, api: settingsState.modelSourceSnapshot.api ?
-        { ...settingsState.modelSourceSnapshot.api, hasKey: false } : null };
-      beginUnknownModelSource();
-      byId("apiKeySaved").hidden = true;
-      byId("btnClearApiKey").hidden = true;
-      text("modelSourceActive", "状态待读取");
-      text("modelSourceStatus", "密钥已清除，状态读取失败");
-    } else text("modelSourceStatus", `清除失败（${modelSourceRequestError(error)}）`);
-  } finally {
-    settingsState.modelSourceBusy = false;
-    updateModelSourceControls();
+    invalidateModelDiscovery();
+    syncSavedApiKeyHint();
   }
+  updateModelSourceControls();
+}
+async function clearStoredApiKey() {
+  const profile = editedApiProfile();
+  if (settingsState.modelSourceBusy || !profile?.hasKey) return;
+  const body = settingsState.apiProfileId ? { profileId: settingsState.apiProfileId } : {};
+  const data = await postApiModelSource("/api/model-source/clear-key", body,
+    { busy: "正在清除密钥…", done: "密钥已清除", failed: "清除失败" });
+  if (!data) return;
+  byId("inputApiKey").value = "";
+  showApiProfileDeleteConfirm(false);
 }
 labelState.apiInsightCache = new Map();
 settingsState.suppressedApiSources = new Set();
@@ -4669,6 +5305,8 @@ function closeSettingsModal() {
   settingsState.modelListController = null;
   settingsState.modelTestController?.abort();
   settingsState.modelTestController = null;
+  showApiProfileDeleteConfirm(false);
+  closeModelBadgeMenu();
   byId("settingsModal").classList.remove("show");
   clearTimeout(settingsState.runtimePollTimer);
   ++analysisCacheRequest;
@@ -4877,6 +5515,14 @@ byId("selectModelSource").addEventListener("change", () => {
   invalidateModelDiscovery();
   showModelSourceMode();
 });
+byId("selectApiProfile").addEventListener("change", event => {
+  showApiProfileDeleteConfirm(false);
+  loadApiProfileDraft(event.target.value);
+});
+byId("inputApiProfileName").addEventListener("input", () => {
+  settingsState.modelSourceDraftDirty = true;
+  text("modelSourceStatus", "");
+});
 for (const id of ["selectApiProtocol", "inputApiBaseUrl", "inputApiKey"])
   byId(id).addEventListener(id === "selectApiProtocol" ? "change" : "input", () => {
     settingsState.modelSourceDraftDirty = true;
@@ -4908,7 +5554,31 @@ byId("btnReloadModelSource").addEventListener("click", () => { void loadModelSou
 byId("btnTestApiModel").addEventListener("click", () => { void testApiModel(); });
 byId("btnActivateLocal").addEventListener("click", () => { void activateModelSource("local"); });
 byId("btnActivateApi").addEventListener("click", () => { void activateModelSource("api"); });
+byId("btnSaveApiProfile").addEventListener("click", () => { void saveApiProfile(); });
 byId("btnClearApiKey").addEventListener("click", () => { void clearStoredApiKey(); });
+byId("btnDeleteApiProfile").addEventListener("click", () => {
+  if (!settingsState.apiProfileId) return;
+  showApiProfileDeleteConfirm(true);
+  byId("btnConfirmDeleteApiProfile").focus();
+});
+byId("btnCancelDeleteApiProfile").addEventListener("click", () => { showApiProfileDeleteConfirm(false); });
+byId("btnConfirmDeleteApiProfile").addEventListener("click", () => { void deleteApiProfile(); });
+byId("modelBadge").addEventListener("click", () => { toggleModelBadgeMenu(); });
+byId("modelBadgeMenu").addEventListener("click", event => {
+  if (event.target.closest("[data-manage]")) {
+    closeModelBadgeMenu();
+    byId("btnSettings").click();
+    byId("selectModelSource").value = "api";
+    settingsState.modelSourceDraftDirty = true;
+    invalidateModelDiscovery();
+    showModelSourceMode();
+    byId("selectApiProfile").focus();
+    return;
+  }
+  const option = event.target.closest(".model-badge-option");
+  if (!option) return;
+  void activateModelProfile(option.dataset.profileId || "");
+});
 const OFFICIAL_RELEASES_URL = "https://github.com/tswawa/WechatVibe/releases";
 const UPDATE_BUSY_PHASES = new Set(["downloading", "verifying", "extracting", "installing", "restarting"]);
 const UPDATE_BACKGROUND_CHECK_DELAY_MS = 10_000;
@@ -5175,6 +5845,17 @@ byId("btnToggleBackgroundAnalyze").addEventListener("click", () => {
   applySettings();
   if (settingsState.settings.backgroundAnalyze) void backgroundAnalyzeAll();
 });
+byId("chkAnalyzeSelfStyle").addEventListener("change", (event) => {
+  settingsState.settings.analyzeSelfStyle = !!event.target.checked;
+  save();
+  applySettings();
+  // Regenerating costs a model call, so the switch never triggers one on its own; the
+  // card says so instead of silently showing advice produced under the old setting.
+  if (portraitState.guidanceRendered && settingsState.modelSourceSnapshot.mode === "api")
+    text("guidanceStatus", "设置已保存，点击“开始分析”或“重算”后生效");
+});
+byId("btnApiWorkerMinus").addEventListener("click", () => { void changeApiWorkerSettings(-1); });
+byId("btnApiWorkerPlus").addEventListener("click", () => { void changeApiWorkerSettings(1); });
 byId("btnWorkerMinus").addEventListener("click", () => { void changeWorkerSettings(-1); });
 byId("btnWorkerPlus").addEventListener("click", () => { void changeWorkerSettings(1); });
 byId("btnToggleElasticWorkers").addEventListener("click", () => {
@@ -5296,7 +5977,8 @@ function closeMemberPicker() {
   byId("groupMemberTabs").querySelector(".member-picker-trigger")?.setAttribute("aria-expanded", "false");
 }
 document.addEventListener("click", event => { if (!event.target.closest("#groupMemberTabs")) closeMemberPicker(); });
-document.addEventListener("keydown", event => { if (event.key === "Escape") { closeMemberPicker(); closeHistorySearch(); byId("emojiPopover").classList.remove("show"); } });
+document.addEventListener("click", event => { if (!event.target.closest("#modelBadgeWrap")) closeModelBadgeMenu(); });
+document.addEventListener("keydown", event => { if (event.key === "Escape") { closeMemberPicker(); closeHistorySearch(); byId("emojiPopover").classList.remove("show"); closeFeedbackDialog(); closeModelBadgeMenu(); showApiProfileDeleteConfirm(false); } });
 renderKaomojiPanel();
 applySettings();
 loadCatalog();
@@ -5380,6 +6062,7 @@ if (!updateValidationMode) {
   setTimeout(() => { if (updateCommitReady) void loadAnalysisOverview(); }, 8000);
   setInterval(() => { if (updateCommitReady && !document.hidden) void loadAnalysisOverview(); }, 60000);
   setTimeout(() => { if (updateCommitReady) void loadWorkerSettings(); }, 9000);
+  setTimeout(() => { if (updateCommitReady) void loadApiWorkerSettings(); }, 9000);
 }
 document.addEventListener("visibilitychange", () => {
   if (document.hidden || updateValidationMode || !updateCommitReady) return;

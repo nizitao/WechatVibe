@@ -124,7 +124,7 @@
         dataRootRequest: 0,
         dataRootBusy: false,
         dataRootDraftDirty: false,
-        modelSourceSnapshot: { mode: "local", api: null, sourceId: "local", status: "idle" },
+        modelSourceSnapshot: { mode: "local", api: null, profiles: [], label: "", sourceId: "local", status: "idle" },
         modelSourceResolved: false,
         modelSourceReadRequest: 0,
         modelSourceLoadController: null,
@@ -138,6 +138,9 @@
         modelListBusy: false,
         modelTestBusy: false,
         modelSourceDraftDirty: false,
+        // Which saved API profile the settings form is editing ("" = a new one).
+        apiProfileId: "",
+        apiProfileBusy: false,
         suppressedApiSources: new Set(),
         suppressedLocalAccounts: new Set(),
       };

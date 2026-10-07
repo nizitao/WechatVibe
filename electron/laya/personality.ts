@@ -47,6 +47,44 @@ export const PERSONALITY_QUESTIONS: Record<string, Question> = {
   },
 };
 
+/**
+ * API-mode MBTI wording. Same option labels (so the shared converter and the persisted
+ * evidence contract are untouched), but the scope question accepts a preference the
+ * sender demonstrates across the batch, not only one they spell out. A chat rarely
+ * contains a textbook self-description, and demanding one left every axis permanently
+ * unknown. The version is separate from `MBTI_QUESTION_VERSION` so only the API
+ * classifier rebuilds; the local Laya profile keeps its cached results.
+ */
+export const API_MBTI_QUESTION_VERSION = "mbti-api-context-v1";
+
+export const API_PERSONALITY_QUESTIONS: Record<string, Question> = {
+  mbti_scope: {
+    type: "choice",
+    instructions: "Across the whole batch, is there any axis preference the TARGET sender either states about themselves or demonstrates through how they repeatedly behave? A single greeting, one refusal, one mood, one plan or one isolated fact is NOT a preference. Judge each axis on its own: a preference can be visible on one axis while the batch gives nothing for the others.",
+    criteria: ["no enduring preference stated", "sender states a recurring personal preference"],
+  },
+  mbti_EI: {
+    type: "choice",
+    instructions: "How does this sender repeatedly restore energy? Weight how they INITIATE contact (who opens a topic after a gap, who keeps a thread going, who writes long unprompted messages) over how much they talk when asked. Long messages alone, being busy, or one lively conversation is not evidence. If the batch shows no recurring pattern either way, choose no stated preference.",
+    criteria: [...OPTIONS.EI],
+  },
+  mbti_SN: {
+    type: "choice",
+    instructions: "How does this sender repeatedly take in information? Weight what they VOLUNTARILY bring up and ask about across topics (concrete events, details and step-by-step specifics versus patterns, abstractions, possibilities and implications). Do not classify the subject matter they happen to discuss. If the batch shows no recurring pattern either way, choose no stated preference.",
+    criteria: [...OPTIONS.SN],
+  },
+  mbti_TF: {
+    type: "choice",
+    instructions: "How does this sender repeatedly decide? Weight the REASON they give when they disagree, refuse, prioritise or resolve a conflict (consistency, fairness and rules versus the effect on people, harmony and commitments), not how warm the message feels. One emotional outburst is not evidence. If the batch shows no recurring pattern either way, choose no stated preference.",
+    criteria: [...OPTIONS.TF],
+  },
+  mbti_JP: {
+    type: "choice",
+    instructions: "How does this sender repeatedly relate to plans and open loops? Weight whether they settle things (deadlines, confirmations, decisions, wanting a closed answer) or keep them open (options left alive, plans drifting, deferring commitments) across several situations, not one appointment. If the batch shows no recurring pattern either way, choose no stated preference.",
+    criteria: [...OPTIONS.JP],
+  },
+};
+
 function distribution<Left extends string, Right extends string>(
   answer: Answer | undefined,
   left: Left,
