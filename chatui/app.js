@@ -787,11 +787,16 @@ async function loadConversationSelection(account, request) {
   if (state.initialized === false) forgetConversationFollow(account);
   chatState.selectedConversations.clear();
   for (const id of state.selectedSessions) chatState.selectedConversations.add(id);
+  chatState.requestedConversations.clear();
+  // The analysis requests survive a restart, so the buttons come back as the user left them.
+  for (const id of state.requestedSessions) chatState.requestedConversations.add(id);
   chatState.selectionLoadedAccount = account;
 }
 function validConversationSelection(state, account) {
   return Boolean(state) && state.account === account && Array.isArray(state.selectedSessions) &&
-    state.selectedSessions.every(id => typeof id === "string");
+    state.selectedSessions.every(id => typeof id === "string") &&
+    Array.isArray(state.requestedSessions) &&
+    state.requestedSessions.every(id => typeof id === "string");
 }
 function clearUnselectedConversation() {
   if (chatState.currentUser) {
@@ -925,14 +930,60 @@ settingsState.workerSettings = null;
 async function requestConversationAnalysis(username) {
   if (!username || !chatState.sessions.has(username)) return;
   const requested = chatState.requestedConversations.has(username);
-  if (requested) chatState.requestedConversations.delete(username);
-  else chatState.requestedConversations.add(username);
+  const next = !requested;
+  try {
+    // Persist first: the request has to survive a restart, and the sweep must not run
+    // against a list the backend does not know about yet.
+    const state = await api("/api/conversation-selection", { method: "POST", body: JSON.stringify({
+      expectedAccount: chatState.currentAccount, session: username, requested: next,
+    }) });
+    if (chatState.currentAccount !== (state && state.account)) throw new Error("账号已切换");
+    chatState.selectedConversations.clear();
+    for (const id of state.selectedSessions) chatState.selectedConversations.add(id);
+    chatState.requestedConversations.clear();
+    for (const id of state.requestedSessions) chatState.requestedConversations.add(id);
+  } catch (error) {
+    status(byId("chatMessages"), `保存分析请求失败：${error.message}`);
+    return;
+  }
   renderSessions();
   // A click analyses that one conversation right away. It deliberately does not depend on
   // the background switch: the button is the explicit request, the switch only governs the
   // sweep that walks the rest of the list later.
-  if (!requested) await analyzeConversations([username]);
+  if (next) {
+    // The open conversation goes through the normal entry point, so the hint is cleared and
+    // the API/local branch is picked the same way the header button picks it.
+    if (username === chatState.currentUser) retryAnalysis();
+    else await analyzeConversations([username]);
+  }
 }
+/**
+ * Whether the user asked for this conversation to be analysed.
+ *
+ * This is the single gate for every analysis path: the background sweep, the header
+ * buttons, the incremental sync and the API inline labelling all consult it. Opening a
+ * conversation is not a request, so nothing is analysed until the card button is clicked.
+ */
+function conversationAnalysisRequested(user) {
+  return Boolean(user) && chatState.requestedConversations.has(user);
+}
+
+/**
+ * Refuse an analysis that was never requested and explain why.
+ * Returns true when the caller must stop. Kept next to the request list so the wording
+ * matches the button that grants it.
+ */
+function analysisBlockedWithoutRequest(user) {
+  if (conversationAnalysisRequested(user)) return false;
+  const hint = "尚未加入分析 · 请在左侧点击该联系人的「开始分析」";
+  setStripStatus(hint);
+  text("analysisStatus", hint);
+  if (byId("btnRetryAnalysis") && !byId("btnRetryAnalysis").hidden) {
+    byId("btnRetryAnalysis").hidden = true;
+  }
+  return true;
+}
+
 /** Analyse exactly the given conversations, in order, under whichever model source is active. */
 async function analyzeConversations(list) {
   if (!chatState.messageSourceReady || chatState.historyState) return;
@@ -2038,8 +2089,11 @@ function incrementalState(key) {
 }
 async function startIncremental(user, token, signal, key, state) {
   const account = chatState.currentAccount;
-  if (!canAnalyzeLocal() || state.pending || !account || token !== chatState.generation || user !== chatState.currentUser ||
-      settingsState.suppressedLocalAccounts.has(account)) return;
+  if (user !== chatState.currentUser || token !== chatState.generation || state.pending) return;
+  // Ahead of the availability checks: an unrequested conversation must say so even when
+  // no model is installed, otherwise the gate looks like a broken model.
+  if (analysisBlockedWithoutRequest(user)) return;
+  if (!canAnalyzeLocal() || !account || settingsState.suppressedLocalAccounts.has(account)) return;
   state.pending = true;
   let refresh = false;
   try {
@@ -2132,7 +2186,10 @@ async function loadAnalysis(user, token, signal) {
 }
 async function analyzeRecent(user, token, signal, signature, limit, window) {
   const account = chatState.currentAccount;
-  if (!canAnalyzeLocal() || labelState.recentPending || labelState.recentFailed || !account || token !== chatState.generation || user !== chatState.currentUser) return;
+  if (user !== chatState.currentUser || token !== chatState.generation ||
+      labelState.recentPending || labelState.recentFailed) return;
+  if (analysisBlockedWithoutRequest(user)) return;
+  if (!canAnalyzeLocal() || !account) return;
   labelState.requestedRecentSignatures.add(signature);
   while (labelState.requestedRecentSignatures.size > 64) labelState.requestedRecentSignatures.delete(labelState.requestedRecentSignatures.values().next().value);
   labelState.recentPending = true;
@@ -5034,6 +5091,11 @@ async function submitApiInsightJob(work, candidates, signature) {
   }
 }
 function ensureApiInsights(force = false) {
+  if (analysisBlockedWithoutRequest(chatState.currentUser)) {
+    cancelApiInsightWork();
+    renderApiInsightStatus();
+    return;
+  }
   const key = settingsState.settings.intent && activeApiInsightKey();
   const sourceKey = JSON.stringify([chatState.currentAccount, settingsState.modelSourceSnapshot.sourceId]);
   if (settingsState.suppressedApiSources.has(sourceKey)) {

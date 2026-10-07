@@ -94,6 +94,9 @@ function harness(fetchImpl = async () => response({ account: "acct", sourceId: "
     fetch: fetchImpl,
     setTimeout: () => 1, clearTimeout() {},
     settings: { intent: true }, currentAccount: "acct", currentUser: "chat",
+    // Inline labelling only runs for a conversation the user asked for with the card button,
+    // so the scenario has to be one that was requested.
+    requestedConversations: new Set(["chat"]),
     view: "chat", apiPortraitSnapshot: null,
     syncPortraitMode() {}, cancelApiPortraitPoll() {}, clearApiPortraitView() {}, loadProfile() {},
     controller: new AbortController(), generation: 1, historyState: null,
