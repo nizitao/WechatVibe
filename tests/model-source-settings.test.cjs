@@ -312,7 +312,9 @@ it("shows the current model beside the chat title and lists every profile in its
 });
 
 it("hides the model badge until the active source is known", () => {
-  assert.match(html, /id="modelBadgeWrap" hidden/);
+  // The wrapper also carries the shared marker the outside-click rule looks for, so this
+  // asserts the attribute rather than its position.
+  assert.match(html, /id="modelBadgeWrap"[^>]*\bhidden/);
   const { ui, byId } = harness(async () => response(localState));
   ui.showModelSource(localState);
   assert.equal(byId("modelBadgeLabel").textContent, "本地 Laya");

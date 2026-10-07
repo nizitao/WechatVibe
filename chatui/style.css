@@ -3118,7 +3118,12 @@ body.theme-light .inline-intent-row .intent-item.primary { color: #4a4a4c; }
 .analysis-cache-card button { flex: none; }
 .analysis-cache-confirm { padding: 10px; border: 1px solid rgba(217, 149, 149, .5); border-radius: 6px; color: var(--text-main); font-size: 12px; }
 .analysis-cache-confirm p { margin: 0 0 10px; }
-.portrait-source-badge { margin-left: 9px; padding: 3px 8px; border: 1px solid var(--border-color); border-radius: 5px; color: var(--text-secondary); font-size: 11px; font-weight: 500; white-space: nowrap; }
+/* The persona header carries the same model switcher as the chat header, so the source can be
+   changed without going back to the conversation. The panel reuses .model-badge-menu; this
+   wrapper is its positioning context. */
+.portrait-source-wrap { position: relative; display: inline-flex; align-items: center; margin-left: 9px; }
+.portrait-source-badge { box-sizing: border-box; margin: 0; padding: 3px 8px; border: 1px solid var(--border-color); border-radius: 5px; background: none; color: var(--text-secondary); font-family: inherit; font-size: 11px; font-weight: 500; line-height: 1.4; white-space: nowrap; cursor: pointer; }
+.portrait-source-badge:hover, .portrait-source-badge:focus-visible, .portrait-source-badge[aria-expanded="true"] { border-color: var(--color-green); color: var(--color-green); outline: none; }
 .api-portrait-status { margin-top: 12px; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
 .api-portrait-status[hidden] { display: none; }
 #btnRetryApiPortrait { margin-top: 8px; }

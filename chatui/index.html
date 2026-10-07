@@ -105,13 +105,14 @@
     <header class="chat-header">
       <div class="chat-title-group">
         <h2 class="chat-title" id="chatTitle">聊天</h2>
-        <span class="model-badge-wrap" id="modelBadgeWrap" hidden>
+        <span class="model-badge-wrap" id="modelBadgeWrap" data-model-menu-wrap hidden>
           <button type="button" class="model-badge" id="modelBadge" aria-haspopup="menu"
                   aria-expanded="false" aria-controls="modelBadgeMenu" title="切换当前使用的模型">
             <span class="model-badge-label" id="modelBadgeLabel"></span>
             <span class="model-badge-caret" aria-hidden="true"></span>
           </button>
-          <div class="model-badge-menu" id="modelBadgeMenu" role="menu" aria-label="选择当前使用的模型" hidden></div>
+          <div class="model-badge-menu" id="modelBadgeMenu" role="menu"
+        aria-label="选择当前使用的模型" hidden></div>
         </span>
         <span class="chat-status-pill" id="chatStatusPill" style="display:none">
           <span class="header-mood-label" id="headerMoodLabel"></span>
@@ -215,7 +216,13 @@
               <path d="M12 2a5 5 0 0 1 5 5v1a5 5 0 0 1-10 0V7a5 5 0 0 1 5-5zm0 12c4.42 0 8 1.79 8 4v2H4v-2c0-2.21 3.58-4 8-4zm7.5-9.5l.94 2.06 2.06.94-2.06.94-.94 2.06-.94-2.06-2.06-.94 2.06-.94.94-2.06z"/>
             </svg>
             <span id="personaHeaderTitle">人物画像分析</span>
-            <span class="portrait-source-badge" id="portraitSourceBadge">本地 Laya</span>
+            <span class="portrait-source-wrap" id="portraitSourceWrap" data-model-menu-wrap>
+              <button type="button" class="portrait-source-badge" id="portraitSourceBadge"
+                aria-haspopup="menu" aria-expanded="false" aria-controls="portraitSourceMenu"
+                title="切换当前使用的模型">本地 Laya</button>
+              <div class="model-badge-menu" id="portraitSourceMenu" role="menu"
+                aria-label="选择当前使用的模型" hidden></div>
+            </span>
           </div>
 
           <!-- Group Member Tabs (仅在群聊时展示，供在群聊内切换成员画像) -->
