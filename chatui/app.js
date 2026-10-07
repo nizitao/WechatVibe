@@ -3754,7 +3754,8 @@ function applySettings() {
 // One provider turn produces both, so the per-message reading and the advice beside
 // it always describe the same conversation. The card only exists in API mode.
 // ---------------------------------------------------------------------------
-const GUIDANCE_VERSION = "api-guidance-v1";
+// Must match electron/api-guidance.ts and bridge/guidance_contracts.py.
+const GUIDANCE_VERSION = "api-guidance-v2";
 const GUIDANCE_SCENARIOS = ["general", "leader"];
 const GUIDANCE_POLARITIES = ["positive", "neutral", "negative", "mixed"];
 const GUIDANCE_STATUSES = ["ok", "uncertain", "insufficient"];

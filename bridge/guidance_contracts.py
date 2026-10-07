@@ -9,7 +9,7 @@ normalised, so a malformed provider reply can never be persisted or displayed.
 """
 from __future__ import annotations
 
-GUIDANCE_REVISION = "api-guidance-v1"
+GUIDANCE_REVISION = "api-guidance-v2"
 
 GUIDANCE_SCENARIOS = frozenset({"general", "leader"})
 

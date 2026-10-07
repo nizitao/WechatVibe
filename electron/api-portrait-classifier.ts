@@ -18,7 +18,7 @@ import { toInternal } from "./laya/questions";
 import type { Answer, ChoiceAnswer, Question } from "./laya/types";
 
 export const API_PORTRAIT_CLASSIFIER_VERSION =
-  `api-laya-portrait-v2+${CATALOG_VERSION}+${MBTI_QUESTION_VERSION}+${API_MBTI_QUESTION_VERSION}+style-v1`;
+  `api-laya-portrait-v3+${CATALOG_VERSION}+${MBTI_QUESTION_VERSION}+${API_MBTI_QUESTION_VERSION}+style-v1`;
 // The classification call sends no output cap. The model scores every supplied
 // question, and a thinking model spends 13K-24K tokens reasoning first (measured
 // on DeepSeek V4.1 Flash). A 2048 or 8192 cap cut that reasoning before any JSON
