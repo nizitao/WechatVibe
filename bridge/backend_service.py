@@ -466,6 +466,32 @@ class Backend:
             raise AccountChangedError()
         return state
 
+    def set_conversation_requested(self, expected_account, session, requested):
+        """Ask for one conversation to be analysed by the background sweep.
+
+        This is the only way a conversation enters the analysis list, and it is what the
+        per-card button calls. Selecting a conversation does not request it.
+        """
+        if not isinstance(expected_account, str) or not expected_account:
+            raise ValueError("invalid expected account")
+        _session_id(session)
+        if type(requested) is not bool:
+            raise ValueError("invalid requested")
+        account = self._selection_account()
+        if account != expected_account:
+            raise AccountChangedError()
+        metadata = self.source.sessions()
+        if metadata.get("account") != account:
+            raise AccountChangedError()
+        if session not in {item.get("username") for item in metadata.get("sessions", [])}:
+            raise ValueError("unknown session")
+        if self._selection_account() != account:
+            raise AccountChangedError()
+        state = self.selection_store.set_requested(account, session, requested)
+        if self._selection_account() != account:
+            raise AccountChangedError()
+        return state
+
     def set_conversation_all_selected(self, expected_account):
         """Put every conversation of the current WeChat account into the sidebar at once."""
         if not isinstance(expected_account, str) or not expected_account:

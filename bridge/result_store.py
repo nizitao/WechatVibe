@@ -19,6 +19,7 @@ from backend_contracts import (
 from guidance_contracts import GUIDANCE_REVISION, valid_guidance
 from portrait_contracts import (empty_portrait_evidence, portrait_synthesis_fingerprint,
                                 valid_mbti_basis, valid_portrait_evidence, valid_synthesis_fingerprint)
+from payload_crypto import default_cipher
 from profile_signals import keyword_counts
 from profile_state import empty_state as empty_profile_state, add_result as add_profile_result
 from api_portrait_statistics import empty_statistics, valid_statistics
@@ -261,7 +262,8 @@ class ResultStore:
         if row is None:
             return {"cursor": None, "complete": False, "context": [], "eligible": 0}
         return {"cursor": tuple(row[:3]) if row[0] is not None else None,
-                "complete": bool(row[3]), "context": json.loads(row[4]), "eligible": row[5]}
+                "complete": bool(row[3]),
+                "context": default_cipher().loads(row[4]) or [], "eligible": row[5]}
 
     def advance(self, account, user, version, cursor, context, item=None, complete=False):
         """Commit only the scan cursor; result summaries are updated on first save."""
@@ -283,7 +285,7 @@ class ResultStore:
             conn.execute("UPDATE progress_v1 SET cursor_seq=?,cursor_shard=?,cursor_local=?,complete=?,"
                          "context_json=?,eligible_count=? WHERE account=? AND session=? AND version=?",
                          (seq, shard, local_id, int(complete),
-                          json.dumps(list(context), ensure_ascii=False), eligible, account, user, version))
+                          default_cipher().dumps(list(context)), eligible, account, user, version))
 
     def recent(self, account, user, version, limit=80):
         with self.connect() as conn:
@@ -409,7 +411,7 @@ class ResultStore:
             if row is None:
                 return None
             saved = {"revision": row[0], "scenario": row[1], "analyzeSelf": bool(row[2]),
-                     "guidance": json.loads(row[3]), "updatedAt": row[4]}
+                     "guidance": default_cipher().loads(row[3]), "updatedAt": row[4]}
         if not valid_guidance(saved["guidance"]):
             with self.connect() as conn:
                 conn.execute("DELETE FROM api_guidance_v1 WHERE account=? AND session=? AND "
@@ -423,7 +425,7 @@ class ResultStore:
                          "(account,session,source_id,subject,revision,scenario,analyze_self,"
                          "payload_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
                          (account, user, source_id, subject, GUIDANCE_REVISION, guidance["scenario"],
-                          int(guidance["analyzeSelf"]), json.dumps(guidance, ensure_ascii=False),
+                          int(guidance["analyzeSelf"]), default_cipher().dumps(guidance),
                           int(time.time())))
 
     def cache_suspended(self, account, source_id):
@@ -470,10 +472,11 @@ class ResultStore:
                                (account, user, source_id, subject)).fetchone()
         if row is None:
             return None
-        portrait = json.loads(row[9])
+        # portrait_json is model-written text, resume_json carries verbatim evidence quotes.
+        portrait = default_cipher().loads(row[9])
         if not valid_api_portrait(portrait):
             raise RuntimeError("invalid saved API portrait")
-        resume = json.loads(row[10]) if row[10] else None
+        resume = default_cipher().loads(row[10])
         if isinstance(resume, dict) and "portraitStatistics" in resume and not valid_statistics(
                 resume["portraitStatistics"]):
             resume.pop("portraitStatistics", None)
@@ -557,8 +560,8 @@ class ResultStore:
                           json.dumps(highwater) if highwater else None,
                           json.dumps(after) if after else None, fingerprint,
                           json.dumps(available, ensure_ascii=False), json.dumps(plan), 0,
-                          int(unchanged), 0, 0, json.dumps(portrait, ensure_ascii=False),
-                          json.dumps(evidence_resume, ensure_ascii=False) if evidence_resume else None))
+                          int(unchanged), 0, 0, default_cipher().dumps(portrait),
+                          default_cipher().dumps(evidence_resume) if evidence_resume else None))
         return self.api_portrait_get(account, user, source_id, subject)
 
     def api_portrait_upgrade_resume(self, account, user, source_id, subject,
@@ -569,8 +572,8 @@ class ResultStore:
                 "UPDATE api_portrait_v1 SET available_json=?,resume_json=? WHERE account=? AND "
                 "session=? AND source_id=? AND subject=? AND fingerprint=? AND batch_index=? "
                 "AND complete=0",
-                (json.dumps(available, ensure_ascii=False), json.dumps(resume), account, user,
-                 source_id, subject, fingerprint, batch_index)).rowcount
+                (json.dumps(available, ensure_ascii=False), default_cipher().dumps(resume),
+                 account, user, source_id, subject, fingerprint, batch_index)).rowcount
             if changed != 1:
                 raise RuntimeError("API portrait checkpoint changed during resume upgrade")
 
@@ -596,7 +599,7 @@ class ResultStore:
             available = json.loads(row[0])
             if resume is not None:
                 resume = dict(resume)
-                previous_resume = json.loads(row[1]) if row[1] else None
+                previous_resume = default_cipher().loads(row[1])
                 if not valid_synthesis_fingerprint(resume.get("synthesisFingerprint")):
                     resume.pop("synthesisFingerprint", None)
                     previous_fingerprint = (previous_resume.get("synthesisFingerprint")
@@ -615,9 +618,9 @@ class ResultStore:
                 available["processedTargetTextCount"] = processed_target
             resume_clause = ",resume_json=?" if resume is not None else ""
             args = (batch_index, int(complete), processed, processed_chars,
-                    json.dumps(portrait, ensure_ascii=False), json.dumps(available, ensure_ascii=False))
+                    default_cipher().dumps(portrait), json.dumps(available, ensure_ascii=False))
             if resume is not None:
-                args += (json.dumps(resume),)
+                args += (default_cipher().dumps(resume),)
             changed = conn.execute("UPDATE api_portrait_v1 SET batch_index=?,complete=?,processed=?,"
                                    "processed_chars=?,portrait_json=?,available_json=?" + resume_clause +
                                    " WHERE account=? AND session=? AND source_id=? AND subject=?",
