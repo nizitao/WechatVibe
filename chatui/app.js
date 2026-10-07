@@ -4867,24 +4867,28 @@ async function saveApiProfileDraft(activate) {
   const acceptProfile = data => {
     if (typeof data.profile === "string") settingsState.apiProfileId = data.profile;
   };
-  let payload = apiProfilePayload(draft);
-  if (activate && payload.profileId) {
-    // `/api/model-source/activate` takes either the connection fields or `{mode, profileId}`,
-    // never both: a mixed body is a 400 `invalid model source request`, which the form used
-    // to report as 启用失败 even though 测试连接 had just succeeded. So "保存并启用" on a
-    // saved profile is save-then-switch — the edits are validated and written first, and the
-    // switch itself stays the instant no-probe path.
-    const saved = await postApiModelSource("/api/model-source/profiles", payload,
-      { busy: "正在保存配置…", done: "配置已保存", failed: "保存失败", accept: acceptProfile });
-    if (!saved) return null;
-    payload = { mode: "api", profileId: payload.profileId };
+  // Saving always goes through `/api/model-source/profiles`: it appends a new profile, and
+  // updates the edited one in place when the body carries its `profileId`.
+  //
+  // 「保存并启用」must not post the connection fields to `activate` instead: that endpoint
+  // takes either the fields or `{mode, profileId}` (a mixed body is a 400 `invalid model
+  // source request`, which the form used to report as 启用失败 right after a successful
+  // 测试连接), and its field form also matches an existing profile by protocol/baseUrl/model
+  // and updates it in place — so adding a second entry for an already-saved connection
+  // silently produced no new row in the model list. Writing first and then switching by id
+  // keeps both buttons on one path and one provider probe.
+  const saved = await postApiModelSource("/api/model-source/profiles", apiProfilePayload(draft),
+    { busy: "正在保存配置…", done: "配置已保存", failed: "保存失败", accept: acceptProfile });
+  if (!saved || !activate) return saved;
+  const profileId = typeof saved.profile === "string" && /^[0-9a-f]{32}$/u.test(saved.profile) ?
+    saved.profile : settingsState.apiProfileId;
+  if (!/^[0-9a-f]{32}$/u.test(profileId)) {
+    text("modelSourceStatus", "保存失败（配置未返回 ID）");
+    return null;
   }
-  const data = await postApiModelSource(
-    activate ? "/api/model-source/activate" : "/api/model-source/profiles",
-    activate ? { mode: "api", ...payload } : payload,
-    { busy: activate ? "正在启用…" : "正在保存配置…", done: activate ? "API 模型已启用" : "配置已保存",
-      failed: activate ? "启用失败" : "保存失败", accept: acceptProfile });
-  if (data && activate && data.mode !== "api") text("modelSourceStatus", "启用失败（来源未切换）");
+  const data = await postApiModelSource("/api/model-source/activate", { mode: "api", profileId },
+    { busy: "正在启用…", done: "API 模型已启用", failed: "启用失败", accept: acceptProfile });
+  if (data && data.mode !== "api") text("modelSourceStatus", "启用失败（来源未切换）");
   return data;
 }
 async function saveApiProfile() { await saveApiProfileDraft(false); }

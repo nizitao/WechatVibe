@@ -397,6 +397,27 @@ class ModelProfileTests(ModelSourceTestCase):
             self.backend.model_source_activate({"mode": "api", "profileId": first["api"]["id"],
                                                 "model": "model-c"})
 
+    def test_activate_matches_an_existing_connection_instead_of_adding_one(self):
+        """Why the settings form saves before switching.
+
+        `activate` with connection fields and no `profileId` looks the connection up by
+        protocol/baseUrl/model and updates that profile in place, so a second entry for an
+        already-saved connection never becomes a new row in the model list. `save_profile`
+        (what `/api/model-source/profiles` calls) always appends for a new profile.
+        """
+        first = self.activate("model-a", name="线路 A")
+        again = self.backend.model_source_activate({
+            "mode": "api", "protocol": "responses", "baseUrl": "https://example.test/v1",
+            "model": "model-a", "apiKey": "test-only-key", "contextTokens": 128000})
+        self.assertEqual(again["sourceId"], first["sourceId"])
+        self.assertEqual([item["id"] for item in again["profiles"]], [first["sourceId"]])
+        appended = self.backend.model_source_profile_save({
+            "name": "线路 A 第二份", "protocol": "responses",
+            "baseUrl": "https://example.test/v1", "model": "model-a",
+            "apiKey": "test-only-key", "contextTokens": 128000})
+        self.assertEqual(len(appended["profiles"]), 2)
+        self.assertNotEqual(appended["profile"], first["sourceId"])
+
     def test_activate_rejects_connection_fields_next_to_a_profile_id(self):
         """Either the connection fields or `{mode, profileId}` — never both.
 

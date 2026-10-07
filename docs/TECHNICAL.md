@@ -393,7 +393,7 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 
 `activate` 的三种入参互斥：`{mode:"local"}`、`{mode:"api",profileId}`（切换到已保存配置，**跳过探测**，因此是瞬时的）、`{mode:"api",...连接字段}`（必要时先探测再落盘）。带 `profileId` 时只允许 `mode`+`profileId` 两个键。
 
-因此设置页的「保存并启用」在**编辑已保存配置**时是两次调用：先 `POST /api/model-source/profiles` 落盘（必要时探测），再用 `{mode:"api",profileId}` 切换。两条合并成一次请求会被 `set(request) != {"mode","profileId"}` 判成 400 `invalid model source request`——历史现象就是「测试连接」成功后点「保存并启用」报「启用失败」。新建配置仍是一次调用（连接字段走探测分支）。
+因此设置页的「保存并启用」**总是两次调用**：先 `POST /api/model-source/profiles` 落盘（新建追加一条、带 `profileId` 则就地更新，必要时探测），再用 `{mode:"api",profileId}` 切换。把连接字段直接发给 `activate` 有两个后果：带 `profileId` 的混合请求会被判成 400 `invalid model source request`（历史现象：「测试连接」成功后点「保存并启用」报「启用失败」）；不带 `profileId` 时会命中已有连接并就地更新，**不会新增一条**（历史现象：「加了新配置，但模型下拉菜单里没有」）。详见 §12.13。
 
 `/api/model-source/*` 的响应统一是 `public()` 形状（下表最后一列），`profiles` 与 `label` 供设置页与标题栏徽标使用。
 
@@ -1052,7 +1052,7 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 截至 2026-10-07：API 沟通建议、API worker 池、并行测试体系、多档案模型来源、分析请求名单与结果落盘加密都已提交（`b2e6006`、`5c8c9a1`、`5cf5783`、`336d8c8` 等），`scripts/stage-real-client.py` 白名单与 `package.json` 的并行测试入口均已就位。此后又落了三块互相独立的工作（同一次提交）：
 
 1. **手选消息分析**：`/api/analyze` 接受 `targetIds`，界面「选择消息」只分析勾中的几条 —— 见 §6.2 与 §12.14。
-2. **修复「测试连接成功但保存并启用失败」**：`activate` 带 `profileId` 时不再混入连接字段，前端改为「先落盘再切换」—— 见 §5.2 与 §12.13。
+2. **修复「保存并启用」的两个坑**：`activate` 带 `profileId` 时不接受连接字段（否则 400「启用失败」），而它的连接字段形式又会命中已有连接就地更新（否则「加了新配置但下拉菜单里没有」）；前端因此统一成「先 `/api/model-source/profiles` 落盘、再按 id 切换」—— 见 §5.2 与 §12.13。
 3. **API 画像 MBTI 观察门槛**：卡片按观察账本 `available.mbtiEvidenceCount` 解锁、逐轴证据数取 `mbtiBasis.evidenceCount`（原先硬编码 1）、失速任务不再显示「正在准备」；`bridge/result_store.py` 的 `api_portrait_get` 负责暴露该计数，`electron/laya/personality.ts` 与 `electron/api-portrait-classifier.ts` 的 API 题面升到 `mbti-api-context-v2`（见 §7.5）。
 
 本轮核对过的一致性状态：
@@ -1168,7 +1168,10 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 - **身份**：`profiles[].id` 是 32 位 hex，直接沿用旧的 `sourceId` 语义，因此 SQLite 里所有 `(account, user, source_id)` 作用域的缓存天然按档案隔离，切换档案不会串用旧结果。
 - **指纹**：`sourceIds{fingerprint→id}`，`fingerprint = sha256(["api-source-v1", protocol, baseUrl, model])`。**一条档案只拥有一个指纹**——`_upsert_profile` 在改写它的 protocol/baseUrl/model 之前会先清掉旧指纹，`_read` 的「指纹值互不重复」不变量才始终成立（否则整份配置会被判损坏）。
 - **落盘与选择是两件独立的事**：`save_profile` 只增删改档案，不动 `selectedMode`/`sourceId`；`select_profile` 只改选择。`model_source_activate` 的顺序是「探测 → `save_profile` → `select_profile` → 发布内存态」，不能颠倒：先落盘选择再探测会让一次失败的探测把来源留在坏配置上。
-- **「保存并启用」对已保存配置是两步**：`chatui/app.js:saveApiProfileDraft(activate)` 在 `payload.profileId` 存在时先发 `/api/model-source/profiles`，再发 `{mode:"api",profileId}`。`activate` 带 `profileId` 时不允许再带连接字段（`model_source_activate` 的 `set(request) != {"mode","profileId"}` 判定），混合请求是 400，而「测试连接」不带 `profileId`／`mode` 所以照样成功——这正是「测试连接成功但保存并启用失败」的成因。契约由 `bridge/test_model_source.py:test_activate_rejects_connection_fields_next_to_a_profile_id` 与 `tests/model-source-settings.test.cjs` 的两个用例钉住；新建配置不受影响，仍是一次调用。
+- **「保存并启用」永远是两步**：`chatui/app.js:saveApiProfileDraft(activate)` 先发 `/api/model-source/profiles`（新建则追加一条，带 `profileId` 则就地更新），拿到响应里的 `profile` 后再发 `{mode:"api",profileId}` 切换。不能省掉第一步，原因有两条：
+  1. `activate` 带 `profileId` 时不允许再带连接字段（`model_source_activate` 的 `set(request) != {"mode","profileId"}` 判定），混合请求是 400 —— 表现为「测试连接成功但保存并启用失败」；
+  2. `activate` 的**连接字段形式**会按 protocol/baseUrl/model 命中已有档案并**就地更新**（`profile_for_endpoint`，注释说明是「不堆积重复项」），所以用它新增一条「同 Base URL + 同模型 ID」的配置时不会多出一行 —— 表现为「加了新配置但模型下拉菜单里没有」。而 `/api/model-source/profiles` 对没有 `profileId` 的请求总是追加。
+  代价不变：连接字段只出现一次，所以探测次数与单请求形式相同，只多一次本地请求。契约由 `bridge/test_model_source.py` 的 `test_activate_matches_an_existing_connection_instead_of_adding_one` / `test_activate_rejects_connection_fields_next_to_a_profile_id` 与 `tests/model-source-settings.test.cjs` 的用例钉住。
 - **密钥沿用**：`resolve_key(protocol, baseUrl, None)` 遍历所有档案，找**协议与 host/path 完全一致**的那条（活动档案优先）。`_upsert_profile` 只在 protocol 与 baseUrl 都未改变时才复用旧密钥，因此「留空沿用已保存密钥」不会把 A 站的密钥带到 B 站。
 - **删除活动档案必须回落本地**：`model_source_profile_delete` 发现删掉的正是 `sourceId` 时，要把 `active_*` 复位为 `LOCAL_SOURCE_ID` 并调 `_cancel_api_source_work_locked()`，否则 worker 会继续指向一份已不存在的配置。
 - **版本迁移**：`version:1` 的单个 `api` 对象在 `_decode_profiles` 中变成 `profiles` 的第一项，并沿用原 `sourceId`（历史缓存键因此不变），下次写入即升级为 `version:2`。

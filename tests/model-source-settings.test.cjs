@@ -220,6 +220,7 @@ it("uses a manual model when listing is unsupported, tests it, and activates onl
     requests.push({ url, body: options?.body ? JSON.parse(options.body) : null });
     if (url.endsWith("/list")) return response({ supported: false, models: [] });
     if (url.endsWith("/test")) return response({ ok: true, latencyMs: 37.6 });
+    if (url.endsWith("/profiles")) return response({ ...apiState, profile: id("c") });
     if (url.endsWith("/activate")) return response(apiState);
     throw new Error("unexpected fetch");
   });
@@ -236,14 +237,20 @@ it("uses a manual model when listing is unsupported, tests it, and activates onl
   assert.equal(byId("apiModelTestStatus").textContent, "连接成功 · 38 ms");
   await ui.activateModelSource("api");
   assert.equal(requests[1].body.model, "model-b");
-  assert.equal(requests[2].body.mode, "api");
+  assert.equal(requests[2].url, "/api/model-source/profiles");
   assert.equal(requests[2].body.contextTokens, 128000);
+  assert.equal(requests[3].body.mode, "api");
   assert.equal(byId("inputApiKey").value, "");
   assert.equal(ui.getSnapshot().mode, "api");
 });
 
 it("keeps the previous active mode when activation fails", async () => {
-  const { ui, byId } = harness(async () => ({ ok: false, status: 401 }));
+  // Saving alone never switches, so the save response still reports the local selection.
+  const savedState = { ...localState, profile: id("c"), profiles: [{ id: id("c"), name: "线路 B",
+    label: "线路 B", protocol: "responses", baseUrl: "https://example.test/v1", model: "model-b",
+    contextTokens: 4096, hasKey: true }] };
+  const { ui, byId } = harness(async url => url.endsWith("/activate")
+    ? { ok: false, status: 401 } : response(savedState));
   ui.showModelSource(localState);
   byId("selectModelSource").value = "api";
   byId("inputApiBaseUrl").value = "https://example.test/v1";
@@ -259,7 +266,7 @@ it("requires a bounded context size before sending API activation", async () => 
   const requests = [];
   const { ui, byId } = harness(async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
-    return response(apiState);
+    return response(url.endsWith("/profiles") ? { ...apiState, profile: id("c") } : apiState);
   });
   ui.showModelSource(localState);
   byId("selectApiProtocol").value = "responses";
@@ -272,7 +279,8 @@ it("requires a bounded context size before sending API activation", async () => 
   assert.equal(requests.length, 0);
   byId("inputApiContextTokens").value = "4096";
   await ui.activateModelSource("api");
-  assert.equal(requests.length, 1);
+  assert.deepEqual(requests.map(item => item.url),
+    ["/api/model-source/profiles", "/api/model-source/activate"]);
   assert.equal(requests[0].body.contextTokens, 4096);
 });
 
@@ -387,7 +395,7 @@ it("updates the selected profile in place and names the request with its id", as
   const requests = [];
   const { ui, byId } = harness(async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
-    return response(url.endsWith("/activate") ? { ...apiState, profile: id("a") } : apiState);
+    return response({ ...apiState, profile: id("a") });
   });
   ui.showModelSource(apiState);
   ui.loadApiProfileDraft(id("a"));
@@ -411,7 +419,7 @@ it("never sends connection fields together with a profile id to activate", async
   const requests = [];
   const { ui, byId } = harness(async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
-    return response(apiState);
+    return response(url.endsWith("/profiles") ? { ...apiState, profile: id("c") } : apiState);
   });
   ui.showModelSource(apiState);
   ui.loadApiProfileDraft(id("a"));
@@ -419,17 +427,21 @@ it("never sends connection fields together with a profile id to activate", async
   for (const request of requests)
     assert.equal(request.url.endsWith("/activate") && Object.keys(request.body).length > 2, false,
       `activate body must be {mode, profileId}: ${JSON.stringify(request.body)}`);
-  // A brand-new profile still activates in one request, carrying the fields it was probed with.
+  // A brand-new profile goes through the same two steps: `/profiles` appends it — posting the
+  // fields to `activate` instead matches the existing profile for that connection and updates
+  // it, so the new entry never appears in the model list.
   byId("selectApiProfile").value = "";
   ui.loadApiProfileDraft("");
   byId("inputApiBaseUrl").value = "https://c.test/v1";
   byId("inputApiModelId").value = "model-c";
   byId("inputApiContextTokens").value = "128000";
   await ui.activateModelSource("api");
-  const last = requests.at(-1);
-  assert.equal(last.url, "/api/model-source/activate");
-  assert.deepEqual(last.body, { mode: "api", protocol: "responses", baseUrl: "https://c.test/v1",
+  const tail = requests.slice(-2);
+  assert.deepEqual(tail.map(item => item.url),
+    ["/api/model-source/profiles", "/api/model-source/activate"]);
+  assert.deepEqual(tail[0].body, { protocol: "responses", baseUrl: "https://c.test/v1",
     model: "model-c", contextTokens: 128000 });
+  assert.deepEqual(tail[1].body, { mode: "api", profileId: id("c") });
 });
 
 it("deletes only after an explicit confirmation and then falls back to the remaining model", async () => {
