@@ -10,11 +10,13 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 
 from backend_contracts import (
     FINE_LABEL_SCHEMA, LOCAL_SOURCE_ID, ROOT, empty_api_portrait, valid_api_portrait,
 )
+from guidance_contracts import GUIDANCE_REVISION, valid_guidance
 from portrait_contracts import (empty_portrait_evidence, portrait_synthesis_fingerprint,
                                 valid_mbti_basis, valid_portrait_evidence, valid_synthesis_fingerprint)
 from profile_signals import keyword_counts
@@ -85,6 +87,14 @@ class ResultStore:
                          "session TEXT NOT NULL, subject TEXT NOT NULL, highwater_json TEXT, "
                          "fingerprint TEXT NOT NULL, available_json TEXT NOT NULL, "
                          "PRIMARY KEY(account,session,subject))")
+            # One deep-semantic reading plus its scenario advice per conversation and
+            # subject. The revision is part of the scope so a prompt change never
+            # reuses an older result, and the row is replaced wholesale on recompute.
+            conn.execute("CREATE TABLE IF NOT EXISTS api_guidance_v1 (account TEXT NOT NULL, "
+                         "session TEXT NOT NULL, source_id TEXT NOT NULL, subject TEXT NOT NULL, "
+                         "revision TEXT NOT NULL, scenario TEXT NOT NULL, analyze_self INTEGER NOT NULL, "
+                         "payload_json TEXT NOT NULL, updated_at INTEGER NOT NULL, "
+                         "PRIMARY KEY(account,session,source_id,subject))")
             conn.execute("CREATE TABLE IF NOT EXISTS api_source_meta_v1 (account TEXT NOT NULL, "
                          "source_id TEXT NOT NULL, protocol TEXT NOT NULL, model TEXT NOT NULL, "
                          "PRIMARY KEY(account,source_id))")
@@ -389,6 +399,33 @@ class ResultStore:
             conn.execute("INSERT OR REPLACE INTO api_source_meta_v1 VALUES (?,?,?,?)",
                          (account, source_id, protocol, model))
 
+    def api_guidance_get(self, account, user, source_id, subject):
+        """Saved guidance for one conversation/subject, or None. A damaged row is
+        dropped rather than surfaced: the caller then reports "not analysed yet"."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT revision,scenario,analyze_self,payload_json,updated_at "
+                               "FROM api_guidance_v1 WHERE account=? AND session=? AND "
+                               "source_id=? AND subject=?", (account, user, source_id, subject)).fetchone()
+            if row is None:
+                return None
+            saved = {"revision": row[0], "scenario": row[1], "analyzeSelf": bool(row[2]),
+                     "guidance": json.loads(row[3]), "updatedAt": row[4]}
+        if not valid_guidance(saved["guidance"]):
+            with self.connect() as conn:
+                conn.execute("DELETE FROM api_guidance_v1 WHERE account=? AND session=? AND "
+                             "source_id=? AND subject=?", (account, user, source_id, subject))
+            return None
+        return saved
+
+    def api_guidance_save(self, account, user, source_id, subject, guidance):
+        with self.connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO api_guidance_v1 "
+                         "(account,session,source_id,subject,revision,scenario,analyze_self,"
+                         "payload_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                         (account, user, source_id, subject, GUIDANCE_REVISION, guidance["scenario"],
+                          int(guidance["analyzeSelf"]), json.dumps(guidance, ensure_ascii=False),
+                          int(time.time())))
+
     def cache_suspended(self, account, source_id):
         with self.connect() as conn:
             return conn.execute("SELECT 1 FROM analysis_cache_suspended_v1 WHERE account=? AND source_id=?",
@@ -610,7 +647,7 @@ class ResultStore:
                                                   "WHERE account=? AND source_id=?",
                                                   (account, LOCAL_SOURCE_ID)).fetchone() is not None}]
             ids = {row[0] for row in conn.execute("SELECT source_id FROM api_source_meta_v1 WHERE account=?", (account,))}
-            for table in ("api_insights_v1", "api_portrait_v1"):
+            for table in ("api_insights_v1", "api_portrait_v1", "api_guidance_v1"):
                 ids.update(raw.split(":", 1)[0] for (raw,) in conn.execute(
                     f"SELECT DISTINCT source_id FROM {table} WHERE account=?", (account,)))
             ids.update(row[0] for row in conn.execute("SELECT source_id FROM analysis_cache_suspended_v1 "
@@ -626,6 +663,8 @@ class ResultStore:
                 portraits = conn.execute("SELECT COUNT(*) FROM (SELECT session,subject FROM api_portrait_v1 "
                                          "WHERE account=? AND source_id LIKE ? GROUP BY session,subject)",
                                          (account, source_id + ":%")).fetchone()[0]
+                guidance = conn.execute("SELECT COUNT(*) FROM api_guidance_v1 WHERE account=? AND "
+                                        "source_id LIKE ?", (account, source_id + ":%")).fetchone()[0]
                 suspended = conn.execute("SELECT 1 FROM analysis_cache_suspended_v1 "
                                          "WHERE account=? AND source_id=?",
                                          (account, source_id)).fetchone() is not None
@@ -633,7 +672,7 @@ class ResultStore:
                                 "label": meta[1] if meta else "旧 API 来源",
                                 **({"protocol": meta[0]} if meta else {}),
                                 "messageCount": insights, "portraitCount": portraits,
-                                "suspended": suspended})
+                                "guidanceCount": guidance, "suspended": suspended})
         return sources
 
     def clear_analysis_cache(self, account, source_id):
@@ -648,7 +687,7 @@ class ResultStore:
                     if table in present:
                         conn.execute(f"DELETE FROM {table} WHERE account=?", (account,))
             else:
-                for table in ("api_insights_v1", "api_portrait_v1"):
+                for table in ("api_insights_v1", "api_portrait_v1", "api_guidance_v1"):
                     conn.execute(f"DELETE FROM {table} WHERE account=? AND source_id LIKE ?",
                                  (account, source_id + ":%"))
                 # A saved source record with zero rows may still carry stale config/job

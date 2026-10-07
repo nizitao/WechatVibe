@@ -123,6 +123,9 @@ function personaHarness(apiImpl, storage) {
     TextEncoder,
     rememberProfileMember() {},
     setTimeout: () => 1, clearTimeout() {},
+    // The deep-semantic card has its own transport; the portrait harness only needs
+    // loadProfile to keep driving the portrait, so the guidance entry points are inert.
+    syncGuidanceMode() {}, cancelGuidancePoll() {}, loadGuidance() {},
   });
   seed(context, {
     sessions: new Map([["friend", { name: "合成联系人", isGroup: false }]]),

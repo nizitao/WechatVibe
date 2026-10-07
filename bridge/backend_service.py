@@ -13,6 +13,7 @@ import json
 import math
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -22,6 +23,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import message_input
+from api_pool import ApiAnalyzerPool, MAX_API_WORKERS
 from api_tasks import ApiTaskCoordinator
 from api_portrait_statistics import (append_batch, profile_from_statistics,
                                     valid_statistics, validate_batch_signal)
@@ -41,9 +43,15 @@ from backend_contracts import (
 )
 from conversation_selection import ConversationSelectionStore, _session_id
 from data_root_source import DataRootSource
+from guidance_contracts import (GUIDANCE_CONTEXT_CHARACTERS, GUIDANCE_FEEDBACK_MAX,
+                                GUIDANCE_PORTRAIT_CONTEXT_MAX, GUIDANCE_REVISION,
+                                GUIDANCE_SCENARIOS, GUIDANCE_SUMMARY_CONTEXT_MAX,
+                                GUIDANCE_WINDOW_MESSAGES, MAX_SUBTEXTS, guidance_scope,
+                                normalize_guidance)
 from history_browser import browse as browse_history, saved_results as saved_history_results, search as search_history
 from message_results import validate_fine_result, validate_portrait_result
-from model_source import LOCAL_SOURCE_ID, ModelSourceStore, ModelSourceUnavailable, connection_values
+from model_source import (LOCAL_SOURCE_ID, ModelSourceStore, ModelSourceUnavailable,
+                            connection_values, profile_name)
 from node_analysis import NodeAnalysis
 from profile_signals import keywords_from_counts, summary_from_aggregate
 from profile_state import empty_state as empty_profile_state, traits_from_state
@@ -135,6 +143,10 @@ class Backend:
         self.model_source_store = model_source_store or ModelSourceStore(
             ROOT / ".local" / "real-client-runtime" / "api-model-source.json", root=ROOT,
             legacy_path=ROOT / ".local" / "real-client-runtime" / "model-source.json")
+        # Message-label turns run one per analyzer, so N conversations can be in flight
+        # at once. Slot 0 is always the current api_analyzer, which keeps the injected
+        # test doubles working; extras are separate API-only processes.
+        self.api_pool = ApiAnalyzerPool(lambda: self.api_analyzer)
         # API chat insights have their own source-scoped cache. The local Laya
         # portrait/affinity worker keeps its existing analysis version.
         # One ApiTaskCoordinator owns the lock/condition, the three registries and
@@ -146,6 +158,7 @@ class Backend:
         self.api_condition = self.api_tasks.condition
         self.api_jobs = self.api_tasks.insight_jobs
         self.api_portrait_jobs = self.api_tasks.portrait_jobs
+        self.api_guidance_jobs = self.api_tasks.guidance_jobs
         self.api_portrait_inventory_jobs = self.api_tasks.inventory_jobs
         self.model_source_revision = 0
         self.active_model_source_mode = "local"
@@ -362,6 +375,8 @@ class Backend:
             close_api = getattr(self.api_analyzer, "close", None)
             if callable(close_api):
                 close_api()
+        # Pool extras are separate processes and are never the primary.
+        self.api_pool.close_extras()
         if self.api_probe_analyzer not in (self.analyzer, self.api_analyzer):
             close_probe = getattr(self.api_probe_analyzer, "close", None)
             if callable(close_probe):
@@ -643,6 +658,9 @@ class Backend:
         """Stop old-source model calls; saved portraits, cursors and the source-independent
         inventory stay intact. Only insight/portrait jobs are cancelled."""
         self.api_tasks.invalidate_models()
+        # Every pooled analyzer holds provider turns of its own; cancelling only the
+        # primary would leave the extras running against the old source.
+        self.api_pool.invalidate()
         seen = set()
         for analyzer in (self.api_analyzer, self.api_portrait_analyzer,
                          self.api_probe_analyzer):
@@ -652,6 +670,40 @@ class Backend:
             cancel = getattr(analyzer, "cancel", None)
             if callable(cancel):
                 cancel()
+
+    def _profile_id(self, value):
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+            raise ValueError("invalid model source request")
+        return value
+
+    def _commit_api_source_locked(self, source_id, config, previous_context):
+        """Publish a probed configuration as the active source."""
+        changed_source = (self.active_model_source_mode != "api" or
+                          self.active_model_source_id != source_id or
+                          self.active_api_config != config)
+        self.active_model_source_mode = "api"
+        self.active_model_source_id = source_id
+        self.active_api_config = config
+        if changed_source:
+            self._cancel_api_source_work_locked()
+        if previous_context != config["contextTokens"]:
+            self.api_tasks.drop_portrait_error(source_id)
+        self.model_source_revision += 1
+
+    def _activate_saved_profile(self, profile_id):
+        """Switch to a stored profile. It was probed before it was saved, so no
+        network round trip is needed and the switch stays instant."""
+        self._profile_id(profile_id)
+        with self.api_lock:
+            profile = self.model_source_store.profile(profile_id)
+            if profile is None:
+                raise ValueError("invalid model source request")
+            config = {field: profile[field] for field in
+                      ("protocol", "baseUrl", "model", "contextTokens")}
+            previous_context = (self.active_api_config or {}).get("contextTokens")
+            self.model_source_store.select_profile(profile_id)
+            self._commit_api_source_locked(profile_id, config, previous_context)
+            return self.model_source()
 
     def model_source_activate(self, request):
         if request == {"mode": "local"}:
@@ -667,19 +719,35 @@ class Backend:
                 return self.model_source()
         if not isinstance(request, dict) or request.get("mode") != "api":
             raise ValueError("invalid model source request")
-        values = connection_values({key: value for key, value in request.items() if key != "mode"},
+        if "profileId" in request:
+            if set(request) != {"mode", "profileId"}:
+                raise ValueError("invalid model source request")
+            return self._activate_saved_profile(request["profileId"])
+        allowed = {"mode", "profileId", "name", "protocol", "baseUrl", "apiKey", "model",
+                   "contextTokens"}
+        if not request.keys() <= allowed:
+            raise ValueError("invalid model source request")
+        values = connection_values({key: value for key, value in request.items()
+                                    if key not in ("mode", "profileId", "name")},
                                    require_model=True)
         if values["contextTokens"] is None:
             raise ValueError("contextTokens required")
+        name = profile_name(request.get("name"), values["model"])
+        profile_id = self._profile_id(request["profileId"]) if "profileId" in request else None
         with self.api_lock:
             key = self.model_source_store.resolve_key(values["protocol"], values["baseUrl"],
                                                       values["apiKey"])
             revision = self.model_source_revision
-            saved_profile = self.model_source_store.saved_selection()["api"]
+            # Activating a connection that a stored profile already covers updates that
+            # profile in place instead of piling up duplicates.
+            target = (self.model_source_store.profile(profile_id) if profile_id else
+                      self.model_source_store.profile_for_endpoint(
+                          values["protocol"], values["baseUrl"], values["model"]))
+            if profile_id is None and target is not None:
+                profile_id = target["id"]
             reuse_validated = (values["apiKey"] is None and key is not None and
-                               saved_profile is not None and
-                               (saved_profile["protocol"], saved_profile["baseUrl"],
-                                saved_profile["model"]) ==
+                               target is not None and target["encryptedKey"] and
+                               (target["protocol"], target["baseUrl"], target["model"]) ==
                                (values["protocol"], values["baseUrl"], values["model"]))
         if not reuse_validated:
             try:
@@ -692,37 +760,95 @@ class Backend:
         with self.api_lock:
             if self.closing or revision != self.model_source_revision:
                 raise ModelSourceUnavailable("model source changed during connection test")
-            saved = self.model_source_store.saved_selection()
-            previous_context = saved["api"].get("contextTokens") if saved["api"] else None
-            source_id = self.model_source_store.save_api(
-                values["protocol"], values["baseUrl"], values["model"], key,
-                context_tokens=values["contextTokens"])
-            changed_source = (self.active_model_source_mode != "api" or
-                              self.active_model_source_id != source_id or
-                              previous_context != values["contextTokens"])
-            self.active_model_source_mode = "api"
-            self.active_model_source_id = source_id
-            self.active_api_config = {field: values[field] for field in
-                                      ("protocol", "baseUrl", "model", "contextTokens")}
-            if changed_source:
+            previous_context = (self.active_api_config or {}).get("contextTokens")
+            source_id = self.model_source_store.save_profile(
+                profile_id, name, values["protocol"], values["baseUrl"], values["model"], key,
+                values["contextTokens"])
+            self.model_source_store.select_profile(source_id)
+            self._commit_api_source_locked(
+                source_id, {field: values[field] for field in
+                            ("protocol", "baseUrl", "model", "contextTokens")},
+                previous_context)
+            return self.model_source()
+
+    def model_source_profile_save(self, request):
+        """Create or update one profile without switching the conversation to it."""
+        allowed = {"profileId", "name", "protocol", "baseUrl", "apiKey", "model", "contextTokens"}
+        if not isinstance(request, dict) or not request.keys() <= allowed:
+            raise ValueError("invalid model source request")
+        values = connection_values({key: value for key, value in request.items()
+                                    if key not in ("profileId", "name")}, require_model=True)
+        if values["contextTokens"] is None:
+            raise ValueError("contextTokens required")
+        name = profile_name(request.get("name"), values["model"])
+        profile_id = self._profile_id(request["profileId"]) if "profileId" in request else None
+        with self.api_lock:
+            key = self.model_source_store.resolve_key(values["protocol"], values["baseUrl"],
+                                                      values["apiKey"])
+            revision = self.model_source_revision
+            existing = self.model_source_store.profile(profile_id) if profile_id else None
+            if profile_id is not None and existing is None:
+                raise ValueError("invalid model source request")
+            # Editing the profile the conversation already runs on must not leave the
+            # worker pointing at the previous values.
+            active = (self.active_model_source_mode == "api" and
+                      self.active_model_source_id == profile_id)
+            reuse_validated = (values["apiKey"] is None and key is not None and
+                               existing is not None and existing["encryptedKey"] and
+                               (existing["protocol"], existing["baseUrl"], existing["model"]) ==
+                               (values["protocol"], values["baseUrl"], values["model"]))
+        if not reuse_validated:
+            try:
+                tested = self.api_probe_analyzer.model_test(values["protocol"], values["baseUrl"], key,
+                                                  values["model"])
+            except Exception as exc:
+                raise model_source_failure(exc, "model connection failed") from exc
+            if not isinstance(tested, dict) or tested.get("ok") is not True:
+                raise ModelSourceUnavailable("model connection failed")
+        with self.api_lock:
+            if self.closing or revision != self.model_source_revision:
+                raise ModelSourceUnavailable("model source changed during connection test")
+            previous_context = (self.active_api_config or {}).get("contextTokens") if active else None
+            source_id = self.model_source_store.save_profile(
+                profile_id, name, values["protocol"], values["baseUrl"], values["model"], key,
+                values["contextTokens"])
+            if active:
+                self._commit_api_source_locked(
+                    source_id, {field: values[field] for field in
+                                ("protocol", "baseUrl", "model", "contextTokens")},
+                    previous_context)
+            return {**self.model_source(), "profile": source_id}
+
+    def model_source_profile_delete(self, request):
+        if not isinstance(request, dict) or set(request) != {"profileId"}:
+            raise ValueError("invalid model source request")
+        profile_id = self._profile_id(request["profileId"])
+        with self.api_lock:
+            if self.model_source_store.delete_profile(profile_id):
+                # Removing the profile the worker is bound to would leave it pointing at
+                # configuration that no longer exists, so fall back to the local model.
+                self.active_model_source_mode = "local"
+                self.active_model_source_id = LOCAL_SOURCE_ID
+                self.active_api_config = None
+                self.model_source_revision += 1
                 self._cancel_api_source_work_locked()
-            if previous_context != values["contextTokens"]:
-                self.api_tasks.drop_portrait_error(source_id)
-            self.model_source_revision += 1
             return self.model_source()
 
     def model_source_clear_key(self, request):
-        if request != {}:
+        if not isinstance(request, dict) or not request.keys() <= {"profileId"}:
             raise ValueError("invalid model source request")
+        profile_id = self._profile_id(request["profileId"]) if "profileId" in request else None
         with self.api_lock:
             was_api = self.active_model_source_mode == "api"
-            self.model_source_store.clear_key()
-            self.active_model_source_mode = "local"
-            self.active_model_source_id = LOCAL_SOURCE_ID
-            self.active_api_config = None
-            self.model_source_revision += 1
-            if was_api:
-                self._cancel_api_source_work_locked()
+            reverted = self.model_source_store.clear_key(profile_id)
+            if reverted or profile_id is None:
+                if was_api:
+                    self.active_model_source_mode = "local"
+                    self.active_model_source_id = LOCAL_SOURCE_ID
+                    self.active_api_config = None
+                self.model_source_revision += 1
+                if was_api:
+                    self._cancel_api_source_work_locked()
             return self.model_source()
 
     def model_insights(self, user, ids=None):
@@ -745,6 +871,25 @@ class Backend:
         return {"account": account, "sourceId": source_id, "results": results, "job": job,
                 "suspended": suspended}
 
+    def _api_source_snapshot(self):
+        """The single gate every provider turn passes: no user-chosen API source, no call.
+
+        Returning the source id, a copy of the config and the resolved key from one critical
+        section keeps the "which endpoint is live" decision atomic, and leaves one place to
+        audit when a new API entry point is added.
+
+        `model_source_list` and `model_source_test` deliberately do NOT come through here: an
+        endpoint has to be probed before it can be activated, so those two run while the
+        active source is still local, and only ever on an explicit click.
+        """
+        with self.api_lock:
+            if self.active_model_source_mode != "api" or not self.active_api_config:
+                raise ModelSourceUnavailable("API model is not active")
+            config = dict(self.active_api_config)
+            return (self.active_model_source_id, config,
+                    self.model_source_store.resolve_key(config["protocol"],
+                                                        config["baseUrl"], None))
+
     def start_model_insights(self, requested_account, user, limit, target_ids=None, around=None):
         started = time.perf_counter()
         if type(limit) is not int or not 1 <= limit <= 500:
@@ -762,11 +907,7 @@ class Backend:
         if account != requested_account:
             raise AccountChangedError()
         with self.api_lock:
-            if self.active_model_source_mode != "api" or not self.active_api_config:
-                raise ModelSourceUnavailable("API model is not active")
-            source_id = self.active_model_source_id
-            config = dict(self.active_api_config)
-            api_key = self.model_source_store.resolve_key(config["protocol"], config["baseUrl"], None)
+            source_id, config, api_key = self._api_source_snapshot()
         window = (browse_history(self.source, account, user, around=around, limit=500,
                                  max_issued_images=MAX_ISSUED_IMAGES)["messages"]
                   if around is not None else self.source.messages(user, 500))
@@ -918,21 +1059,24 @@ class Backend:
 
                     # Test doubles and legacy analyzers may keep their six-argument
                     # contract. Pass the optional callback whenever the adapter
-                    # explicitly exposes it, including streaming test doubles.
-                    model_insights = self.api_analyzer.model_insights
-                    try:
-                        supports_delta = ("on_delta" in
-                                          inspect.signature(model_insights).parameters)
-                    except (TypeError, ValueError):
-                        supports_delta = isinstance(self.api_analyzer, NodeAnalysis)
-                    if supports_delta:
-                        response = model_insights(
-                            config["protocol"], config["baseUrl"], api_key, config["model"],
-                            wire, target_ids, on_delta=on_delta)
-                    else:
-                        response = model_insights(
-                            config["protocol"], config["baseUrl"], api_key, config["model"],
-                            wire, target_ids)
+                    # explicitly exposes it, including streaming test doubles. The lease
+                    # is taken per attempt so a retry backoff does not hold a slot.
+                    with self.api_pool.lease() as analyzer:
+                        model_insights = analyzer.model_insights
+                        try:
+                            supports_delta = ("on_delta" in
+                                              inspect.signature(model_insights).parameters)
+                        except (TypeError, ValueError):
+                            supports_delta = isinstance(analyzer, NodeAnalysis)
+                        if supports_delta:
+                            response = model_insights(
+                                config["protocol"], config["baseUrl"], api_key, config["model"],
+                                wire, target_ids, on_delta=on_delta)
+                        else:
+                            response = model_insights(
+                                config["protocol"], config["baseUrl"], api_key, config["model"],
+                                wire, target_ids)
+                    self.api_pool.note_success()
                     job.setdefault("timings", {})["providerMs"] = round(
                         (time.perf_counter() - provider_started) * 1000, 3)
                     response_timings = response.get("timings") if isinstance(response, dict) else None
@@ -959,6 +1103,10 @@ class Backend:
                         (time.perf_counter() - validate_started) * 1000, 3)
                 except Exception as exc:
                     code = str(exc)
+                    if code == "rate-limit":
+                        # The provider (or the Node lane queue) is throttling us. Step the
+                        # pool down before the per-job retry storm adds more turns.
+                        self.api_pool.note_rate_limited()
                     if attempt >= API_INSIGHT_RETRY_MAX or code not in API_INSIGHT_RETRYABLE:
                         raise
                     self._assert_scope(scope)
@@ -998,6 +1146,192 @@ class Backend:
                 job["status"] = "error"
         finally:
             self.api_tasks.finish()
+
+    def _api_subject_summary(self, store, account, user, source_id, subject):
+        """A short saved description of one subject, or "" when nothing is stored yet.
+
+        Guidance reads the same portrait summary the message labels use, so the advice
+        and the portrait card can never describe the same person differently.
+        """
+        saved = store.api_portrait_get(account, user, api_portrait_scope(source_id), subject)
+        if not saved:
+            return ""
+        statistics = (saved.get("resume") or {}).get("portraitStatistics")
+        if valid_statistics(statistics):
+            derived = profile_from_statistics(statistics, statistics["classifierVersion"],
+                                              is_group=user.endswith("@chatroom"), subject=subject)
+            return (derived["summary"] or "")[:GUIDANCE_SUMMARY_CONTEXT_MAX]
+        return (saved["portrait"]["summary"] or "")[:GUIDANCE_SUMMARY_CONTEXT_MAX]
+
+    def guidance(self, user, member=None):
+        account, workdir, store = self._scoped_identity()
+        with self.api_lock:
+            mode, source_id = self.active_model_source_mode, self.active_model_source_id
+            job = dict(self.api_guidance_jobs.get(
+                (account, user, source_id, member or user)) or {"id": None, "status": "idle"})
+        saved = None
+        if mode == "api":
+            saved = store.api_guidance_get(account, user, guidance_scope(source_id), member or user)
+        self._assert_scope((account, workdir))
+        return {"account": account, "sourceId": source_id, "subject": member or user,
+                "version": GUIDANCE_REVISION, "guidance": saved, "job": job,
+                "suspended": store.cache_suspended(account, source_id) if mode == "api" else False}
+
+    def start_guidance(self, requested_account, user, member=None, scenario="general",
+                       analyze_self=False, feedback=None):
+        if member is not None and (not user.endswith("@chatroom") or
+                                   not isinstance(member, str) or not 1 <= len(member) <= 256):
+            raise ValueError("invalid guidance subject")
+        if scenario not in GUIDANCE_SCENARIOS:
+            raise ValueError("invalid guidance scenario")
+        if type(analyze_self) is not bool:
+            raise ValueError("invalid guidance self-style flag")
+        if feedback is not None:
+            if (not isinstance(feedback, str) or len(feedback) > GUIDANCE_FEEDBACK_MAX or
+                    any(ord(char) < 32 or ord(char) == 127 for char in feedback)):
+                raise ValueError("invalid guidance feedback")
+            feedback = feedback.strip() or None
+        account, workdir, store = self._scoped_identity()
+        if account != requested_account:
+            raise AccountChangedError()
+        with self.api_lock:
+            source_id, config, api_key = self._api_source_snapshot()
+            subject = member or user
+            job_key = (account, user, source_id, subject)
+            current = self.api_guidance_jobs.get(job_key)
+            if current and current["status"] in ("queued", "running"):
+                return {"account": account, "sourceId": source_id, "subject": subject,
+                        "job": dict(current)}
+            if store.cache_suspended(account, source_id):
+                return {"account": account, "sourceId": source_id, "subject": subject,
+                        "job": {"id": None, "status": "suspended"}}
+        window = self.source.messages(user, GUIDANCE_WINDOW_MESSAGES)
+        self._assert_scope((account, workdir))
+        group = user.endswith("@chatroom")
+        wire = []
+        eligible = []
+        characters = 0
+        for item in reversed(window):
+            if item["side"] not in ("self", "other") or item["kind"] != "text":
+                continue
+            text = item["text"]
+            if not isinstance(text, str):
+                continue
+            characters += len(text)
+            if characters > GUIDANCE_CONTEXT_CHARACTERS:
+                break
+            wire.append({"id": item["id"],
+                         "sender": "SELF" if item["side"] == "self" else "OTHER",
+                         "text": text})
+            if (item["side"] == "other" and text.strip() and len(eligible) < MAX_SUBTEXTS and
+                    (not group or not member or item.get("senderId") == member)):
+                eligible.append(item["id"])
+        if not eligible:
+            return {"account": account, "sourceId": source_id, "subject": subject,
+                    "job": {"id": None, "status": "insufficient"}}
+        other_portrait = self._api_subject_summary(
+            store, account, user, source_id, subject)[:GUIDANCE_PORTRAIT_CONTEXT_MAX]
+        job = {"id": uuid.uuid4().hex, "status": "queued", "scenario": scenario,
+               "analyzeSelf": analyze_self, "targetCount": len(eligible),
+               "startedAtMs": int(time.time() * 1000)}
+        self.api_guidance_jobs[job_key] = job
+        if len(self.api_guidance_jobs) > API_JOB_CACHE_LIMIT:
+            for old_key, old_job in list(self.api_guidance_jobs.items()):
+                if len(self.api_guidance_jobs) <= API_JOB_CACHE_LIMIT:
+                    break
+                if old_key != job_key and old_job["status"] not in ("queued", "running"):
+                    del self.api_guidance_jobs[old_key]
+        self.api_tasks.begin()
+        thread = threading.Thread(target=self._run_guidance,
+                                  args=(job_key, job, (account, workdir), store, config,
+                                        api_key, wire, eligible, other_portrait, feedback),
+                                  daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            self.api_tasks.finish()
+            job["status"] = "error"
+            job["error"] = "model-analysis-failed"
+            raise
+        return {"account": account, "sourceId": source_id, "subject": subject, "job": dict(job)}
+
+    def _run_guidance(self, job_key, job, scope, store, config, api_key, wire, targets,
+                      other_portrait, feedback):
+        try:
+            with self.api_lock:
+                if (self.closing or self.active_model_source_mode != "api" or
+                        self.active_model_source_id != job_key[2]):
+                    job["status"] = "error"
+                    job["error"] = "model-source-changed"
+                    return
+                job["status"] = "running"
+            for attempt in range(API_MODEL_RETRY_MAX + 1):
+                try:
+                    with self.api_lock:
+                        if self.api_guidance_jobs.get(job_key) is not job:
+                            raise RuntimeError("model-source-changed")
+                    self._assert_scope(scope)
+                    with self.api_pool.lease() as analyzer:
+                        response = analyzer.model_guidance(
+                            config["protocol"], config["baseUrl"], api_key, config["model"],
+                            wire, targets, job["scenario"], job["analyzeSelf"],
+                            config["contextTokens"],
+                            other_portrait or None,
+                            self._guidance_self_summary(store, job_key) if job["analyzeSelf"] else None,
+                            feedback)
+                    self.api_pool.note_success()
+                    guidance = normalize_guidance(response.get("guidance"))
+                    if guidance is None:
+                        raise RuntimeError("invalid-guidance")
+                except Exception as exc:
+                    code = str(exc)
+                    if code == "rate-limit":
+                        self.api_pool.note_rate_limited()
+                    if attempt >= API_MODEL_RETRY_MAX or code not in API_MODEL_RETRYABLE:
+                        raise
+                    self._assert_scope(scope)
+                    self._wait_api_model_retry(self.api_guidance_jobs, job_key, job, store,
+                                               code, attempt + 1)
+                    continue
+                break
+            with self.api_lock:
+                if (self.closing or self.active_model_source_mode != "api" or
+                        self.active_model_source_id != job_key[2] or
+                        self.api_guidance_jobs.get(job_key) is not job or
+                        store.cache_suspended(job_key[0], job_key[2])):
+                    raise RuntimeError("model-source-changed")
+                source_lock = getattr(self.source, "lock", None)
+                with source_lock if source_lock is not None else nullcontext():
+                    self._assert_scope(scope)
+                    store.api_guidance_save(job_key[0], job_key[1],
+                                            guidance_scope(job_key[2]), job_key[3], guidance)
+                job["status"] = "done"
+        except Exception as exc:
+            code = str(exc)
+            with self.api_lock:
+                job.pop("retry", None)
+                job["error"] = code if code in MODEL_CONNECTOR_ERRORS or code in {
+                    "model-source-changed", "invalid-guidance", "guidance-version-invalid",
+                    "invalid-request"} else "model-analysis-failed"
+                job["status"] = "error"
+        finally:
+            self.api_tasks.finish()
+
+    def _guidance_self_summary(self, store, job_key):
+        """The user's own conversation summary, read only when the switch asks for it."""
+        saved = store.api_portrait_get(job_key[0], job_key[1],
+                                       api_portrait_scope(job_key[2]), job_key[1])
+        if not saved:
+            return None
+        statistics = (saved.get("resume") or {}).get("portraitStatistics")
+        if valid_statistics(statistics):
+            derived = profile_from_statistics(statistics, statistics["classifierVersion"],
+                                              is_group=job_key[1].endswith("@chatroom"),
+                                              subject=job_key[1])
+            summary = derived["summary"] or ""
+        else:
+            summary = saved["portrait"]["summary"] or ""
+        return summary[:GUIDANCE_SUMMARY_CONTEXT_MAX] or None
 
     def _api_portrait_history(self, user, subject, highwater, scope, after=None,
                               piece_limit_bytes=None, cancel_check=None, start_after=None,
@@ -1323,6 +1657,14 @@ class Backend:
         self._ensure_load_monitor()
         return self.worker_status()
 
+    def api_worker_status(self):
+        """Current API parallelism, for the settings row and the API panel tooltip."""
+        return self.api_pool.status()
+
+    def set_api_worker_settings(self, workers=None):
+        """Resize the API analyzer pool and remember the choice for the next launch."""
+        return self.api_pool.configure(workers)
+
     def analysis_overview(self):
         """Whole-account tally behind the sidebar progress bar: how many conversations
         the local background scan has walked to the end of their history, and how many
@@ -1508,11 +1850,7 @@ class Backend:
             raise AccountChangedError()
         subject = member or user
         with self.api_lock:
-            if self.active_model_source_mode != "api" or not self.active_api_config:
-                raise ModelSourceUnavailable("API model is not active")
-            source_id = self.active_model_source_id
-            config = dict(self.active_api_config)
-            api_key = self.model_source_store.resolve_key(config["protocol"], config["baseUrl"], None)
+            source_id, config, api_key = self._api_source_snapshot()
             if store.cache_suspended(account, source_id):
                 return {"account": account, "sourceId": source_id,
                         "job": {"id": None, "status": "suspended", "processed": 0}}
