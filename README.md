@@ -1,349 +1,101 @@
-<div align="center">
+# WechatVibe（nizitao 的个人 fork）
 
-<img src="docs/assets/readme/wechatvibe-logo.png" alt="WechatVibe" width="128">
+上游仓库：[tswawa/WechatVibe](https://github.com/tswawa/WechatVibe)。
 
-# WechatVibe
+本 fork 在上游 **v1.2.4** 的基础上，放进了我们自己提给上游的修复和一套自用改动，
+方便自己构建、也给朋友用。上游的功能说明、下载安装、隐私与免责声明请以上游仓库为准。
 
-微信聊天情感分析客户端<br>
-意图识别 · 情绪感知 · 人物画像 · 群聊画像 · 好感度 · MBTI 聊天推测
+## 我们的改动
 
-[![最新版本](https://img.shields.io/github/v/release/tswawa/WechatVibe?label=release)](https://github.com/tswawa/WechatVibe/releases/latest)
-[![Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)](#运行要求)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+### 一、提给上游的 PR
 
-[功能介绍](#功能介绍) · [下载安装](#下载安装) · [首次使用](#首次使用) · [常见问题](#常见问题) · [数据与隐私](#数据与隐私) · [免责声明](#免责声明) · [交流与反馈](#交流与反馈)
+| PR | 内容 | 状态 |
+| --- | --- | --- |
+| [#13](https://github.com/tswawa/WechatVibe/pull/13) | 逐条情绪 / 意图：宽情绪题（粗粒度 19.7% 到 64.3%）、`caring` / `surprised` 选项（38.9% 到 57.2%）、悬空判断句守卫、schema `generic-v9` 到 `generic-v10`；顺带修掉 [#14](https://github.com/tswawa/WechatVibe/issues/14) 的 API 逐条标签 | **已合并**（只采纳 API 标签部分，见下） |
+| [#10](https://github.com/tswawa/WechatVibe/pull/10) | 本地分析多 worker 并行 + 弹性负载调节 | **已合并**（`d5c0fbe`，随 1.2.4 发布，合入后又做了调整） |
+| [#18](https://github.com/tswawa/WechatVibe/pull/18) | 服务号 / 系统会话不进会话列表（本机 203 降到 149） | **已合并**（`a9e51b0`） |
+| [#19](https://github.com/tswawa/WechatVibe/pull/19) | 一键把全部会话加进侧边栏 | **已合并**（`cd61328`；上游保留「全部添加」，去掉首次启动自动全选，并修掉手动移除的会话又被加回来的问题） |
+| [#20](https://github.com/tswawa/WechatVibe/pull/20) | 只读的整账号分析进度 / 耗时接口 | **已合并**（`da3cec4`） |
+| [#21](https://github.com/tswawa/WechatVibe/pull/21) | 后台分析全部会话的开关、侧栏总进度与并行档位 | **已合并**（`fcdd150`；上游改成默认关闭，并修了进度显示） |
+| [#17](https://github.com/tswawa/WechatVibe/pull/17) | 消息内嵌图片直接显示（点击放大） | 开放；上游表示改动面较大、后续自己做，本 fork 保留该功能 |
+| [#22](https://github.com/tswawa/WechatVibe/pull/22) | 单条消息右键「重新生成测评」（只重算这一条并覆盖已保存结果） | 开放；本 fork 已并入 `main` |
+| [#23](https://github.com/tswawa/WechatVibe/pull/23) | 每条消息显示选项数 1 / 2 / 3：默认 1 与上游现状逐条一致，选 2 / 3 才列出概率最高的前 N 个候选（各带百分比，与第一名接近的标「相近」）；只影响本地模型路径，不改标签 schema。定位是**给用户放权**，同时算**前几个版本多候选显示的再重构** | 开放；本 fork 已并入 `main` |
+| [#31](https://github.com/tswawa/WechatVibe/pull/31) | 修 [#24](https://github.com/tswawa/WechatVibe/issues/24) 的崩溃类问题：进度记录与明细不一致时，尾巴证据的标签不再直接下标，改用 `setdefault` 兜底，整轮分析不会 KeyError 后永久失败；附 5 个复现用例（修复前 4/5 失败） | 开放；**修复分支可单独构建使用**（见下） |
 
-</div>
+**#13 的采纳情况**（上游在 1.2.3 里手工移植）：
 
-WechatVibe 只读读取本机已登录的 Windows 微信，分析聊天中的情绪和意图，并生成人物画像、好感度和 MBTI 推测；接入 API 模型后还可生成潜台词解读与沟通建议。适合想回看聊天中的情绪变化、了解日常交流方式的用户。
+- **采纳**：API 模式逐条标签改用短编号逐条输出（prompt 约 1000 降到 440 字节），这条同时修掉 #14；上游另补上了乱序、重复与流式结果的对应。
+- **未采纳（本 fork 保留）**：逐条显示改用宽情绪题、`caring` / `surprised` 选项、标签 schema `generic-v10`。上游 1.2.4 仍未采纳这块。
+- **未采纳（已丢弃）**：画像输出的容错解析。上游指出 `I:70` 会被算成偏 E 70%（方向反了），且画像已改为程序统一计分，这段逻辑不再需要。
 
-- **本地模型**：使用 [Laya](https://github.com/NandhaKishorM/laya) [多语言 ONNX 模型](https://huggingface.co/mizchi/laya-multilingual-onnx)，在本机完成分析。
-- **API 模式**：可接入 Anthropic、Responses、Chat Completions、Gemini 或 Ollama 兼容接口。
-- **微信数据读取**：基于 [wechatauto-replica](https://github.com/fanyuantaier/wechatauto-replica) 的本地数据库接口，只读获取当前登录账号的会话和消息。
+**#10 按 review 修掉的问题**（已随上游 1.2.4 发布）：
 
-![API 模式下的消息情绪与意图识别](docs/assets/readme/chat-demo.png)
+- `subprocess` 从未导入，探测 `nvidia-smi` 一直抛 `NameError` 又被 `except` 吞掉，显卡 / 显存检测实际从未生效；
+- 每次采样都新建 `psutil.Process()`，`cpu_percent(interval=None)` 恒为 0，自身占用扣不掉；
+- 上限降到 0 时，**已经阻塞在 `tasks.get()` 上**的 worker 仍会取走新任务（现改为取到任务后复查上限，超限就放回队列）；
+- 监控线程退出后句柄没清空，账号清除失败后 resume 时弹性模式不会重启。
 
-<sub>截图中的聊天和分析结果均为虚构演示数据。</sub>
+服务号过滤、会话全选、统计接口与结果库 WAL 已从这个 PR 移出，分别走 #18 / #19 / #20。
 
-## 功能介绍
+### 二、自用改动（已并入 `main`）
 
-### 消息情绪与意图
+上游 1.2.4 采纳了 #10 / #18 / #19 / #20 / #21，这几块**一律改用上游实现**，本 fork 不再维护自用版。
+如今跟着 v1.2.4 走的自用改动只剩下面这些（都是上游没有的）：
 
-在聊天页点击「意图识别」，消息下方会显示情绪和意图两个短标签，例如「开心」「期待」「委屈」，或「分享」「邀约」「求安慰」「婉拒」。
+- **消息内嵌图片**：直接显示、点击放大；图片密钥在后端后台派生并落盘，首次仍需在微信里点开一张图 (→ [#17](https://github.com/tswawa/WechatVibe/pull/17))；
+- **聊天页「刷新」按钮**：手动重新读取会话列表、当前会话与画像；
+- **标签跟随**：发起一次逐条标签后，短时间轮询几次分析读取，新消息的标签尽早出现；
+- **宽情绪题 8 桶**：逐条显示用 `EMOTION_QUESTION`（`caring` 取代 `affectionate`，`surprised` 从 `amused` 拆出），schema 升到 `generic-v10` 以强制刷新旧缓存；
+- **悬空判断句扩展**：`我是` / `这是` / `我这是` 这类悬空判断句不出标签。
 
-- **结合上下文**：参考近期聊天和已保存的人物画像来判断，不只看单句；纯标点消息也能分析。
-- **本地与 API 一致**：两种模式显示方式相同。API 模式的每个标签不超过四个字，使用支持流式返回的接口时会边分析边显示。
-- **人物情绪与群聊氛围**：单聊顶部显示聊天对象当前的情绪状态，群聊顶部显示整体氛围。
-- **随时开关**：关闭标签后再打开，会恢复已有结果。
+另外，还在上游走 PR 的两块**也已经并进 `main`**：#22 单条消息右键「重新生成测评」、#23 每条消息显示选项数。它们不是 fork 独占 —— 上游一旦采纳，就按上面同一口径改用上游实现。（#17 内嵌图片虽然也开着 PR，但上游已表示自己另做，所以仍按上一条由本 fork 保留。）
 
-### 人物画像
+`feat/selfuse-on-1.2.4` 上 `tsc`、Node 测试与 Python 全套通过。
 
-从聊天工具栏或左侧导航进入「人物画像」，在同一页面查看好感度、MBTI 倾向、互动风格和画像摘要。
+### 三、与上游的已知分歧
 
-![人物画像：好感度、MBTI 倾向、互动风格和摘要](docs/assets/readme/profile-demo.png)
+保留自用判定逻辑会带来两处可预期的不一致，下次升级上游时需要留意：
 
-- **好感度**：单聊显示好感度数值和等级，随新消息持续更新。
-- **MBTI 聊天推测**：按 E/I、S/N、T/F、J/P 四个维度显示倾向。该人物已分析的有效文本满 100 条后解锁，依据不足的维度显示为未确定。
-- **互动风格**：六维雷达图，包括表达活力、幽默表达、情绪平和、话题主动、关怀支持和亲近表达。
-- **常聊内容**：根据实际分析过的文本展示高频词。
-- **统一计分**：API 模式按上下文容量整批判断聊天，好感度、MBTI、雷达和摘要使用与本地 Laya 相同的累计和打分规则。
-- **保存与续算**：再次进入时先显示上次的结果，新消息在原有基础上继续分析，切换聊天或重启软件都不会重新分析全部历史；分析中可查看进度和速率。
+- 情绪题是 **8 个桶**（`caring` 取代 `affectionate`，`surprised` 从 `amused` 拆出），上游是 7 个。
+  因此 `tests/api-portrait-classifier.test.ts` 的两处断言按本 fork 的题库调整过（59 改 60、`affectionate` 改成 `caring`）。
+- 逐条显示走宽情绪题 `EMOTION_QUESTION`，上游的逐条显示仍走 18 个立场词；标签 schema 本 fork 是 `generic-v10`，上游是 `generic-v9`。
 
-### 群聊画像
+升级上游时的做法（v1.2.4 这轮实际用的）：从目标版本开分支，上游已经覆盖的功能**直接取上游**，
+只按功能重贴上面这些 fork 独占块；比对时用 `git diff -w` 过滤行尾噪声，最后跑 `tsc`、Node 与 Python 全套。
+v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github.com/silicon-sbt/WechatVibe/tree/selfuse/v1.2.0) 分支，仅作历史对照，不再维护。
 
-在群聊中进入画像页面，可以在「群整体」和具体成员之间切换。
+## 可以单独用的修复分支（基于上游 main，不含自用改动）
 
-![群聊整体画像与成员选择](docs/assets/readme/group-profile-demo.png)
+这两个分支从 `origin/main`（上游）切出，各自只带一个提交、**没有夹带本 fork 的自用改动**，可以直接构建来救急；正式合并仍走上游 PR。
 
-- **群整体**：参与人数、消息数量、分析进度、六维互动风格、常见词和群聊摘要。
-- **成员画像**：搜索或翻页选择成员，查看该成员的互动风格、摘要和 MBTI 聊天推测。
-- **分别保存**：群整体和每个成员各自积累结果，切换时显示对应对象的画像。
+| 分支 | 内容 | 上游状态 |
+| --- | --- | --- |
+| [`fix/state-tail-keyerror`](https://github.com/silicon-sbt/WechatVibe/tree/fix/state-tail-keyerror) | 修 [#24](https://github.com/tswawa/WechatVibe/issues/24) 的三处 `KeyError`（`batch_state.py` / `profile_state.py` / `result_store.py`）：进度被清、明细还在时不再整轮失败，健康状态数值逐字节不变 | [PR #31](https://github.com/tswawa/WechatVibe/pull/31) 开放 |
+| [`fix/key-scan-budget`](https://github.com/silicon-sbt/WechatVibe/tree/fix/key-scan-budget) | 修 [#30](https://github.com/tswawa/WechatVibe/issues/30)：config cipher 扫描预算从 2 GiB / 4 GiB 提到 4 GiB / 8 GiB，微信进程内存涨大后不再「账号永远未就绪」 | 未开 PR —— 留给 issue 作者提，避免撞车 |
 
-### 潜台词与沟通建议
+用法：`git clone -b <分支> https://github.com/silicon-sbt/WechatVibe.git`，然后按上游 README 构建。两个修复也都已经打在本机现役安装目录里验证过（bridge `result=ready required=5 matched=5`、`/api/health state=ready`）。
 
-启用 API 模型后，画像页会多出一张「潜台词与沟通建议」卡片：读出对方话里的言外之意，并给出可直接照着说的回复建议。本地 Laya 模式不提供这张卡片。
+## 分支
 
-- **两种场景**：可选「普通联系人」或「与领导／上级」。后者会额外要求保留对方面子、先接住责任再谈条件、不做无边界退让。
-- **潜台词解读**：逐条列出对方消息的真实意图，并标注语气（偏正面／中性／偏负面／好坏参半）与沟通手法；对方没有明确文本时会直接说明，不硬编。
-- **场景化建议**：给出整体解读、可以直接发送的回复备选，以及最多 4 条策略提示。
-- **针对自己**：在「设置 → 通用设置」开启「自我风格分析」后，同一份结果会额外给出「针对自己」一段，包括做得好的地方和可以调整的地方。
-- **重算**：点「重算」可以先写下对上一次结果的不满意之处再重新生成。你的要求会连同聊天证据一起给模型，**与聊天证据冲突时以证据为准**；不填就直接按最新聊天重算。
-- **按来源保存**：潜台词与建议按模型来源分别保存，会随该来源的缓存一起清除；分析规则更新后需要重新分析。
-
-> 潜台词解读和沟通建议来自模型推测，可能遗漏语境或产生错误，不等于对方真实想法，也不构成心理诊断或沟通处方。
-
-### 聊天记录与账号
-
-软件只读读取本机已登录的微信，支持单聊、群聊、联系人和群头像。图片消息显示为 `[图片]`。
-
-- **按需添加会话**：首次进入只读取会话目录，不加载全部聊天。点击左侧搜索框旁的「＋」，或在「设置 → 信息列表」添加要查看的会话；移出列表不会删除缓存或画像。
-- **历史记录**：分页查看更早的消息，可按关键词或日期查找，并定位到上下文。
-- **聊天记录路径**：自动找不到微信数据时，可在「设置 → 通用设置 → 聊天记录路径」选择 `xwechat_files` 或账号目录，也可以恢复自动发现。选择目录后仍需微信登录并通过账号校验。
-- **多账号**：每个微信账号使用独立的数据库，再次登录时复用原有记录。
-- **清除账号**：在账号管理中清除某个账号在 WechatVibe 里的聊天副本、分析和画像，不影响微信本身的聊天记录。清除当前账号后软件会退出。
-
-<details>
-<summary>截图：选择要查看的会话</summary>
-
-![选择要加入聊天列表的会话](docs/assets/readme/conversations-demo.png)
-
-</details>
-
-### 模型与设置
-
-- **模型来源**：默认使用本地 Laya，也可以接入 API。填写 Base URL、API Key 和上下文大小后，可获取模型列表、测试连接并启用。
-- **多套 API 配置**：可以保存多套 API 配置（例如不同服务商、不同模型），随时增删改。聊天标题栏会显示当前使用的模型名称，点击它就能从下拉菜单里切换当前对话用哪一套；切换只影响之后发起的分析，已经算好的结果仍按各自来源分别保存。在设置页选中某套配置后点「保存并启用」会让它立即生效，点「仅保存配置」则只存起来不切换。删除正在使用的那套配置会自动切回本地模型。</new_string>
-- **上下文容量**：API 画像按模型的上下文容量自动分批，装得下就一次处理。完整的画像判断至少需要 12288 tokens 上下文，不足时会提示。
-- **分析并行数**：「设置 → 通用设置」可分别调整本地与 API 的并行路数（各默认 1 路、最多 4 路），用来同时分析多段会话。本地模式还可开启「跟随负载」，按 CPU、内存和显卡占用自动升降档；API 模式没有「跟随负载」，限制来自接口方，因此改为在遇到接口限流时自动降档、请求恢复后再升回。
-- **分来源保存**：本地和各个 API 模型的结果分开保存，可在设置中分别查看和清除缓存。潜台词与沟通建议同样按来源保存。
-- **运行设置**：浅色/深色主题、界面缩放，以及 CPU/GPU 切换；GPU 不可用时可回退到 CPU。
-
-<details>
-<summary>截图：模型设置与缓存管理</summary>
-
-![本地 Laya 下载与运行设备选择](docs/assets/readme/local-model-demo.png)
-
-![API 服务地址、协议、模型与上下文设置](docs/assets/readme/api-settings-demo.png)
-
-![按本地和 API 模型来源分别管理分析缓存](docs/assets/readme/cache-demo.png)
-
-</details>
-
-## 下载安装
-
-1. 从 [Releases](https://github.com/tswawa/WechatVibe/releases/latest) 下载最新的 `WechatVibe-版本号-windows-x64.zip`。这是标准运行包，不含 Laya 模型。
-2. 解压后保留整个 `win-unpacked` 目录，双击其中的 `WechatVibe.exe`。
-3. 使用本地分析时，在「设置 → 本地部署」下载模型（独立的 `WechatVibe-Laya-model-v1.zip`），或选择已有的模型目录。只用 API 可以跳过这一步。
-
-### 运行要求
-
-| 项目 | 要求 |
+| 分支 | 内容 |
 | --- | --- |
-| 系统 | Windows 10/11 x64 |
-| 微信 | Windows 微信 **4.x**，已实测 **4.1.15.13**；**不支持 3.x** |
-
-<details>
-<summary>本地 Laya 配置参考（只用 API 可以跳过）</summary>
-
-模型约 3.22 亿参数，纯 CPU 即可运行，不需要独立显卡。下表为建议配置，低配设备尚未系统测试。
-
-| 项目 | 建议配置 |
-| --- | --- |
-| CPU | 4 核及以上 x64 处理器；CPU 推理默认使用 4 线程 |
-| 内存 | 8 GB 起步；同时运行微信和其他应用，建议 16 GB 及以上 |
-| GPU（可选） | 支持 WebGPU 的显卡和较新的驱动，不兼容时使用 CPU；最低显存要求暂未确定 |
-| 磁盘 | 至少预留 4 GB，用于应用、模型下载和安装；聊天缓存和更新备份另算 |
-| 模型体积 | 模型包约 599 MB，解压后约 681 MB；文件体积不等于运行时的内存占用 |
-
-首次加载和分析历史消息的速度取决于处理器、内存和聊天量。API 模式不需要下载 Laya，也不需要本地显卡，速度和上下文容量取决于所选的模型服务。本地模式可调高「本地分析并行数」来利用多核和多显卡，详见「模型与设置」。
-
-</details>
-
-## 首次使用
-
-1. **登录微信**：使用 Windows 微信 4.x 登录要分析的账号。
-2. **启动软件**：双击 `WechatVibe.exe`。账号状态可在「设置 → 管理账号」查看，不用等聊天加载完就能使用界面。
-3. **选择模型**：在「设置 → 通用设置」选择模型来源。本地模式下载或选择 Laya 模型；API 模式填写服务地址、API Key 和模型，确认上下文大小，测试连接后保存并启用。需要多套配置时，在「已保存的配置」里切换或新建，每套都能单独保存和启用。
-4. **添加会话**：点击左侧搜索框旁的「＋」，或在「设置 → 信息列表」选择联系人或群聊。
-5. **查看分析**：打开聊天，点击「意图识别」查看消息标签；进入「人物画像」查看画像，群聊还可以选择具体成员。
-6. **（可选）潜台词与建议**：使用 API 模型时，在「人物画像」页选择沟通场景后点「开始分析」，即可看到潜台词解读与可直接照着说的回复建议。
-
-## 软件更新
-
-在「设置 → 关于 → 当前版本」检查更新，发现新版本后点击「下载并安装」。下载的文件会先校验，安装完成后自动重启；账号数据、分析结果、画像和已下载的模型都会保留。安装失败会自动恢复旧版，更新成功后也可以回退到上一版（只保留最近一次）。Windows 设置了系统代理时，更新会沿用该代理连接 GitHub。
-
-各版本的改动见[更新日志](CHANGELOG.md)。
-
-<details>
-<summary>从旧版本升级的注意事项</summary>
-
-- **已有的 API 画像**：1.2.3 起 API 画像改用新规则。升级后先显示旧画像，在画像页点击「更新画像」后才按新规则重新分析。
-- **从内置模型的旧版升级**：原来的 Laya 模型会保留，设置中显示为已就绪。
-- **1.2.1 首版从目录映射（Junction）启动**：如果更新时提示「更新包或安装位置不可用」，请手动下载最新版，退出软件后覆盖原目录，保留 `resources/client/.local` 和 `resources/client/.models`。
-- **从 1.0.4 升级**：旧更新器不支持现在的运行包，需要手动下载。完全退出旧版后，把新包 `win-unpacked` 里的文件覆盖到原软件目录，保留 `resources/client/.local` 和 `resources/client/.models`，不要先删除旧目录。
-
-</details>
-
-## 常见问题
-
-<details>
-<summary>一直显示「当前微信账号未就绪」</summary>
-
-- 确认使用的是 Windows 微信 4.x（不支持 3.x）。使用旧版微信时，请先更新微信并重新登录，再启动 WechatVibe。
-- 微信数据存放在自定义位置时，在「设置 → 通用设置 → 聊天记录路径」手动选择 `xwechat_files` 或账号目录。
-- 仍然无法解决时，运行下面的启动诊断工具，再到 [Issues](https://github.com/tswawa/WechatVibe/issues) 反馈。
-
-</details>
-
-<details>
-<summary>启动时提示「本地服务未就绪」或无法打开</summary>
-
-下载 [WechatVibe-diagnose.bat](https://github.com/tswawa/WechatVibe/releases/download/v1.2.4/WechatVibe-diagnose.bat)，放到 `WechatVibe.exe` 所在目录后双击运行。它会检查文件、运行环境和启动错误并生成报告；不启动应用或模型，不读取聊天数据库和 API Key，也不会自动上传。详见[启动诊断说明](docs/startup-diagnostics.md)。
-
-</details>
-
-<details>
-<summary>升级后人物画像还是旧的</summary>
-
-旧的 API 画像会先保留显示。在画像页点击「更新画像」，才会按新规则重新分析；重建期间会标明正在显示旧画像。
-
-</details>
-
-<details>
-<summary>潜台词与沟通建议不见了或提示需要重新分析</summary>
-
-- 该卡片只在 **API 模式**下出现，本地 Laya 模式没有。
-- 提示「分析规则已更新，请重新分析」表示分析规则随版本变化了，点「开始分析」重新生成一次即可。
-- 提示「暂无对方文本，无法分析潜台词」表示所选会话或群成员还没有可分析的对方文本；先让该会话产生一些消息。
-- 提示「模型不支持当前请求上下文」时，调高「设置 → 通用设置」里的上下文大小后重试。
-- 结果按模型来源保存，切换模型后需要为新来源重新分析；清除该来源缓存也会一并清除。
-
-</details>
-
-<details>
-<summary>标题栏的模型名称点不动 / 切换后没变化</summary>
-
-- 标题栏的模型名称需要先在「设置 → 通用设置」里读取过一次模型来源才会出现；点它会展开下拉菜单，列出全部已保存的 API 配置、本地 Laya，以及「管理 API 配置…」。
-- 切换只改变**之后发起**的分析。正在进行中的分析会中止并按新来源重跑，已保存的结果不受影响。
-- 如果切换失败（例如配置已被删除、服务不可用），标题栏保持原样，并在设置页给出失败原因；此时当前对话仍在原来的模型上。
-- 刚保存但还没启用过的配置不会在标题栏显示为当前项，需先在设置页点「保存并启用」。
-
-</details></new_string>
-
-## 开发
-
-后端按应用服务、微信只读适配器、Node 推理适配器和 SQLite 存储拆分，模块职责、依赖边界和回归命令见[后端架构说明](docs/backend-architecture.md)。完整的模块清单、进程间协议、存储结构、算法与修改影响范围见[技术文档](docs/TECHNICAL.md)。
-
-<details>
-<summary>源码运行</summary>
-
-需要 Node.js **24.11.1**、Python **3.14** 和 npm。在 PowerShell 中执行：
-
-```powershell
-git clone https://github.com/tswawa/WechatVibe.git
-cd WechatVibe
-npm ci
-py -3.14 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --no-deps -r python-requirements.lock.txt
-npm start
-```
-
-Windows 下也可以直接双击仓库根目录的 `Start.bat`（或在 PowerShell 中执行 `.\Start.bat`）一键启动：脚本会检查 Node 与 Python（Python 按 3.14 起向下探测本机已安装版本），并自动补齐缺失的依赖——首次运行执行 `npm ci`、创建 `.venv`、按锁文件安装 Python 依赖——随后启动客户端；只想检查环境而暂不启动时执行 `.\Start.bat --check`。脚本固定使用项目 `.venv` 中的解释器，缺少 Node 或 Python 时会给出对应的安装提示。
-
-需要本地 Laya 时，可在首次启动前执行 `npm run setup:models`，或进入应用后下载；仅使用 API 时可跳过模型下载。源码方式下载模型约 681 MB，下载后校验 SHA-256。下载器保留 `.part` 文件供断点续传，网络失败最多尝试三次；完整文件通过大小和 SHA-256 校验后才替换旧文件，强制下载失败不会删除已有模型。默认目录为 `.models/laya`，可通过 `LAYA_MODEL_DIR` 或 `--dir` 指定。Python 安装时请按锁文件安装并保留 `--no-deps`。
-
-应用内“下载模型”使用 GitHub 上的独立模型 ZIP，安装到 `resources/client/.local/models/laya`。当前桌面下载中断后需要重新下载；上述断点续传功能适用于 `npm run setup:models`，两者使用不同的下载入口。
-
-`npm ci` 完成后会运行 Electron 官方安装器补全桌面运行时；若跳过了安装脚本，启动或构建前执行 `npm run setup:electron`。
-
-Python 脚本优先使用 `WECHATVIBE_PYTHON` 指定的解释器，其次使用当前虚拟环境，再使用项目 `.venv`，避免测试或构建误用系统 Python。便携构建仍要求 Python 3.14 和 Node 24.11.1，可用 `--python-exe` / `--node-exe` 显式指定。`npm run start:service -- --no-open` 可单独启动 bridge；`npm start` 会启动桌面客户端。CPU/GPU 切换位于「设置 → 通用设置」。
-
-</details>
-
-<details>
-<summary>本地验证</summary>
-
-```powershell
-npm test                 # 类型检查 + Node + 桌面/更新脚本 + Python 回归
-npm run test:model       # 真实加载本地 ONNX，执行中文推理（需先下载模型）
-npm run test:recovery    # 桌面、服务恢复、账号存储和启动器测试
-npm run build:portable   # 构建包含模型和运行环境的便携版
-```
-
-</details>
-
-<details>
-<summary>构建运行版</summary>
-
-完成上述依赖和模型安装后，在同一个 PowerShell 窗口运行：
-
-```powershell
-$env:PATH = "$PWD\.venv\Scripts;$env:PATH"
-npm run build:portable
-```
-
-构建命令会打印本次独立的产物目录：`.local/portable-builds/build-*/release/win-unpacked/WechatVibe.exe`。整个 `win-unpacked` 目录构成本地运行版，包含模型和运行环境。公开发行采用**无模型标准包 + 独立 Laya 模型包**；`scripts/build-windows-release.py` 默认生成不含模型的标准 ZIP。
-
-</details>
-
-<details>
-<summary>修改词库</summary>
-
-当前词库包含 40 个情绪、547 个意图细项、98 个表达方式和 80 个人际需求。同义意图共用 215 个简短显示词，表达方式与人际需求两组词表生成 7,840 个组合。
-
-源文件为 `scripts/analysis-catalog-source.json`、`scripts/intent-display-source.json` 和 `scripts/social-intent-source.json`。修改时保留既有 ID，然后执行：
-
-```powershell
-npm run catalog:generate
-```
-
-</details>
-
-## 数据与隐私
-
-- **本地模式（默认）**：使用本地 Laya 在本机推理，本地服务只监听回环地址。
-- **API 模式（需手动开启）**：消息分析会把当前这批聊天文本和简短的画像参考发送给你配置的模型服务；人物画像会按上下文容量发送所选会话的历史文本，由模型判断后，再由程序计算好感度、MBTI、互动风格和摘要。
-- **潜台词与沟通建议（API 模式）**：点「开始分析」或「重算」时，会把当前会话窗口的聊天文本、对方画像摘要，以及你在「重算」里写的不满意之处一起发送给你配置的模型服务。留空即不发送该部分；这些内容同样受上条约束，请按所选服务商的计费与隐私政策自行判断。
-- **保存方式**：聊天副本按微信账号保存，分析结果和画像再按模型来源分开；潜台词与沟通建议也跟着来源保存和清除。每套 API 配置的密钥用 Windows DPAPI 加密后存在本机运行目录里，密文与当前 Windows 用户绑定，换用户或换机器无法解密；明文密钥不会写入日志或结果文件。配置数量上限为 20 套。
-
-使用时请注意：
-
-- 只读取自己有权访问的账号和聊天，不用于获取他人的私人记录。
-- 清除账号只删除 WechatVibe 保存的数据，不删除微信原始聊天。
-- 软件只分析和展示，不自动发送微信消息，也不提供聊天记录导出功能。
-- 不要把聊天数据库、解密密钥、账号缓存或带私人内容的日志上传到仓库、Issue 或交流群。
-- 反馈问题前先检查截图和日志，移除不想公开的姓名、账号和对话。
-
-## 免责声明
-
-WechatVibe 面向技术学习、研究及个人聊天复盘。使用前请确认数据来源和使用方式符合适用法律、微信服务协议及相关第三方服务条款。
-
-- **功能与使用边界**：本项目不提供微信聊天记录导出功能，本地缓存用于应用内查看与分析。项目不提倡通过导出、传播、交易或再利用聊天记录侵犯用户隐私、数据权益或微信相关合法权益，也不为此类用途提供支持。
-- **数据授权**：仅处理本人合法持有、有权访问和分析的聊天记录。能在设备上看到记录，不代表可以任意公开、传播或用于其他目的；涉及他人信息时，应尊重其隐私和合法权益。不得用于盗取账号、未经授权的监控、跟踪、骚扰或其他违法侵权活动。
-- **分析边界**：意图、情绪、好感度、MBTI、潜台词解读和沟通建议均为模型推测，可能遗漏语境或产生错误。结果不等于对方真实想法，不构成心理诊断、人格定性或官方测评，也不应作为作出重大个人决定的唯一依据。
-- **第三方服务**：启用 API 后，所选聊天片段和画像摘要会按功能需要发送至你配置的服务商。请自行了解其计费、数据保存与隐私政策；项目无法替第三方承诺数据安全、服务稳定性或分析准确率。
-- **运行风险**：微信版本、操作系统、权限和第三方组件变化可能影响读取与运行。请保留重要数据备份；项目不保证持续兼容、数据绝不丢失，也不承诺“零风险”或“不会封号”。
-- **许可与担保**：本项目依据 [Apache-2.0](LICENSE) 许可证“按现状”提供。除适用法律要求或另有书面约定外，维护者及贡献者不提供任何明示或默示担保，包括适销性、特定用途适用性及不侵权担保；不承诺分析结果准确、运行持续稳定或适合任何特定使用场景。
-- **使用者责任**：使用者应自行判断本项目是否适合其用途，并负责取得账号、聊天数据及第三方服务所需的授权。由使用者自行决定的数据处理方式、服务配置、结果使用，以及自行或委托第三方实施的修改、部署与运营，由相应使用者、开发者或运营者承担其行为及承诺所对应的责任。
-- **责任限制**：在适用法律允许的最大范围内，且除另有书面约定外，维护者及贡献者不对因使用或无法使用本项目而产生的直接、间接、附带、特殊或后果性损失承担责任，包括数据丢失、账号受限、业务中断及其他损失。担保与责任限制的具体范围以 [Apache-2.0](LICENSE) 许可证第 7 至第 9 条为准。
-
-WechatVibe 为独立项目，与腾讯、微信没有官方隶属、合作或背书关系。相关名称、商标及第三方组件的权利归各自权利人所有。
+| `main` | 跟随上游 v1.2.4 + 「自用改动」 |
+| `feat/selfuse-on-1.2.4` | 本轮升级分支（自用改动搬到 1.2.4） |
+| `feat/selfuse-on-1.2.3` | 上一轮升级分支（已并入 `main`，历史） |
+| `feat/selfuse-on-1.2.2` | 更早的升级分支（历史） |
+| `selfuse/v1.2.0` | v1.2.0 + 旧的原始自用补丁（存档，不再维护） |
+| `feat/inline-image` | PR #17 消息内嵌图片（已并入 `main`，PR 仍开放） |
+| `feat/message-regenerate` | PR #22 单条消息重新生成（已并入 `main`，PR 开放） |
+| `feat/label-option-count` | PR #23 每条消息显示选项数（已并入 `main`，PR 开放） |
+| `feat/parallel-analysis-workers` | PR #10（已合并，可归档） |
+| `fix/emotion-question-options` | PR #13（已合并，可归档） |
+| `feat/service-account-filter` | PR #18（已合并，可归档） |
+| `feat/conversation-add-all` | PR #19（已合并，可归档） |
+| `feat/analysis-overview` | PR #20（已合并，可归档） |
+| `feat/background-sweep-ui` | PR #21（已合并，可归档） |
+| `fix/state-tail-keyerror` | PR #31（基于上游 main 的单提交，可单独构建） |
+| `fix/key-scan-budget` | #30 的扫描预算修复（基于上游 main 的单提交，未开 PR） |
 
 ## 许可
 
-项目采用 [Apache-2.0](LICENSE)。Laya、模型与第三方依赖的来源及许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-演示头像使用 Lisa Wischofsky 的 [Adventurer](https://www.dicebear.com/styles/adventurer/) 插画，经 DiceBear 组合并调整配色，采用 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)；该素材许可独立于项目代码许可。
-
-## 致谢
-
-<details>
-<summary>感谢为本项目提交代码和反馈问题的朋友</summary>
-
-- 感谢 [china-luo](https://github.com/china-luo) 在 [Issue #1](https://github.com/tswawa/WechatVibe/issues/1) 中反馈 Windows 微信 4.1.15.13 的聊天记录读取异常，并提出对非字符串消息类型进行兼容转换的建议。
-- 感谢 [Li Xiang](https://github.com/Misaka1008611) 反馈微信数据库密钥不完整、反复读取的问题，并提供排查信息，帮助定位读取兼容性问题。
-- 感谢 [luo785859020（小闹一起）](https://github.com/luo785859020) 通过 [PR #3](https://github.com/tswawa/WechatVibe/pull/3) 和 [PR #4](https://github.com/tswawa/WechatVibe/pull/4) 改进源码模型下载、Python 环境选择与验证流程，并完成后端职责分层。
-- 感谢 [morticuke](https://github.com/morticuke) 在 [Issue #5](https://github.com/tswawa/WechatVibe/issues/5) 中提供 Windows MIME 映射异常的排查过程和修复建议。
-- 感谢 [Dl1447（Geekline）](https://github.com/Dl1447) 通过 [PR #12](https://github.com/tswawa/WechatVibe/pull/12) 修复选中首个会话后无法继续添加会话的问题。
-- 感谢 [silicon-sbt](https://github.com/silicon-sbt) 通过 [PR #13](https://github.com/tswawa/WechatVibe/pull/13) 改进 API 消息标签的批量结果对应。
-- 感谢 [silicon-sbt](https://github.com/silicon-sbt) 通过 [PR #10](https://github.com/tswawa/WechatVibe/pull/10)、[PR #18](https://github.com/tswawa/WechatVibe/pull/18)、[PR #19](https://github.com/tswawa/WechatVibe/pull/19)、[PR #20](https://github.com/tswawa/WechatVibe/pull/20) 和 [PR #21](https://github.com/tswawa/WechatVibe/pull/21) 加入本地多路并行分析、过滤服务号与系统会话、一键添加全部会话、只读的整账号分析进度与耗时，以及后台分析开关。
-- 感谢 [Ch1cken-1145（Ch1cken_#）](https://github.com/Ch1cken-1145) 通过 [PR #16](https://github.com/tswawa/WechatVibe/pull/16) 加入手动设置微信聊天记录路径的功能。
-- 感谢 [LianYu-Ya](https://github.com/LianYu-Ya) 在 [Issue #14](https://github.com/tswawa/WechatVibe/issues/14) 中反馈自部署模型批量标签格式错误、只返回一条的问题。
-
-</details>
-
-## 赞助
-
-因为本项目的特殊性，永久不接受任何形式的赞助。
-
-## 合作说明
-
-如需使用、修改或再分发本项目，请以本仓库的 [Apache-2.0](LICENSE) 许可证为准；第三方组件遵循各自的许可证。本说明不改变开源许可证已授予的权利。
-
-第三方基于本项目独立开发、分发或运营的衍生版本，由相应开发者或运营者自行负责维护、服务支持及其对外承诺。使用本项目源码不代表与本项目或维护者建立合作关系，也不代表相关衍生版本获得本项目的认可、担保或背书。未经明确授权，不得以本项目或维护者名义对外开展合作或作出承诺。
-
-## 交流与反馈
-
-- 问题反馈：[GitHub Issues](https://github.com/tswawa/WechatVibe/issues)
-- QQ 交流群：**921170374**
-- 作者：[tswawa](https://github.com/tswawa)
+沿用上游 [Apache-2.0](LICENSE) 许可证。
