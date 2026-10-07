@@ -4299,9 +4299,8 @@ function localModelBadgeOption() {
   button.append(tick, body);
   return button;
 }
-function renderModelBadgeMenu() {
-  const menu = byId("modelBadgeMenu");
-  if (menu.hidden) return;
+function renderModelBadgeMenu(menu = byId("modelBadgeMenu")) {
+  if (!menu || menu.hidden) return;
   const profiles = modelProfiles();
   if (!profiles.length) {
     const empty = document.createElement("p");
@@ -4318,28 +4317,49 @@ function renderModelBadgeMenu() {
   foot.textContent = "管理 API 配置…";
   menu.replaceChildren(...profiles.map(modelBadgeOption), localModelBadgeOption(), foot);
 }
-function closeModelBadgeMenu() {
-  byId("modelBadgeMenu").hidden = true;
-  byId("modelBadge").setAttribute("aria-expanded", "false");
+/**
+ * Every model menu as trigger/menu pairs: the chat header and the persona header each own one.
+ * Enumerated by id rather than a DOM query so the list stays explicit about what it closes.
+ */
+const MODEL_MENU_PAIRS = [
+  ["modelBadge", "modelBadgeMenu"],
+  ["portraitSourceBadge", "portraitSourceMenu"],
+];
+function modelMenus() {
+  return MODEL_MENU_PAIRS.map(([trigger, menu]) => ({ trigger, menu: byId(menu) }))
+    .filter(pair => pair.menu);
 }
-function toggleModelBadgeMenu() {
-  const menu = byId("modelBadgeMenu");
+function closeModelBadgeMenu() {
+  // Closing every menu keeps the model source consistent no matter which header asked for it:
+  // a switch from the persona header must not leave the chat header's panel open behind it.
+  for (const { trigger, menu } of modelMenus()) {
+    menu.hidden = true;
+    byId(trigger)?.setAttribute("aria-expanded", "false");
+  }
+}
+function toggleModelBadgeMenu(triggerId = "modelBadge", menuId = "modelBadgeMenu") {
+  const menu = byId(menuId);
+  if (!menu) return;
   if (menu.hidden) {
+    // Only one panel at a time: the other header's menu closes first.
+    closeModelBadgeMenu();
     menu.hidden = false;
-    renderModelBadgeMenu();
-    byId("modelBadge").setAttribute("aria-expanded", "true");
+    renderModelBadgeMenu(menu);
+    byId(triggerId)?.setAttribute("aria-expanded", "true");
   } else closeModelBadgeMenu();
 }
 function renderModelBadge() {
   const wrap = byId("modelBadgeWrap");
   if (!settingsState.modelSourceResolved) {
     wrap.hidden = true;
+    byId("portraitSourceWrap").hidden = true;
     closeModelBadgeMenu();
     return;
   }
   wrap.hidden = false;
+  byId("portraitSourceWrap").hidden = false;
   text("modelBadgeLabel", currentModelLabel());
-  renderModelBadgeMenu();
+  for (const { menu } of modelMenus()) renderModelBadgeMenu(menu);
 }
 function clearModelList() {
   const select = byId("selectApiModel");
@@ -5657,8 +5677,8 @@ byId("btnDeleteApiProfile").addEventListener("click", () => {
 });
 byId("btnCancelDeleteApiProfile").addEventListener("click", () => { showApiProfileDeleteConfirm(false); });
 byId("btnConfirmDeleteApiProfile").addEventListener("click", () => { void deleteApiProfile(); });
-byId("modelBadge").addEventListener("click", () => { toggleModelBadgeMenu(); });
-byId("modelBadgeMenu").addEventListener("click", event => {
+/** Shared by every model menu: pick a source, or jump to the API profile settings. */
+function handleModelMenuClick(event) {
   if (event.target.closest("[data-manage]")) {
     closeModelBadgeMenu();
     byId("btnSettings").click();
@@ -5672,7 +5692,15 @@ byId("modelBadgeMenu").addEventListener("click", event => {
   const option = event.target.closest(".model-badge-option");
   if (!option) return;
   void activateModelProfile(option.dataset.profileId || "");
+}
+byId("modelBadge").addEventListener("click", () => { toggleModelBadgeMenu(); });
+byId("modelBadgeMenu").addEventListener("click", handleModelMenuClick);
+// The persona header carries the same switcher, so the source can be switched without
+// navigating back to the conversation.
+byId("portraitSourceBadge").addEventListener("click", () => {
+  toggleModelBadgeMenu("portraitSourceBadge", "portraitSourceMenu");
 });
+byId("portraitSourceMenu").addEventListener("click", handleModelMenuClick);
 const OFFICIAL_RELEASES_URL = "https://github.com/tswawa/WechatVibe/releases";
 const UPDATE_BUSY_PHASES = new Set(["downloading", "verifying", "extracting", "installing", "restarting"]);
 const UPDATE_BACKGROUND_CHECK_DELAY_MS = 10_000;
@@ -6071,7 +6099,12 @@ function closeMemberPicker() {
   byId("groupMemberTabs").querySelector(".member-picker-trigger")?.setAttribute("aria-expanded", "false");
 }
 document.addEventListener("click", event => { if (!event.target.closest("#groupMemberTabs")) closeMemberPicker(); });
-document.addEventListener("click", event => { if (!event.target.closest("#modelBadgeWrap")) closeModelBadgeMenu(); });
+// One rule for every model switcher: a click outside all of their wrappers closes whichever
+// panel is open. Checking a single id would close the persona panel the instant its own
+// trigger was clicked, because the document listener runs after the trigger handler.
+document.addEventListener("click", event => {
+  if (!event.target.closest("[data-model-menu-wrap]")) closeModelBadgeMenu();
+});
 document.addEventListener("keydown", event => { if (event.key === "Escape") { closeMemberPicker(); closeHistorySearch(); byId("emojiPopover").classList.remove("show"); closeFeedbackDialog(); closeModelBadgeMenu(); showApiProfileDeleteConfirm(false); } });
 renderKaomojiPanel();
 applySettings();
