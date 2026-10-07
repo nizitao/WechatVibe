@@ -11,6 +11,10 @@
       return {
         sessions: new Map(),
         selectedConversations: new Set(),
+        // Contacts the user asked to analyse with the per-card button. Kept apart from
+        // `selectedConversations` (which is just "added to the list"): only a conversation
+        // in this set may be analysed or appear in the background sweep.
+        requestedConversations: new Set(),
         selectionLoadedAccount: null,
         conversationSelectionBusy: false,
         sessionCache: new Map(),
