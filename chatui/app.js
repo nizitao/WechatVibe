@@ -647,7 +647,16 @@ function renderSessions() {
       const avatarWrap = element("div", "session-avatar-wrap");
       const info = element("div", "session-info");
       const top = element("div", "session-top");
-      top.append(element("span", "session-name"), element("span", "session-time"));
+      // The analyse button sits left of the name. It is a separate control from the card:
+      // clicking it asks for this conversation to be analysed, it never switches chats.
+      const analyseBtn = element("button", "session-analyze-btn");
+      analyseBtn.type = "button";
+      analyseBtn.dataset.action = "analyze";
+      top.append(analyseBtn, element("span", "session-name"), element("span", "session-time"));
+      analyseBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void requestConversationAnalysis(session.username);
+      });
       const bottom = element("div", "session-bottom");
       bottom.appendChild(element("span", "session-preview"));
       info.append(top, bottom);
@@ -690,6 +699,19 @@ function renderSessions() {
     if (timeNode.textContent !== displayTime) timeNode.textContent = displayTime;
     const preview = item.querySelector(".session-preview");
     if (preview.textContent !== (session.preview || "")) preview.textContent = session.preview || "";
+    const analyseBtn = item.querySelector(".session-analyze-btn");
+    if (analyseBtn) {
+      const requested = chatState.requestedConversations.has(session.username);
+      const label = requested ? "已加入分析" : "开始分析";
+      if (analyseBtn.textContent !== label) analyseBtn.textContent = label;
+      analyseBtn.classList.toggle("requested", requested);
+      // Property assignment, not setAttribute: the ARIA reflection sets the attribute in a
+      // real DOM, and the plain-object DOM used by the UI tests accepts it as well.
+      analyseBtn.ariaPressed = String(requested);
+      analyseBtn.title = requested
+        ? "已加入后台分析名单；点击可移出名单"
+        : "点击分析该联系人，并加入后台分析名单";
+    }
     if (container.children[visible] !== item) container.insertBefore(item, container.children[visible] || null);
     visible++;
   }
@@ -893,36 +915,64 @@ settingsState.sweepBusy = false;
 settingsState.overviewBusy = false;
 settingsState.analysisOverviewSnapshot = null;
 settingsState.workerSettings = null;
-async function backgroundAnalyzeAll() {
-  if (settingsState.sweepBusy || !settingsState.settings.backgroundAnalyze) return;
-  if (!chatState.messageSourceReady || chatState.historyState ||
-      !chatState.selectionLoadedAccount) return;
-  // API mode has no worker pool and needs no per-conversation read here: the bridge knows
-  // which messages still lack labels and answers a repeated POST with the running job, so
-  // one cheap POST per conversation is enough to keep several provider turns in flight.
-  if (usingApiInsights()) return sweepApiInsights();
-  if (!canAnalyzeLocal() ||
-      settingsState.suppressedLocalAccounts.has(chatState.currentAccount)) return;
+/**
+ * Ask for one conversation to be analysed, and put it on the background list.
+ *
+ * Nothing else analyses a conversation: this button and the sweep below are the only paths,
+ * and the sweep walks `requestedConversations` rather than every added conversation. Clicking
+ * a requested card again takes it off that list, so the button is a real toggle.
+ */
+async function requestConversationAnalysis(username) {
+  if (!username || !chatState.sessions.has(username)) return;
+  const requested = chatState.requestedConversations.has(username);
+  if (requested) chatState.requestedConversations.delete(username);
+  else chatState.requestedConversations.add(username);
+  renderSessions();
+  // A click analyses that one conversation right away. It deliberately does not depend on
+  // the background switch: the button is the explicit request, the switch only governs the
+  // sweep that walks the rest of the list later.
+  if (!requested) await analyzeConversations([username]);
+}
+/** Analyse exactly the given conversations, in order, under whichever model source is active. */
+async function analyzeConversations(list) {
+  if (!chatState.messageSourceReady || chatState.historyState) return;
   const account = chatState.currentAccount;
-  settingsState.sweepBusy = true;
-  try {
-    // The visible conversation goes first: it is the one the user is reading.
-    const order = [...chatState.sessions.keys()];
-    if (chatState.currentUser && order.includes(chatState.currentUser)) {
-      order.splice(order.indexOf(chatState.currentUser), 1);
-      order.unshift(chatState.currentUser);
-    }
-    for (const id of order) {
-      if (!settingsState.settings.backgroundAnalyze || !canAnalyzeLocal() ||
-          account !== chatState.currentAccount) return;
-      if (!chatState.selectedConversations.has(id)) continue;
-      try {
+  for (const id of list) {
+    if (!chatState.requestedConversations.has(id)) continue;
+    if (account !== chatState.currentAccount) return;
+    try {
+      if (usingApiInsights()) {
+        await api("/api/model-insights", { method: "POST", body: JSON.stringify({
+          account, user: id, limit: API_SWEEP_WINDOW,
+        }) });
+      } else if (canAnalyzeLocal()) {
         // No per-conversation read here: the backend already knows the running job.
         await api("/api/analyze", { method: "POST", body: JSON.stringify({
           account, user: id, mode: "incremental",
         }) });
-      } catch { /* one broken conversation must not stop the sweep */ }
-    }
+      }
+    } catch { /* one broken conversation must not stop the rest */ }
+  }
+}
+async function backgroundAnalyzeAll() {
+  if (settingsState.sweepBusy || !settingsState.settings.backgroundAnalyze) return;
+  if (!chatState.messageSourceReady || chatState.historyState ||
+      !chatState.selectionLoadedAccount) return;
+  if (usingApiInsights()) {
+    if (settingsState.suppressedApiSources.has(apiInsightSweepSourceKey())) return;
+  } else if (!canAnalyzeLocal() ||
+             settingsState.suppressedLocalAccounts.has(chatState.currentAccount)) return;
+  // Only conversations the user asked for with the per-card button; adding a conversation to
+  // the list is not a request to analyse it.
+  const order = [...chatState.requestedConversations];
+  // The conversation being read goes first: it is the one the user is looking at.
+  if (chatState.currentUser && order.includes(chatState.currentUser)) {
+    order.splice(order.indexOf(chatState.currentUser), 1);
+    order.unshift(chatState.currentUser);
+  }
+  settingsState.sweepBusy = true;
+  try {
+    await analyzeConversations(order);
   } finally {
     settingsState.sweepBusy = false;
     void loadAnalysisOverview();
@@ -937,28 +987,6 @@ function usingApiInsights() {
 }
 function apiInsightSweepSourceKey() {
   return JSON.stringify([chatState.currentAccount, settingsState.modelSourceSnapshot.sourceId]);
-}
-async function sweepApiInsights() {
-  if (settingsState.suppressedApiSources.has(apiInsightSweepSourceKey())) return;
-  const account = chatState.currentAccount;
-  // The conversation being read goes first; it already has a foreground request, and the
-  // bridge answers a repeated POST for it with that same job.
-  const order = [...chatState.sessions.keys()];
-  if (chatState.currentUser && order.includes(chatState.currentUser)) {
-    order.splice(order.indexOf(chatState.currentUser), 1);
-    order.unshift(chatState.currentUser);
-  }
-  for (const id of order) {
-    if (!settingsState.settings.backgroundAnalyze || !usingApiInsights() ||
-        account !== chatState.currentAccount ||
-        settingsState.suppressedApiSources.has(apiInsightSweepSourceKey())) return;
-    if (!chatState.selectedConversations.has(id)) continue;
-    try {
-      await api("/api/model-insights", { method: "POST", body: JSON.stringify({
-        account, user: id, limit: API_SWEEP_WINDOW,
-      }) });
-    } catch { /* one broken conversation must not stop the sweep */ }
-  }
 }
 // Whole-account progress behind the sidebar bar: how many conversations the local
 // background sweep has walked to the end of their history.
@@ -4184,8 +4212,10 @@ function modelBadgeOption(profile) {
   const model = document.createElement("span");
   model.className = "model-badge-model";
   model.textContent = profile.model;
-  body.appendChild(name, model);
-  button.appendChild(tick, body);
+  // `appendChild` takes a single node; the extra arguments were silently dropped,
+  // so the name and model never reached the row and only the tick rendered.
+  body.append(name, model);
+  button.append(tick, body);
   return button;
 }
 function localModelBadgeOption() {
@@ -4206,8 +4236,10 @@ function localModelBadgeOption() {
   const model = document.createElement("span");
   model.className = "model-badge-model";
   model.textContent = "内置本地模型";
-  body.appendChild(name, model);
-  button.appendChild(tick, body);
+  // `appendChild` takes a single node; the extra arguments were silently dropped,
+  // so the name and model never reached the row and only the tick rendered.
+  body.append(name, model);
+  button.append(tick, body);
   return button;
 }
 function renderModelBadgeMenu() {

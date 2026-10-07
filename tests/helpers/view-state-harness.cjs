@@ -9,7 +9,8 @@ const vm = require("node:vm");
 const VIEW_STATE_SOURCE = readFileSync(path.join(__dirname, "..", "..", "chatui/view-state.js"), "utf8");
 
 const DOMAIN_FIELDS = {
-  chat: ["sessions", "selectedConversations", "selectionLoadedAccount", "conversationSelectionBusy",
+  chat: ["sessions", "selectedConversations", "requestedConversations", "selectionLoadedAccount",
+    "conversationSelectionBusy",
     "sessionCache", "historyState", "historyRequest", "historyController", "historySearchRequest",
     "historySearchController", "historySearchPending", "historySearchPage", "historySearchPageStarts",
     "historySearchQuery", "self", "sessionSignature", "sessionRequest", "sessionLoading",

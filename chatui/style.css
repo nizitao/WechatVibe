@@ -485,6 +485,32 @@ body.theme-light .nav-update-notice:hover {
   justify-content: space-between;
   align-items: center;
 }
+/* Per-card analyse request. Sits left of the name and keeps a fixed width so the names
+   below it stay aligned; `flex: none` stops the row's space-between from squeezing it. */
+.session-analyze-btn {
+  flex: none;
+  width: 58px;
+  padding: 2px 0;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: none;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: center;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.session-analyze-btn:hover, .session-analyze-btn:focus-visible {
+  border-color: var(--color-green);
+  color: var(--color-green);
+  outline: none;
+}
+.session-analyze-btn.requested {
+  border-color: var(--color-green);
+  color: var(--color-green);
+}
 .session-name {
   font-size: 14px;
   color: var(--text-main);

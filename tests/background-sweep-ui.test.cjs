@@ -43,7 +43,7 @@ it("keeps both local-only switches inside the local model settings", () => {
 
 it("defines the sweep, overview and worker-settings entry points", () => {
   const app = read("chatui", "app.js");
-  for (const name of ["backgroundAnalyzeAll", "sweepApiInsights", "renderAnalysisOverview",
+  for (const name of ["backgroundAnalyzeAll", "analyzeConversations", "renderAnalysisOverview",
                       "loadAnalysisOverview", "loadWorkerSettings", "changeWorkerSettings"]) {
     assert.match(app, new RegExp(`(?:async )?function ${name}\\(`), `app.js must define ${name}`);
   }
@@ -57,7 +57,11 @@ it("defines the sweep, overview and worker-settings entry points", () => {
   // API mode sweeps conversations, not messages: one POST per conversation, and the
   // window is a ceiling rather than a slice of a single conversation.
   assert.match(app, /user: id, limit: API_SWEEP_WINDOW/u);
-  assert.match(app, /if \(usingApiInsights\(\)\) return sweepApiInsights\(\);/u);
+  // One shared entry point posts a conversation for either model source, so the API and the
+  // local pool cannot drift apart.
+  assert.match(app, /if \(usingApiInsights\(\)\) \{/u);
+  assert.match(app, /user: id, limit: API_SWEEP_WINDOW/u);
+  assert.match(app, /mode: "incremental"/u);
 });
 
 it("keeps the switch, the stepper and the periodic refresh wired up", () => {
