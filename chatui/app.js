@@ -469,6 +469,9 @@ function resetAccountView(message = "当前微信账号未就绪", preserveOther
   labelState.manualRecentJobId = null;
   labelState.manualRecentDeferred = false;
   setIntentActionState("idle");
+  chatState.messagePicking = false;
+  chatState.selectedMessageIds.clear();
+  renderPickBar();
   portraitState.profilePending = false;
   labelState.requestedRecentSignatures.clear();
   portraitState.activeAnalysisScope = null;
@@ -1542,9 +1545,13 @@ function clearInlineIntentPending() {
   labelState.inlineIntentPending.clear();
   labelState.inlineIntentJobId = null;
 }
-function startInlineIntentPending(window) {
+function startInlineIntentPending(window, targetIds = null) {
+  // A hand-picked run only marks its own ids as pending; the rest of the window is neither
+  // queued nor shown as "分析中".
+  const wanted = targetIds ? new Set(targetIds.map(String)) : null;
   for (const message of uncoveredMessages(window)) {
     const id = String(message.id);
+    if (wanted && !wanted.has(id)) continue;
     labelState.inlineIntentPending.set(id, message.text);
   }
   labelState.inlineIntentJobId = null;
@@ -1617,6 +1624,7 @@ function messageNode(message) {
     message.kind === "text" ? message.text || "" : message.text || "[不支持的消息]"));
   item.appendChild(wrap);
   updateLabel(message, item);
+  attachPickControl(message, item);
   return item;
 }
 function renderMessages(next, restoreScroll = null, historyAnchor = null) {
@@ -1674,6 +1682,7 @@ function renderMessages(next, restoreScroll = null, historyAnchor = null) {
   renderMood();
   updateHistoryNavigation();
   ensureApiInsights();
+  renderPickBar();
 }
 function scrollToLatest() {
   chatState.followLatest = true;
@@ -1725,6 +1734,8 @@ function cancelHistoryRequest() {
 }
 function enterHistoryView() {
   if (chatState.historyState) return;
+  // Browsing older pages is not the window the selection was made in.
+  if (chatState.messagePicking) setMessagePicking(false);
   clearTimeout(labelState.selectedAnalysisTimer);
   labelState.selectedAnalysisTimer = null;
   chatState.historyState = { beforeCursor: chatState.messages[0]?.historyCursor || null, hasMoreBefore: true, hasMoreAfter: false, error: "" };
@@ -2025,6 +2036,8 @@ function renderRecentAction(job) {
   if (["queued", "running", "done", "error"].includes(status)) setIntentActionState(status);
 }
 function submitManualRecent() {
+  // With a selection on, the manual entry must not quietly analyse the whole window.
+  if (chatState.messagePicking) { submitPickedMessages(); return; }
   if (settingsState.suppressedLocalAccounts.has(chatState.currentAccount) || !canAnalyzeLocal() || !settingsState.settings.intent || !chatState.currentUser || !chatState.controller || chatState.historyState || labelState.recentPending ||
       ["queued", "running"].includes(labelState.currentRecentJob?.status)) return;
   if (!portraitState.activeAnalysisScope) {
@@ -2039,6 +2052,45 @@ function submitManualRecent() {
   portraitState.analysisGeneration++;
   setIntentActionState("submitting");
   void analyzeRecent(chatState.currentUser, chatState.generation, chatState.controller.signal, fineWindowSignature(window), window.limit, window);
+}
+/** 「分析选中」: hand the picked ids to whichever model source is active. */
+function submitPickedMessages() {
+  if (!chatState.messagePicking || !settingsState.settings.intent ||
+      !chatState.currentUser || !chatState.controller) return;
+  const { limit, candidates } = pickedWindow();
+  if (!candidates.length) return;
+  const targetIds = candidates.map(message => String(message.id));
+  if (usingApiInsights()) { submitPickedApiInsights(candidates); return; }
+  if (!canAnalyzeLocal() || chatState.historyState || labelState.recentPending) return;
+  if (!portraitState.activeAnalysisScope) {
+    labelState.manualRecentDeferred = true;
+    return;
+  }
+  labelState.recentFailed = false;
+  labelState.manualRecentAwaitingPost = true;
+  labelState.manualRecentJobId = null;
+  portraitState.analysisGeneration++;
+  setIntentActionState("submitting");
+  const window = { limit, candidates };
+  void analyzeRecent(chatState.currentUser, chatState.generation, chatState.controller.signal,
+    fineWindowSignature(window), limit, window, targetIds);
+}
+function submitPickedApiInsights(candidates) {
+  const work = labelState.apiInsightWork;
+  if (!work || !apiInsightWorkCurrent(work)) {
+    setStripStatus("当前会话分析尚未就绪，请稍后再试");
+    return;
+  }
+  const entry = labelState.apiInsightCache.get(work.key);
+  if (!entry) return;
+  if (["queued", "running"].includes(entry.job?.status)) {
+    // The backend answers a request made during a run with that same running job, so the
+    // selection would be dropped silently; say so instead of pretending it was queued.
+    setStripStatus("已有分析正在进行，选中的消息会在其中一并完成");
+    return;
+  }
+  entry.error = "";
+  void submitApiInsightJob(work, candidates, apiInsightSignature(candidates));
 }
 function fineWindow() {
   if (!chatState.messages.length) return { limit: 0, candidates: [] };
@@ -2061,6 +2113,106 @@ function fineWindow() {
 function analyzableMessages(window = fineWindow()) {
   return window.candidates;
 }
+// ── 「选择消息」：只分析手动勾选的几条 ────────────────────────────────────────
+// Picking is a submission scope, not a display filter: while it is on the automatic
+// whole-window runs are suppressed and every submit carries targetIds, so nothing outside
+// the selection is analysed (and, in API mode, paid for).
+function pickableMessage(message) {
+  if (message.side !== "other" || message.kind !== "text" ||
+      typeof message.text !== "string" || !message.text.trim()) return false;
+  const apiMode = settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api";
+  return !apiMode || (hasIntentContent(message.text) && !isIncompleteFragment(message.text));
+}
+function pickedMessages() {
+  if (!chatState.selectedMessageIds.size) return [];
+  return chatState.messages.filter(message =>
+    chatState.selectedMessageIds.has(String(message.id)) && pickableMessage(message));
+}
+// `/api/analyze` resolves the ids inside the same tail window `/api/messages` handed the UI
+// and caps that window at 80, so ids older than the tail are dropped instead of sent.
+function pickedWindow(picked = pickedMessages()) {
+  if (!picked.length) return { limit: 0, candidates: [] };
+  const index = new Map(chatState.messages.map((message, position) => [String(message.id), position]));
+  const first = Math.min(...picked.map(message => index.get(String(message.id)) ?? 0));
+  const limit = Math.max(1, Math.min(80, chatState.messages.length - first));
+  const boundary = chatState.messages.length - limit;
+  return { limit,
+    candidates: picked.filter(message => (index.get(String(message.id)) ?? 0) >= boundary) };
+}
+function renderPickBar() {
+  const picking = chatState.messagePicking;
+  byId("pickBar").hidden = !picking;
+  const toggle = byId("btnPickMessages");
+  toggle.classList.toggle("active", picking);
+  toggle.setAttribute("aria-pressed", String(picking));
+  toggle.textContent = picking ? "退出选择" : "选择消息";
+  byId("chatMessages").classList.toggle("pick-mode", picking);
+  if (!picking) return;
+  const picked = pickedMessages();
+  const candidates = pickedWindow(picked).candidates;
+  text("pickBarCount", candidates.length === picked.length ? `已选 ${candidates.length} 条` :
+    `已选 ${candidates.length} 条（${picked.length - candidates.length} 条超出当前窗口）`);
+  byId("btnPickAnalyze").disabled = !candidates.length;
+  byId("btnPickAnalyze").textContent = candidates.length ? `分析选中 ${candidates.length} 条` : "分析选中";
+}
+function setPickedMessage(id, on) {
+  if (on) chatState.selectedMessageIds.add(id);
+  else chatState.selectedMessageIds.delete(id);
+  const node = [...byId("chatMessages").querySelectorAll(".msg-item")]
+    .find(item => item.dataset.messageId === id);
+  if (node) {
+    const input = node.querySelector(".msg-pick input");
+    if (input) input.checked = on;
+    node.classList.toggle("picked", on);
+  }
+  renderPickBar();
+}
+function syncPickControls() {
+  for (const node of byId("chatMessages").querySelectorAll(".msg-item.pickable")) {
+    const on = chatState.selectedMessageIds.has(node.dataset.messageId);
+    const input = node.querySelector(".msg-pick input");
+    if (input) input.checked = on;
+    node.classList.toggle("picked", on);
+  }
+}
+function setMessagePicking(on) {
+  if (chatState.messagePicking === on) return;
+  if (on) {
+    if (!settingsState.settings.intent) { toast("请先开启「意图识别」"); return; }
+    if (!(usingApiInsights() || canAnalyzeLocal())) { toast("当前模型来源不可用，无法分析"); return; }
+    if (chatState.historyState) { toast("请先返回最新消息再选择"); return; }
+  }
+  chatState.messagePicking = on;
+  // Leaving the mode drops the selection: it belongs to the window the user was looking at.
+  if (!on) chatState.selectedMessageIds.clear();
+  syncPickControls();
+  renderPickBar();
+  if (on) setStripStatus("勾选要分析的消息，然后点击「分析选中」");
+}
+function pickAllMessages() {
+  for (const message of chatState.messages) if (pickableMessage(message))
+    chatState.selectedMessageIds.add(String(message.id));
+  syncPickControls();
+  renderPickBar();
+}
+function attachPickControl(message, item) {
+  if (!pickableMessage(message)) return;
+  const id = String(message.id);
+  item.classList.add("pickable");
+  const label = element("label", "msg-pick");
+  const input = document.createElement("input");
+  input.type = "checkbox";
+  input.checked = chatState.selectedMessageIds.has(id);
+  input.addEventListener("change", () => setPickedMessage(id, input.checked));
+  label.appendChild(input);
+  item.appendChild(label);
+  item.classList.toggle("picked", input.checked);
+  // Clicking the row toggles as well; the checkbox itself already handled its own click.
+  item.addEventListener("click", event => {
+    if (!chatState.messagePicking || event.target.closest(".msg-pick")) return;
+    setPickedMessage(id, !chatState.selectedMessageIds.has(id));
+  });
+}
 function uncoveredMessages(window = fineWindow()) {
   return analyzableMessages(window).filter(message => {
     const result = fineMessageResult(labelState.results[message.id]) ? labelState.results[message.id] : null;
@@ -2072,6 +2224,9 @@ function fineWindowSignature(window) {
   return JSON.stringify([window.limit, analyzableMessages(window).map(message => [message.id, message.text])]);
 }
 function scheduleRecent(user, token, signal, changedOther) {
+  // While the user is hand-picking what to analyse the automatic window run stays off:
+  // it would analyse (and, in API mode, pay for) everything the selection exists to avoid.
+  if (chatState.messagePicking) return;
   if (settingsState.suppressedLocalAccounts.has(chatState.currentAccount) || !canAnalyzeLocal() || !settingsState.settings.intent || chatState.view !== "chat" || document.hidden || startupActive || !changedOther ||
       labelState.recentPending || labelState.recentFailed || !portraitState.activeAnalysisScope) return;
   const window = fineWindow();
@@ -2184,7 +2339,7 @@ async function loadAnalysis(user, token, signal) {
     }
   }
 }
-async function analyzeRecent(user, token, signal, signature, limit, window) {
+async function analyzeRecent(user, token, signal, signature, limit, window, targetIds = null) {
   const account = chatState.currentAccount;
   if (user !== chatState.currentUser || token !== chatState.generation ||
       labelState.recentPending || labelState.recentFailed) return;
@@ -2193,10 +2348,11 @@ async function analyzeRecent(user, token, signal, signature, limit, window) {
   labelState.requestedRecentSignatures.add(signature);
   while (labelState.requestedRecentSignatures.size > 64) labelState.requestedRecentSignatures.delete(labelState.requestedRecentSignatures.values().next().value);
   labelState.recentPending = true;
-  startInlineIntentPending(window);
+  startInlineIntentPending(window, targetIds);
   try {
     const data = await api("/api/analyze", { method: "POST", body: JSON.stringify({
       account, user, mode: "recent", limit,
+      ...(targetIds?.length ? { targetIds } : {}),
     }) }, signal);
     if (token === chatState.generation && canAnalyzeLocal()) {
       labelState.recentNetworkFailed = false;
@@ -2318,6 +2474,11 @@ function switchSession(user, force = false) {
   labelState.manualRecentJobId = null;
   labelState.manualRecentDeferred = false;
   setIntentActionState("idle");
+  // A selection belongs to one conversation: switching drops it instead of carrying ids the
+  // next conversation's window cannot resolve.
+  chatState.messagePicking = false;
+  chatState.selectedMessageIds.clear();
+  renderPickBar();
   labelState.recentPending = false;
   portraitState.incrementalFailed = false;
   labelState.recentFailed = false;
@@ -2737,13 +2898,22 @@ function renderMbti(profile) {
   if (profile.apiSource && !profile.apiNativeProfile) {
     // API portrait reuses the Laya card: same threshold, lock panel and evidence
     // section. Axis shares arrive as 0-100 favoring the left letter.
-    const eligible = Number(profile.apiTargetTexts) || 0;
+    //
+    // The unlock count must be the observation-ledger count the backend gates on, not the
+    // analysed-text count: a run can hold thousands of texts and still have observed nothing,
+    // in which case the backend withholds all four axes.
+    const eligible = Number(profile.apiMbtiEvidenceCount) || 0;
     const minMessages = 100;
     const axes = {};
     for (const axis of preferenceAxes) {
       const share = apiScore(profile.apiMbtiAxes?.[axis.key]);
-      axes[axis.key] = share === null ? null :
-        { leftShare: share / 100, rightShare: (100 - share) / 100, evidenceCount: 1 };
+      const basis = profile.apiMbtiBasis?.[axis.key];
+      axes[axis.key] = share === null ? null : {
+        leftShare: share / 100, rightShare: (100 - share) / 100,
+        // The per-axis count is how many dedicated observations back this axis. It was
+        // hardcoded to 1, so every API axis reported "1 条证据" regardless of the real amount.
+        evidenceCount: Number(basis?.evidenceCount) || 0,
+      };
     }
     profile = { ...profile, mbtiInference: { eligibleMessages: eligible, minMessages,
       axes, sources: officialSources } };
@@ -2791,7 +2961,13 @@ function renderMbti(profile) {
     iconWrap.appendChild(svgIcon("M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z", "mbti-lock-icon"));
     lockPanel.appendChild(iconWrap);
     lockPanel.appendChild(element("div", "mbti-lock-title", "人格推测未解锁"));
-    lockPanel.appendChild(element("div", "mbti-lock-desc", `需积累 ${minMessages} 条该人物有效文本以进行四维偏好推测`));
+    // The API path unlocks on the observation ledger, so "analyse more messages" would be
+    // wrong advice: the run has to reach the observing phase first.
+    lockPanel.appendChild(element("div", "mbti-lock-desc", profile.apiSource
+      ? (profile.apiComplete
+        ? `需完成聊天观察以积累四维偏好依据（当前 ${Math.max(0, eligible)}/${minMessages} 条）`
+        : "本次 API 画像尚未完成，观察阶段未运行，暂无法给出四维偏好")
+      : `需积累 ${minMessages} 条该人物有效文本以进行四维偏好推测`));
     const progWrap = element("div", "mbti-lock-progress-wrap");
     const progBar = element("div", "mbti-lock-progress-bar");
     const fill = element("div", "mbti-lock-progress-fill");
@@ -3181,6 +3357,10 @@ function renderApiProfile(data) {
     apiMbtiAxes: portrait?.mbtiAxes || null,
     apiMbtiBasis: mbtiBasisSnapshot(data.mbtiBasis),
     apiTargetTexts: analyzedTargets,
+    // The backend withholds the axes until the observation ledger reaches its threshold, and
+    // that count is not the analysed-text count. Without it the card reports itself unlocked
+    // on a run that stalled before observing, and every axis reads as "待判断".
+    apiMbtiEvidenceCount: Number(data.available?.mbtiEvidenceCount) || 0,
     apiProgressProcessed: analyzed,
     apiProgressTotal: analysisTotal,
     apiComplete: progress.complete === true,
@@ -3304,6 +3484,10 @@ function renderApiPortrait(data) {
   else if (running) state = "API 分析中";
   else if (data.needsRebuild) state = "画像算法已更新，可重新分析";
   else if (upToDate) state = "API 画像已更新";
+  // A run that never left the queue would otherwise read as "preparing" for ever. The
+  // backend holds the row with complete=0 and processed=0, so say what actually happened.
+  else if (Number(available?.targetTextCount) > 0 && Number(progress?.processedTargetTexts) === 0)
+    state = "API 画像未开始（观察阶段未运行），请重新分析";
   else state = "正在准备 API 画像";
   const autoKey = portraitState.renderedApiPortraitKey + ":" + total + ":" + (Number(available?.totalChars) || 0);
   const submitError = portraitState.apiPortraitSubmitErrors.get(autoKey);
@@ -4680,14 +4864,26 @@ async function saveApiProfileDraft(activate) {
   let draft;
   try { draft = apiModelDraft(true, true); }
   catch (error) { text("modelSourceStatus", error.message); return null; }
+  const acceptProfile = data => {
+    if (typeof data.profile === "string") settingsState.apiProfileId = data.profile;
+  };
+  let payload = apiProfilePayload(draft);
+  if (activate && payload.profileId) {
+    // `/api/model-source/activate` takes either the connection fields or `{mode, profileId}`,
+    // never both: a mixed body is a 400 `invalid model source request`, which the form used
+    // to report as 启用失败 even though 测试连接 had just succeeded. So "保存并启用" on a
+    // saved profile is save-then-switch — the edits are validated and written first, and the
+    // switch itself stays the instant no-probe path.
+    const saved = await postApiModelSource("/api/model-source/profiles", payload,
+      { busy: "正在保存配置…", done: "配置已保存", failed: "保存失败", accept: acceptProfile });
+    if (!saved) return null;
+    payload = { mode: "api", profileId: payload.profileId };
+  }
   const data = await postApiModelSource(
     activate ? "/api/model-source/activate" : "/api/model-source/profiles",
-    { ...(activate ? { mode: "api" } : {}), ...apiProfilePayload(draft) },
+    activate ? { mode: "api", ...payload } : payload,
     { busy: activate ? "正在启用…" : "正在保存配置…", done: activate ? "API 模型已启用" : "配置已保存",
-      failed: activate ? "启用失败" : "保存失败",
-      accept: data => {
-        if (typeof data.profile === "string") settingsState.apiProfileId = data.profile;
-      } });
+      failed: activate ? "启用失败" : "保存失败", accept: acceptProfile });
   if (data && activate && data.mode !== "api") text("modelSourceStatus", "启用失败（来源未切换）");
   return data;
 }
@@ -5155,6 +5351,9 @@ function ensureApiInsights(force = false) {
   }
   if (!work.hydrated || work.getPending || work.postPending ||
       ["queued", "running"].includes(entry.job?.status)) return;
+  // Same rule as the local path: no automatic whole-window submit while the user is
+  // choosing which messages to analyse. `submitPickedMessages` posts the selection.
+  if (chatState.messagePicking) { renderApiInsightStatus(); return; }
   const candidates = apiInsightCandidates();
   if (!candidates.length) return;
    const pending = entry.sessionReady ? candidates.filter(message => !validApiInsight(
@@ -5604,6 +5803,15 @@ function retryAnalysis() {
   void startIncremental(chatState.currentUser, chatState.generation, chatState.controller.signal, key, state);
 }
 byId("btnRetryAnalysis").addEventListener("click", retryAnalysis);
+byId("btnPickMessages").addEventListener("click", () => setMessagePicking(!chatState.messagePicking));
+byId("btnPickCancel").addEventListener("click", () => setMessagePicking(false));
+byId("btnPickClear").addEventListener("click", () => {
+  chatState.selectedMessageIds.clear();
+  syncPickControls();
+  renderPickBar();
+});
+byId("btnPickAll").addEventListener("click", pickAllMessages);
+byId("btnPickAnalyze").addEventListener("click", submitPickedMessages);
 byId("btnRetryProfile").addEventListener("click", () => {
   if (chatState.view === "persona" && portraitState.activeMember) void loadProfile(portraitState.activeMember, true);
   else retryAnalysis();

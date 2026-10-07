@@ -2449,25 +2449,38 @@ class Backend:
                 "basisFingerprint": fingerprint, "lastMessageId": last_message_id,
                 "candidates": candidates}
 
-    def _schedule_recent(self, key, store, job, scope, limit, standalone=False):
+    def _schedule_recent(self, key, store, job, scope, limit, standalone=False, selected=None):
         state = self.recent_windows.get(key)
         if state is not None:
             state["limit"] = max(state["limit"], limit)
+            if selected:
+                state.setdefault("selected", set()).update(selected)
             if state["iterator"] is not None:
                 state["rerun"] = True
             return
         counts = {"total": 0, "processed": 0}
         self.recent_windows[key] = {"iterator": None, "counts": counts, "limit": limit,
-                                    "rerun": False, "job": job, "background_pending": standalone}
+                                    "rerun": False, "job": job, "background_pending": standalone,
+                                    # Ids the user picked by hand. Non-empty means the next
+                                    # pass analyses exactly those, never the visible window.
+                                    "selected": set(selected or ())}
         job["recent"] = {"id": uuid.uuid4().hex, "status": "queued", "total": 0, "processed": 0}
         self._enqueue((key, "recent-window", limit, store, job, scope), interactive=True)
 
-    def start(self, user, mode, limit, expected_account=None):
+    def start(self, user, mode, limit, expected_account=None, target_ids=None):
         account, workdir, store = self._scoped_identity()
         if expected_account is not None and account != expected_account:
             raise AccountChangedError()
         if store.cache_suspended(account, LOCAL_SOURCE_ID):
             return {"id": None, "status": "suspended", "total": 0, "processed": 0}
+        # A hand-picked selection is resolved (and rejected) before the 202 response, so a
+        # stale id is a 400 the UI can report instead of a job that fails silently later.
+        selected = None
+        if target_ids is not None:
+            if mode != "recent":
+                raise ValueError("invalid selected analysis mode")
+            selected = self._resolve_selected_targets(user, limit, target_ids)
+            self._assert_scope((account, workdir))
         version = self.analyzer.analysis_version()
         if expected_account is not None:
             self._assert_scope((account, workdir))
@@ -2476,7 +2489,8 @@ class Backend:
             current = self.jobs.get(key)
             if current and (current["status"] in ("queued", "running") or key in self.recent_windows):
                 if mode == "recent":
-                    self._schedule_recent(key, store, current, (account, workdir), limit)
+                    self._schedule_recent(key, store, current, (account, workdir), limit,
+                                          selected=selected)
                     return dict(current)
                 if (mode == "incremental" and key in self.recent_windows and
                         current["status"] == "done"):
@@ -2503,7 +2517,8 @@ class Backend:
                    "requested": {"mode": mode, "limit": limit}}
             self.jobs[key] = job
             if mode == "recent":
-                self._schedule_recent(key, store, job, (account, workdir), limit, standalone=True)
+                self._schedule_recent(key, store, job, (account, workdir), limit, standalone=True,
+                                      selected=selected)
                 return dict(job)
             if (not self.batch_engine and
                     ((mode == "incremental" and not self._stored_progress(account, user, version, store)["complete"]) or
@@ -2616,6 +2631,71 @@ class Backend:
         """
         return self._analyze_item(account, user, version, store, context, item, scope,
                                   fine=True, portrait_context=portrait_context)
+
+    def _resolve_selected_targets(self, user, limit, target_ids):
+        """Validate a hand-picked id list against the analysable tail window.
+
+        The window is the same one ``/api/messages`` handed the UI, so ids older than the
+        loaded window are rejected here rather than failing inside the worker.
+        """
+        if (not isinstance(target_ids, list) or not 1 <= len(target_ids) <= limit or
+                any(not isinstance(item, str) or not 1 <= len(item) <= 200 or
+                    any(ord(char) < 32 or ord(char) == 127 for char in item)
+                    for item in target_ids) or
+                len(set(target_ids)) != len(target_ids)):
+            raise ValueError("invalid analysis targets")
+        window = self.source.messages(user, limit + 3)
+        tail = window[max(0, len(window) - limit):]
+        eligible = {item["id"] for item in tail
+                    if item["side"] == "other" and item["kind"] == "text" and item["text"].strip()}
+        if any(item not in eligible for item in target_ids):
+            raise ValueError("analysis target is no longer in the current window")
+        wanted = set(target_ids)
+        return [item["id"] for item in tail if item["id"] in wanted and item["id"] in eligible]
+
+    def _run_selected_targets(self, account, user, version, store, job, scope, limit, target_ids):
+        """Analyse exactly the messages the user picked, never the whole visible window."""
+        if not target_ids:
+            return
+        wanted = set(target_ids)
+        self._assert_scope(scope)
+        window = self.source.messages(user, limit + 3)
+        self._assert_scope(scope)
+        start = max(0, len(window) - limit)
+        selected = [(index, item) for index, item in enumerate(window)
+                    if index >= start and item["id"] in wanted and item["side"] == "other" and
+                    item["kind"] == "text" and item["text"].strip()]
+        if not selected:
+            return
+        if self.batch_engine:
+            known = store.fine_known(account, user, version,
+                                     [item["id"] for _index, item in selected])
+        else:
+            known = {item["id"] for _index, item in selected
+                     if store.has(account, user, version, item["id"])}
+        job["total"] = len(selected)
+        job["processed"] = sum(item["id"] in known for _index, item in selected)
+        contexts = {}
+        since_yield = 0
+        for index, item in reversed(selected):
+            if item["id"] in known:
+                continue
+            if self.batch_engine:
+                subject = item.get("senderId") if user.endswith("@chatroom") else user
+                if subject not in contexts:
+                    contexts[subject] = self._fine_portrait_context(account, user, version, store, item)
+                self._analyze_fine_item(account, user, version, store,
+                                        window[max(0, index - 3):index + 1], item, scope,
+                                        portrait_context=contexts[subject])
+            else:
+                self._analyze_item(account, user, version, store,
+                                   window[max(0, index - 3):index + 1], item, scope)
+            known.add(item["id"])
+            job["processed"] += 1
+            since_yield += 1
+            if since_yield >= 8 or self._interactive_waiting():
+                since_yield = 0
+                yield
 
     def _run_fine_recent(self, account, user, version, store, job, scope, limit):
         self._assert_scope(scope)
@@ -3000,9 +3080,14 @@ class Backend:
                     return
                 if state["iterator"] is None:
                     state["counts"] = {"total": 0, "processed": 0}
-                    state["iterator"] = self._run_visible_priority(
+                    # A hand-picked set is consumed by exactly one pass and then dropped, so
+                    # the next automatic window run is not silently narrowed to old ids.
+                    picked = state.pop("selected", set())
+                    state["iterator"] = (self._run_selected_targets(
                         account, user, version, store, state["counts"], scope,
-                        None, set(), set(), set(), state["limit"])
+                        state["limit"], picked) if picked else self._run_visible_priority(
+                        account, user, version, store, state["counts"], scope,
+                        None, set(), set(), set(), state["limit"]))
                 job["recent"] = {**job["recent"], "status": "running"}
                 if job["requested"]["mode"] == "recent":
                     job["status"] = "running"

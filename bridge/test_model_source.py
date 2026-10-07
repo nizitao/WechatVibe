@@ -397,6 +397,30 @@ class ModelProfileTests(ModelSourceTestCase):
             self.backend.model_source_activate({"mode": "api", "profileId": first["api"]["id"],
                                                 "model": "model-c"})
 
+    def test_activate_rejects_connection_fields_next_to_a_profile_id(self):
+        """Either the connection fields or `{mode, profileId}` — never both.
+
+        `chatui/app.js:saveApiProfileDraft` therefore saves the edits through
+        `/api/model-source/profiles` first and then switches with the two-key body. Sending the
+        mixed body was answered with 400 `invalid model source request`, which the form reported
+        as 启用失败 immediately after a successful 测试连接.
+        """
+        profile = self.activate("model-a", name="线路 A")
+        probes = len(self.backend.api_probe_analyzer.calls)
+        with self.assertRaises(ValueError):
+            self.backend.model_source_activate({
+                "mode": "api", "profileId": profile["api"]["id"], "name": "线路 A",
+                "protocol": "responses", "baseUrl": "https://example.test/v1",
+                "model": "model-a2", "contextTokens": 128000})
+        # Rejected before any probe: the mixed body must not spend a provider round trip.
+        self.assertEqual(len(self.backend.api_probe_analyzer.calls), probes)
+        # The two-key form is the switch the form falls back to: no probe, same profile.
+        switched = self.backend.model_source_activate(
+            {"mode": "api", "profileId": profile["api"]["id"]})
+        self.assertEqual((switched["sourceId"], switched["label"]),
+                         (profile["sourceId"], "线路 A"))
+        self.assertEqual(len(self.backend.api_probe_analyzer.calls), probes)
+
     def test_editing_the_active_profile_republishes_it_to_the_running_worker(self):
         active = self.activate("model-a")
         self.assertEqual(len(self.backend.api_probe_analyzer.calls), 1)

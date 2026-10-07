@@ -167,6 +167,14 @@
         </div>
         <div class="reply-prediction-body" id="replyPredictionBody"></div>
       </section>
+      <!-- Hand-picked message selection: shown only while picking is on -->
+      <div class="pick-bar" id="pickBar" role="group" aria-label="选择消息分析" hidden>
+        <span class="pick-bar-count" id="pickBarCount">已选 0 条</span>
+        <button type="button" class="pick-bar-btn" id="btnPickAll" title="选中当前已加载且可分析的消息">全选</button>
+        <button type="button" class="pick-bar-btn" id="btnPickClear" title="清空已选消息">清空</button>
+        <button type="button" class="pick-bar-btn pick-bar-primary" id="btnPickAnalyze" disabled>分析选中</button>
+        <button type="button" class="pick-bar-btn" id="btnPickCancel">取消</button>
+      </div>
       <!-- Input Toolbar -->
       <div class="input-toolbar">
         <div class="toolbar-left">
@@ -188,6 +196,7 @@
 
           <!-- Text Action Buttons on the right of icons -->
           <button class="toolbar-text-btn active" id="btnToggleIntent" title="识别当前聊天消息">意图识别</button>
+          <button class="toolbar-text-btn" id="btnPickMessages" title="勾选若干条聊天记录，只分析勾选的内容" aria-pressed="false">选择消息</button>
           <button class="toolbar-text-btn" id="btnToolbarPersona" title="切换到当前聊天对象的人格画像">人物画像</button>
           <button class="toolbar-text-btn" id="btnRetryAnalysis" title="重新分析当前会话" hidden>分析失败 · 重试</button>
         </div>

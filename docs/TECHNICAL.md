@@ -374,7 +374,7 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | 路径 | 请求体 | 说明 |
 | --- | --- | --- |
 | `/api/control/shutdown` | 无 body（`Content-Length: 0`）+ 头 `X-WechatVibe-Control-Token` | 202 `{stopping:true}`；唯一需要令牌的端点 |
-| `/api/analyze` | `{account,user,mode:recent\|history\|incremental,limit}` | 202 `{job}`；recent ≤80、history ≤5000 或 `"all"` |
+| `/api/analyze` | `{account,user,mode:recent\|history\|incremental,limit,targetIds?}` | 202 `{job}`；recent ≤80、history ≤5000 或 `"all"`；`targetIds` 只允许配 `mode:"recent"`，只分析列出的消息（见 §6.2 / §12.14） |
 | `/api/messages/batch` | `{account, users[1..64]}` | 多会话窗口 |
 | `/api/predict-reply` | `{user,account,requestId,draft≤2000,expectedLastMessageId?,member?}` | 续写预测；错误 409/422 |
 | `/api/runtime` | `{provider}` | 切 CPU/GPU |
@@ -392,6 +392,8 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | `/api/model-source/profiles/delete` | `{profileId}` | 删除一条 API 配置；删掉正在使用的那条会切回本地模型 |
 
 `activate` 的三种入参互斥：`{mode:"local"}`、`{mode:"api",profileId}`（切换到已保存配置，**跳过探测**，因此是瞬时的）、`{mode:"api",...连接字段}`（必要时先探测再落盘）。带 `profileId` 时只允许 `mode`+`profileId` 两个键。
+
+因此设置页的「保存并启用」在**编辑已保存配置**时是两次调用：先 `POST /api/model-source/profiles` 落盘（必要时探测），再用 `{mode:"api",profileId}` 切换。两条合并成一次请求会被 `set(request) != {"mode","profileId"}` 判成 400 `invalid model source request`——历史现象就是「测试连接」成功后点「保存并启用」报「启用失败」。新建配置仍是一次调用（连接字段走探测分支）。
 
 `/api/model-source/*` 的响应统一是 `public()` 形状（下表最后一列），`profiles` 与 `label` 供设置页与标题栏徽标使用。
 
@@ -467,6 +469,8 @@ styleCount, style{6 维}, axes{EI,SN,TF,JP: [left,right,evidence,insufficient]},
 `set(key, value)` 有字段白名单校验；`advance(key)` 只增不减；`reset(...)` **禁止重置请求计数器**（防竞态）。
 前端本地持久化仅 5 个设置项（`localStorage["real-ui-settings-1"]`：`theme/zoom/intent/backgroundAnalyze/analyzeSelfStyle`）+ 已读水位 + 画像展示快照。
 
+`chat` 域另有两个「选择消息」态字段：`messagePicking`（是否处于手选态）与 `selectedMessageIds`（勾选的消息 id 集合）。二者不落盘，只活在当前会话窗口内，见 §12.14。
+
 ---
 
 ## 6. 主要业务流程与调用链路
@@ -529,6 +533,13 @@ POST /api/analyze {account,user,mode}
 - 同一会话串行（key lock），不同会话并行。
 - `worker_limit = 1 if not elastic else worker_count`，`worker_count ∈ [1,4]`（默认 1）。
 - **elastic 模式**：`_load_monitor` 每 30 s 采样 psutil（CPU/内存）+ `nvidia-smi`（GPU/显存，timeout 5 s），连续 2 个 busy 样本降到 0，连续 2 个 calm 样本升 1；自身负载被扣除，只按「其他程序」节流。阈值：busy CPU 85 / MEM 90 / GPU 85 / 空闲显存 2048 MiB；calm CPU 55 / MEM 80 / GPU 55 / 空闲显存 3072 MiB；显存 < 1024 MiB 或 GPU ≥95 % 直接降到 0。
+
+**手选消息（`targetIds`）**：`mode:"recent"` 可附带 `targetIds`，只分析列出的那些消息（界面上是「选择消息」工具条，见 §12.14）。
+
+- 校验在**入队前**（`Backend.start` → `_resolve_selected_targets`）：id 必须是 1..`limit` 个唯一字符串，且能在 `source.messages(user, limit+3)` 的**尾部 `limit` 条**（即 `/api/messages` 交给界面的同一个窗口）里按 `side=="other" && kind=="text" && text.strip()` 找到。窗口外的 id 回 400 `analysis target is no longer in the current window`，格式非法回 400 `invalid analysis targets`，不会留下「排队成功但永不分析」的任务。
+- 调度复用 `recent-windows` 状态：`_schedule_recent(selected=…)` 把 id 并入 `state["selected"]`；下一趟迭代器由 `_run_selected_targets` 承担（有 `batch_engine` 时走 `_analyze_fine_item` 的 fine 路径，否则走单条画像路径），上下文取该消息前 3 条，`total/processed` 只统计选中的条数。
+- 该集合在创建迭代器时被 `pop`，因此**紧接着的自动窗口扫描不会被历史选择收窄**（否则用户退出选择态后新消息再也不打标签）。
+- 前端把 `limit` 收敛为 `max(1, min(80, 已加载条数 - 最早被选位置))`，超出尾窗的 id 提交前就被丢弃并在工具条上提示；两条提交路径都复用既有函数（本地 `analyzeRecent`、API `submitApiInsightJob`），不新增端点。
 
 ### 6.3 API 消息标签链路
 
@@ -773,8 +784,8 @@ MIN_AXIS_MARGIN          = 0.2   # 两侧份额差值下限
 
 | | `PERSONALITY_QUESTIONS`（本地 Laya） | `API_PERSONALITY_QUESTIONS`（API 分类器） |
 | --- | --- | --- |
-| 版本串 | `MBTI_QUESTION_VERSION = "mbti-chat-evidence-v3"` | `API_MBTI_QUESTION_VERSION = "mbti-api-context-v1"` |
-| scope 题判定 | 仅接受「本人明确说出偏好」 | 「本人明确说出，**或在整批消息里反复表现出同一倾向**」 |
+| 版本串 | `MBTI_QUESTION_VERSION = "mbti-chat-evidence-v3"` | `API_MBTI_QUESTION_VERSION = "mbti-api-context-v2"` |
+| scope 题判定 | 仅接受「本人明确说出偏好」 | 「本人明确说出，**或在整批消息里反复表现出同一倾向**」；判定的是**存在性**——任一轴有反复模式即选是 |
 | 选项标签 | `[不足, 左极, 右极]` | **完全相同**（因此共享转换函数与已落库的 evidence 契约不变） |
 
 原因：聊天记录里极少出现教科书式的自我描述，坚持「必须明说」会让所有轴永久未定。API 题面每轴都指明要看什么（谁发起话题、自愿带来什么信息、争执时给出的理由、计划如何收口），并明确排除角色责任、话题类型与单次情绪。
@@ -825,7 +836,15 @@ packMessageBatch(messages, budget)
 - 把整批当作**一份累积记录**读：优先采信明说的偏好，否则从跨话题、跨情境的重复行为推断；普通计划、单次回复、一次性情绪仍不构成偏好；**绝不默认选第一极**。
 - **区分信号与情境**：在场的人、话题、关系、发送者角色（工作/闲聊/群聊）能解释消息的大部分，只有剥离这些解释后仍成立的部分才计分。必需的工作回复、对客户的回复、对上级的回复**不是**偏好。
 - **考虑反例**：某轴在部分情境有支撑、部分没有时，该轴由「无偏好」选项胜出。
-- **权重分摊而非表态**：证据混合时把权重摊到两个极 + 无偏好三项，而不是硬选一个；**只有整批都成立的偏好才给 80 分以上**；四轴独立判断，可用同一次回答的一致读法。
+- **权重分摊而非表态**：证据混合时把权重摊到两个极，而不是硬选一个；**只有整批都成立的偏好才给 80 分以上**；四轴独立判断，可用同一次回答的一致读法。
+
+**提示词必须与消费端的三道机制对齐**（`mbti-api-context-v2` 的改动依据，`rules` 与题面都按此重写）：
+
+| 机制 | 代码位置 | 对打分的含义 |
+| --- | --- | --- |
+| scope 是四轴总闸 | `personalityEvidenceFromAnswers` | 「有偏好」权重必须**严格大于**「无偏好」，否则整个 `personalityEvidence=null`，本批四轴**全部**记为证据不足且永不累积。因此只要任一轴有反复模式就应选是，不能因多数消息平淡而弃权 |
+| `insufficient` 是悬崖门控 | `batch_state._merge` | `insufficient >= max(左, 右)` 时该轴只累加「证据不足」计数，**不做任何比例累积**——它是整轴作废开关，不是稀释项。混合证据要摊在**两个极之间**，摊给「无偏好」会直接毒化该轴 |
+| 差值门槛 | `mbti_from_totals` | `leftShare = 左/(左+右)`，`abs(leftShare-rightShare) < 0.2` 即判未定。50/50 必然报未知，因此证据确实指向某极时应给出约 **60/40 或更强**的倾斜 |
 
 因此 API 画像的 MBTI 判定比本地更宽松，但通过 0.2 差值、30 条证据、100 条解锁三道本地门槛后收敛到同一口径。
 
@@ -1028,34 +1047,22 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 
 ### 11.5 工作区当前状态（重要）
 
-`git status` 显示**未提交的功能改动**（API 沟通建议 + API worker 池 + 并行测试体系），共 21 个修改 + 6 个新增：
+**本节是快照，落笔前必须用 `git status` 复核，不要照抄上一版。**
 
-```
-修改：README.md, docs/backend-architecture.md, package.json,
-      bridge/analysis_server.ts, bridge/api_tasks.py, bridge/backend_service.py,
-      bridge/node_analysis.py, bridge/real_http.py, bridge/result_store.py,
-      bridge/test_backend_layers.py, bridge/test_model_source.py,
-      chatui/app.js, chatui/index.html, chatui/style.css,
-      electron/api-portrait-classifier.ts, electron/laya/personality.ts,
-      scripts/run-python-tests.py, scripts/stage-real-client.py,
-      tests/api-persona-ui.test.cjs, tests/api-portrait-classifier.test.ts,
-      tests/background-sweep-ui.test.cjs
-新增：bridge/api_pool.py, bridge/guidance_contracts.py,
-      bridge/test_api_guidance.py, bridge/test_api_workers.py,
-      electron/api-guidance.ts, scripts/run-all-tests.cjs,
-      tests/api-guidance.test.ts, tests/api-worker-settings.test.cjs
-未跟踪：docs/TECHNICAL.md（本文件）
-```
+截至 2026-10-07：API 沟通建议、API worker 池、并行测试体系、多档案模型来源、分析请求名单与结果落盘加密都已提交（`b2e6006`、`5c8c9a1`、`5cf5783`、`336d8c8` 等），`scripts/stage-real-client.py` 白名单与 `package.json` 的并行测试入口均已就位。此后又落了三块互相独立的工作（同一次提交）：
 
-已核对的一致性状态：
+1. **手选消息分析**：`/api/analyze` 接受 `targetIds`，界面「选择消息」只分析勾中的几条 —— 见 §6.2 与 §12.14。
+2. **修复「测试连接成功但保存并启用失败」**：`activate` 带 `profileId` 时不再混入连接字段，前端改为「先落盘再切换」—— 见 §5.2 与 §12.13。
+3. **API 画像 MBTI 观察门槛**：卡片按观察账本 `available.mbtiEvidenceCount` 解锁、逐轴证据数取 `mbtiBasis.evidenceCount`（原先硬编码 1）、失速任务不再显示「正在准备」；`bridge/result_store.py` 的 `api_portrait_get` 负责暴露该计数，`electron/laya/personality.ts` 与 `electron/api-portrait-classifier.ts` 的 API 题面升到 `mbti-api-context-v2`（见 §7.5）。
 
-- `scripts/stage-real-client.py` 白名单**已补齐** `bridge/api_pool.py`、`bridge/guidance_contracts.py`（BRIDGE）与 `electron/api-guidance.ts`（PUBLIC_FILES）→ 便携构建不会缺文件。
-- `electron/api-guidance.ts` 已在 `analysis_server.ts` 接线，`bridge/real_http.py` 已注册 `GET/POST /api/model-guidance`，`result_store` 已加 `api_guidance_v1` 与 `api_guidance_get/save`。
-- 回归覆盖已补：`bridge/test_api_guidance.py`、`bridge/test_api_workers.py`、`tests/api-guidance.test.ts`、`tests/api-worker-settings.test.cjs`。
-- `package.json` 的 `test` 已改为并行入口 `scripts/run-all-tests.cjs`（见 §13）；原串行链保留为 `test:serial`。
-- 另有 tokenizer 性能优化（提交 `f83513a` / `959b4e0`，记忆化编码 + 复用共享 state token ids）已在分支上。
+本轮核对过的一致性状态：
 
-**尚未提交**——如需发布，须先完成 §12.10 的更新流程与 §13 的全量回归。
+- 三块的回归都在：`tests/message-picking.test.cjs`、`tests/model-source-settings.test.cjs`、`tests/api-mbti-gate.test.cjs`、`bridge/test_model_source.py`、`bridge/test_real_backend.py`；`tests/api-persona-ui.test.cjs` 的 MBTI 夹具已改为提供 `mbtiEvidenceCount` 与 `mbtiBasis`。
+- `npm run test:node` 486/486、`npm run typecheck`、`scripts/run-python-tests.py`（另跑 `--only test_real_backend.py`）本轮全绿。
+- 本轮没有新增运行时模块，`scripts/stage-real-client.py` 白名单无需变更。
+- 另有 tokenizer 性能优化（提交 `f83513a` / `959b4e0`，记忆化编码 + 复用共享 state token ids）在同一分支上。
+
+发布前仍须走 §12.10 的更新流程与 §13 的全量回归。
 
 ---
 
@@ -1161,11 +1168,24 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 - **身份**：`profiles[].id` 是 32 位 hex，直接沿用旧的 `sourceId` 语义，因此 SQLite 里所有 `(account, user, source_id)` 作用域的缓存天然按档案隔离，切换档案不会串用旧结果。
 - **指纹**：`sourceIds{fingerprint→id}`，`fingerprint = sha256(["api-source-v1", protocol, baseUrl, model])`。**一条档案只拥有一个指纹**——`_upsert_profile` 在改写它的 protocol/baseUrl/model 之前会先清掉旧指纹，`_read` 的「指纹值互不重复」不变量才始终成立（否则整份配置会被判损坏）。
 - **落盘与选择是两件独立的事**：`save_profile` 只增删改档案，不动 `selectedMode`/`sourceId`；`select_profile` 只改选择。`model_source_activate` 的顺序是「探测 → `save_profile` → `select_profile` → 发布内存态」，不能颠倒：先落盘选择再探测会让一次失败的探测把来源留在坏配置上。
+- **「保存并启用」对已保存配置是两步**：`chatui/app.js:saveApiProfileDraft(activate)` 在 `payload.profileId` 存在时先发 `/api/model-source/profiles`，再发 `{mode:"api",profileId}`。`activate` 带 `profileId` 时不允许再带连接字段（`model_source_activate` 的 `set(request) != {"mode","profileId"}` 判定），混合请求是 400，而「测试连接」不带 `profileId`／`mode` 所以照样成功——这正是「测试连接成功但保存并启用失败」的成因。契约由 `bridge/test_model_source.py:test_activate_rejects_connection_fields_next_to_a_profile_id` 与 `tests/model-source-settings.test.cjs` 的两个用例钉住；新建配置不受影响，仍是一次调用。
 - **密钥沿用**：`resolve_key(protocol, baseUrl, None)` 遍历所有档案，找**协议与 host/path 完全一致**的那条（活动档案优先）。`_upsert_profile` 只在 protocol 与 baseUrl 都未改变时才复用旧密钥，因此「留空沿用已保存密钥」不会把 A 站的密钥带到 B 站。
 - **删除活动档案必须回落本地**：`model_source_profile_delete` 发现删掉的正是 `sourceId` 时，要把 `active_*` 复位为 `LOCAL_SOURCE_ID` 并调 `_cancel_api_source_work_locked()`，否则 worker 会继续指向一份已不存在的配置。
 - **版本迁移**：`version:1` 的单个 `api` 对象在 `_decode_profiles` 中变成 `profiles` 的第一项，并沿用原 `sourceId`（历史缓存键因此不变），下次写入即升级为 `version:2`。
 
 **改动清单**：`bridge/model_source.py`（存储与校验）→ `backend_service.py` 的 `model_source_activate` / `model_source_profile_save` / `model_source_profile_delete` / `model_source_clear_key`（语义与原子性）→ `bridge/real_http.py`（路由白名单 + 分支）→ `chatui/index.html`（`#selectApiProfile`、`#inputApiProfileName`、`#modelBadge*`、`#apiProfileDeleteConfirm`）→ `chatui/app.js`（`modelProfiles()`、`resolveEditedProfileId()`、`postApiModelSource()`、`renderModelBadgeMenu()`）。前端仍禁止 innerHTML，菜单项用 `document.createElement` 逐个构造；删除沿用账号管理的「二次确认」交互而非 `window.confirm`。
+
+### 12.14 修改「选择消息」分析（手选若干条只分析它们）
+
+界面上：聊天工具条 `#btnPickMessages`（文案在「选择消息」与「退出选择」之间切换）→ `chatui/index.html` 的 `#pickBar`（`#btnPickAll` / `#btnPickClear` / `#btnPickAnalyze` / `#btnPickCancel`）。
+
+- **前端状态**：`chatState.messagePicking` + `chatState.selectedMessageIds`（`chatui/view-state.js` 的 chat 域）。每行可分析消息由 `attachPickControl` 挂上 `.msg-pick` 复选框并标 `.pickable`，容器加 `.pick-mode` 才显示 —— 进入/退出选择态**不重渲染消息列表**，只切类名 + `syncPickControls()`。
+- **两条提交路径都只带选中 id**：本地 `submitPickedMessages` → `analyzeRecent(…, targetIds)` → `POST /api/analyze {mode:"recent",limit,targetIds}`；API `submitPickedApiInsights` → `submitApiInsightJob`（后端本来就接受 `targetIds`）。API 侧若已有 `queued/running` 任务，后端会把新请求答成那个运行中的任务，所以前端直接提示「会在其中一并完成」而不是假装已排队。
+- **必须保留的三处抑制**：`scheduleRecent` 与 `ensureApiInsights` 在选择态下直接返回；`submitManualRecent`（「意图识别」按钮，也是 `manualRecentDeferred` 的续投入口）改为委托 `submitPickedMessages`。漏掉任意一处，手选都会被整窗分析盖过去（API 模式还多花钱）。
+- **窗口契约**：前端 `pickedWindow()` 用 `limit = max(1, min(80, 已加载条数 - 最早被选位置))`、候选只取尾窗内的选中项，`#pickBarCount` 会提示「N 条超出当前窗口」；后端再校验一次（§6.2）。
+- **选择态生命周期**：切换会话（`switchSession`）、账号重置（`resetAccountView`）、进入历史视图（`enterHistoryView`）都会退出并清空选择；退出选择态本身也会清空（选择属于当时那个窗口）。
+- **范围边界**：手选只产出逐条消息标签（本地 `fine_results_v1` / API `api_insights_v1`），不改画像累计与沟通建议；后台「分析已添加的会话」开关（`incremental` / 全程扫描）不受影响，要不要一起关是用户的设置，不是本功能能替用户决定的。
+- **回归**：`tests/message-picking.test.cjs`（前端行为 + 三处抑制的接线）、`bridge/test_real_backend.py` 的 `test_http_analyze_accepts_hand_picked_targets`（HTTP 边界 202/400）、`test_selected_targets_analyse_only_the_picked_ids` / `test_selected_targets_outside_the_window_are_rejected_before_queueing` / `test_selection_does_not_narrow_the_next_window_run`。
 
 ---
 
@@ -1188,6 +1208,8 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 本地环境注意：README 要求 Python 3.14，但本机只有 3.13；用 `py -3.13 -m venv .venv` + `pip install --no-deps -r python-requirements.lock.txt`，运行时设 `WECHATVIBE_PYTHON` 指向该解释器。
 
 合成测试覆盖账号作用域、任务失效、流式标签、纯标点、启动失败回收、静态 MIME、更新保留模型等路径；**它们不能替代真实服务商或用户设备的验收**。
+
+手选消息的范围与守卫由 `tests/message-picking.test.cjs`（前端行为 + `scheduleRecent`/`ensureApiInsights`/`submitManualRecent` 三处抑制的接线）与 `bridge/test_real_backend.py` 的 `test_http_analyze_accepts_hand_picked_targets` + 三个 `test_selected_targets_*` / `test_selection_does_not_narrow_the_next_window_run` 钉住（后者已用「关掉守卫」验证过确实会失败）。
 
 ---
 
@@ -1222,3 +1244,4 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 | 应用更新 | `scripts/real-client-update*.cjs`、`scripts/update-signing.pub` |
 | 打包白名单 | `scripts/stage-real-client.py` |
 | 分层约定（权威） | `docs/backend-architecture.md` |
+| 手选消息的分析范围 | `chatui/app.js`（`pickableMessage`/`pickedWindow`/`submitPickedMessages`）、`bridge/backend_service.py`（`_resolve_selected_targets`/`_run_selected_targets`）、`bridge/real_http.py`（`/api/analyze` 的 `targetIds`） |

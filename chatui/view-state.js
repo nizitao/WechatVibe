@@ -43,6 +43,10 @@
         generation: 0,
         controller: null,
         messages: [],
+        // 手动「选定几条来分析」：只对用户勾选的 id 提交分析，进入选择态时
+        // 自动扩展到整个窗口的流程会被抑制，退出后恢复。
+        messagePicking: false,
+        selectedMessageIds: new Set(),
         messagePending: false,
         messageRequest: 0,
         messageRefreshQueued: false,

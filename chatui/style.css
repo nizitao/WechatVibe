@@ -2044,6 +2044,58 @@ body.theme-light .kaomoji-mood {
 }
 
 /* ========================================================
+   HAND-PICKED MESSAGE SELECTION (「选择消息」)
+   ======================================================== */
+.msg-pick {
+  display: none;
+  align-self: center;
+  flex-shrink: 0;
+  cursor: pointer;
+}
+.pick-mode .msg-item.pickable .msg-pick { display: flex; }
+.pick-mode .msg-item.pickable { cursor: pointer; }
+.msg-pick input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #07c160;
+  cursor: pointer;
+}
+.msg-item.picked .msg-bubble {
+  outline: 2px solid #07c160;
+  outline-offset: 2px;
+}
+.pick-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px 0;
+  flex-wrap: wrap;
+}
+.pick-bar[hidden] { display: none; }
+.pick-bar-count {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.pick-bar-btn {
+  background: transparent;
+  border: 1px solid #3a3a3d;
+  color: #aaa;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.pick-bar-btn:hover { color: #dfdfdf; border-color: #555; }
+.pick-bar-btn:disabled { opacity: 0.5; cursor: default; }
+.pick-bar-primary { border-color: #07c160; color: #07c160; font-weight: 500; }
+.pick-bar-primary:hover:not(:disabled) { background: rgba(7, 193, 96, 0.12); color: #07c160; }
+body.theme-light .pick-bar-btn { border-color: var(--border-color); color: var(--text-muted); }
+body.theme-light .pick-bar-btn:hover { color: var(--text-main); }
+body.theme-light .pick-bar-primary:hover:not(:disabled) { color: #07c160; }
+
+/* ========================================================
    PERSONA VIEW COMPONENTS (好感等级系统 & MBTI 融合)
    ======================================================== */
 

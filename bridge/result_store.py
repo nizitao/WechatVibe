@@ -488,9 +488,19 @@ class ResultStore:
         if isinstance(resume, dict) and "synthesisFingerprint" in resume and not valid_synthesis_fingerprint(
                 resume["synthesisFingerprint"]):
             resume.pop("synthesisFingerprint", None)
+        available = json.loads(row[3])
+        # The MBTI gate in api-portrait.ts counts the observation ledger, not analysed texts.
+        # Without this the UI can only see `targetTextCount` (2126 on a stalled run) and would
+        # report the card as unlocked while every axis is withheld, leaving a blank verdict
+        # with no explanation. Read after the validity pops: a rejected ledger must count as 0.
+        available["mbtiEvidenceCount"] = (
+            int(resume["portraitEvidence"]["targetCount"])
+            if isinstance(resume, dict) and isinstance(resume.get("portraitEvidence"), dict)
+            and type(resume["portraitEvidence"].get("targetCount")) is int
+            else 0)
         return {"highwater": tuple(json.loads(row[0])) if row[0] else None,
                 "after": tuple(json.loads(row[1])) if row[1] else None,
-                "fingerprint": row[2], "available": json.loads(row[3]),
+                "fingerprint": row[2], "available": available,
                 "plan": json.loads(row[4]), "batchIndex": row[5],
                 "complete": bool(row[6]), "processed": row[7],
                 "processedChars": row[8], "portrait": portrait,

@@ -400,12 +400,19 @@ def make_handler(backend, accounts=None, control_token=None):
                 mode = request.get("mode")
                 if mode not in ("recent", "history", "incremental"):
                     raise ValueError("invalid mode")
+                # Hand-picked message ids. The backend resolves them against the same tail
+                # window this endpoint's `limit` describes, so the request is rejected with
+                # 400 when an id has fallen out of the window.
+                target_ids = request.get("targetIds")
+                if target_ids is not None and mode != "recent":
+                    raise ValueError("invalid analysis targets")
                 limit = (None if mode == "incremental" else
                          "all" if mode == "history" and request.get("limit") == "all" else
                          integer(request.get("limit"), 80 if mode == "recent" else 500,
                                  80 if mode == "recent" else 5000))
                 return self.send(202, {"job": backend.start(user, mode, limit,
-                                                             expected_account=expected_account)})
+                                                             expected_account=expected_account,
+                                                             target_ids=target_ids)})
             except ForecastRequestError as exc:
                 return self.send(exc.status, {**echo, "error": exc.code, "message": exc.message})
             except (ValueError, UnicodeError, json.JSONDecodeError) as exc:

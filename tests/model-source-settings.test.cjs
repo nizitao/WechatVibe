@@ -380,6 +380,10 @@ it("saves a new profile without activating it and keeps editing that profile", a
 });
 
 it("updates the selected profile in place and names the request with its id", async () => {
+  // 「保存并启用」on a saved profile is save-then-switch: `/api/model-source/activate` takes
+  // either the connection fields or `{mode, profileId}`, and a mixed body is a 400
+  // `invalid model source request` that the form reported as 启用失败 even though 测试连接
+  // had just succeeded.
   const requests = [];
   const { ui, byId } = harness(async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
@@ -393,9 +397,39 @@ it("updates the selected profile in place and names the request with its id", as
   assert.equal(byId("apiKeySaved").hidden, false);
   byId("inputApiModelId").value = "model-a2";
   await ui.activateModelSource("api");
+  assert.deepEqual(requests.map(item => item.url),
+    ["/api/model-source/profiles", "/api/model-source/activate"]);
   assert.equal(requests[0].body.profileId, id("a"));
   assert.equal(requests[0].body.name, "线路 A");
   assert.equal(requests[0].body.model, "model-a2");
+  // The switch itself must stay the two-key form: no fields, so no second probe.
+  assert.deepEqual(requests[1].body, { mode: "api", profileId: id("a") });
+  assert.equal(byId("modelSourceStatus").textContent, "API 模型已启用");
+});
+
+it("never sends connection fields together with a profile id to activate", async () => {
+  const requests = [];
+  const { ui, byId } = harness(async (url, options) => {
+    requests.push({ url, body: JSON.parse(options.body) });
+    return response(apiState);
+  });
+  ui.showModelSource(apiState);
+  ui.loadApiProfileDraft(id("a"));
+  await ui.activateModelSource("api");
+  for (const request of requests)
+    assert.equal(request.url.endsWith("/activate") && Object.keys(request.body).length > 2, false,
+      `activate body must be {mode, profileId}: ${JSON.stringify(request.body)}`);
+  // A brand-new profile still activates in one request, carrying the fields it was probed with.
+  byId("selectApiProfile").value = "";
+  ui.loadApiProfileDraft("");
+  byId("inputApiBaseUrl").value = "https://c.test/v1";
+  byId("inputApiModelId").value = "model-c";
+  byId("inputApiContextTokens").value = "128000";
+  await ui.activateModelSource("api");
+  const last = requests.at(-1);
+  assert.equal(last.url, "/api/model-source/activate");
+  assert.deepEqual(last.body, { mode: "api", protocol: "responses", baseUrl: "https://c.test/v1",
+    model: "model-c", contextTokens: 128000 });
 });
 
 it("deletes only after an explicit confirmation and then falls back to the remaining model", async () => {
