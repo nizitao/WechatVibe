@@ -1,9 +1,8 @@
 // Vendored from laya-mlx (Apache-2.0).
 // Source: https://github.com/mizchi/laya-mlx @ dc3aa6b150cb861d0788fbd421cfd1303de4ed57
 // Path: web/packages/laya-web/src/prompt.ts
-// Modified: relative imports made extensionless ("./x.ts" -> "./x"). `buildSequence` takes an
-// optional precomputed state id list so a caller preparing many questions against one state
-// encodes that state once instead of once per question. Logic otherwise unchanged.
+// Modified: relative imports made extensionless ("./x.ts" -> "./x"). Optional precomputed
+// state ids adapted from nizitao's WechatVibe PR #26 @ bca5c5ab4258e16340b5a4ecea94d070011853a9.
 
 import { pyJson } from "./pyjson";
 import { renderOptions } from "./questions";
@@ -62,10 +61,8 @@ export function buildPrefix(
 
 /**
  * Python `build_sequence`: prefix + state tokens (right-truncated) + [SEP], capped at maxLen.
- *
- * `stateIds` is the already-encoded `serializeState(state)` with the mask token blanked. It is
- * an optimization hook only: pass it when the same state is being encoded for several
- * questions. It is sliced, never mutated, so the caller's array stays intact.
+ * Optional `stateIds` must encode this state's serialized text with the mask token blanked.
+ * They are only sliced, allowing one immutable encoding to be shared across questions.
  */
 export function buildSequence(
   tokenizer: LayaTokenizer,
@@ -73,7 +70,7 @@ export function buildSequence(
   q: InternalQuestion,
   maxLen: number,
   headMaxLen: number,
-  stateIds?: number[],
+  stateIds?: readonly number[],
 ): PreparedItem {
   const prefix = buildPrefix(tokenizer, q, headMaxLen);
   const room = Math.max(0, maxLen - prefix.ids.length - 1);

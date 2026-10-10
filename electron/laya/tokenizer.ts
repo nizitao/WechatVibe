@@ -1,16 +1,11 @@
 // Vendored from laya-mlx (Apache-2.0).
 // Source: https://github.com/mizchi/laya-mlx @ dc3aa6b150cb861d0788fbd421cfd1303de4ed57
 // Path: web/packages/laya-web/src/tokenizer.ts
-// Logic unchanged except for the local memoization described below; depends on
-// @huggingface/tokenizers pinned to 0.2.0. Local modifications:
-// - `encode` memoizes its result in a bounded FIFO cache. Encoding is a pure function of
-//   the text, and every caller encodes the same few strings repeatedly (question heads and
-//   options once per budget check plus once per sequence build, the target state once per
-//   question), so this removes redundant tokenizer round trips without changing any id.
-// - `isUnicodeWhitespace` replaces a per-character `/\p{White_Space}/u` test with the exact
-//   same code-point set, without allocating a regex match per character.
-// - Token accumulation uses index loops instead of `push(...spread)`.
-// Token ids are bit-identical to the unmodified upstream file.
+// Local performance changes adapted from nizitao's WechatVibe PR #26:
+// https://github.com/tswawa/WechatVibe/pull/26 @ bca5c5ab4258e16340b5a4ecea94d070011853a9
+// Bounded encode memoization, equivalent Unicode whitespace membership and indexed appends.
+// Cached ids are immutable; raw-text length and explicit clearing bound text retention.
+// Depends on @huggingface/tokenizers pinned to 0.2.0.
 
 import { Tokenizer } from "@huggingface/tokenizers";
 
@@ -43,11 +38,7 @@ export interface TokenizerConfig {
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/**
- * Exact membership test for `\p{White_Space}`, i.e. U+0009..U+000D, U+0020, U+0085,
- * U+00A0, U+1680, U+2000..U+200A, U+2028, U+2029, U+202F, U+205F and U+3000. A lone
- * surrogate is notWhite_Space, which matches the `u`-flagged regex this replaces.
- */
+/** Unicode White_Space membership for the single characters used by lstrip/rstrip. */
 export function isUnicodeWhitespace(ch: string): boolean {
   const cp = ch.codePointAt(0);
   if (cp === undefined) return false;
@@ -66,21 +57,11 @@ export function isUnicodeWhitespace(ch: string): boolean {
   );
 }
 
-const isWhitespace = (ch: string) => isUnicodeWhitespace(ch);
-
-/**
- * Upper bound on memoized `encode` results. Every question set contributes only its head,
- * option and state strings, so a few hundred entries cover a session; the FIFO eviction
- * keeps a long-running desktop session from growing without limit.
- */
+const isWhitespace = isUnicodeWhitespace;
 const ENCODE_CACHE_LIMIT = 256;
-
-/**
- * Ids longer than this are not cached. Paths that produce them (`fitTargetStateToBudget`
- * probing progressively shorter states) never repeat the same text, so caching them only
- * costs memory.
- */
 const ENCODE_CACHE_MAX_IDS = 4096;
+// Bound raw keys independently: whitespace can collapse into very few token ids.
+const ENCODE_CACHE_MAX_TEXT_LENGTH = 16384;
 
 interface AddedTokenInfo {
   id: number;
@@ -134,7 +115,7 @@ export class LayaTokenizer {
   private readonly addedTokenInfo: Map<string, AddedTokenInfo>;
   private readonly replacement: string;
   private readonly pieceSplitter: RegExp;
-  private readonly encodeCache = new Map<string, number[]>();
+  private readonly encodeCache = new Map<string, readonly number[]>();
 
   constructor(tokenizerJson: TokenizerJson, tokenizerConfig: TokenizerConfig) {
     const pre = tokenizerJson.pre_tokenizer;
@@ -196,17 +177,13 @@ export class LayaTokenizer {
 
   /**
    * Token ids without special tokens, equal to Python `tok(text, add_special_tokens=False)`.
-   *
-   * The returned array is the cached instance and is shared with every later call for the
-   * same text: callers must treat it as read-only. All in-tree callers only read `.length`,
-   * spread it, or `slice()` it, so this stays invisible; a caller that needs to mutate must
-   * copy first.
+   * Results are frozen and may be shared by later calls; copy before mutating them.
    */
-  encode(text: string): number[] {
+  encode(text: string): readonly number[] {
     const cached = this.encodeCache.get(text);
     if (cached !== undefined) return cached;
-    const ids = this.encodeUncached(text);
-    if (ids.length <= ENCODE_CACHE_MAX_IDS) {
+    const ids = Object.freeze(this.encodeUncached(text));
+    if (ids.length <= ENCODE_CACHE_MAX_IDS && text.length <= ENCODE_CACHE_MAX_TEXT_LENGTH) {
       if (this.encodeCache.size >= ENCODE_CACHE_LIMIT) {
         const oldest = this.encodeCache.keys().next();
         if (!oldest.done) this.encodeCache.delete(oldest.value);
@@ -214,6 +191,11 @@ export class LayaTokenizer {
       this.encodeCache.set(text, ids);
     }
     return ids;
+  }
+
+  /** Release retained input text and token ids without unloading the tokenizer/model. */
+  clearEncodeCache(): void {
+    this.encodeCache.clear();
   }
 
   private encodeUncached(text: string): number[] {
@@ -275,6 +257,6 @@ export class LayaTokenizer {
   }
 }
 
-function appendAll(target: number[], source: number[]): void {
+function appendAll(target: number[], source: readonly number[]): void {
   for (let i = 0; i < source.length; i++) target.push(source[i]!);
 }

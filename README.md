@@ -2,8 +2,9 @@
 
 上游仓库：[tswawa/WechatVibe](https://github.com/tswawa/WechatVibe)。
 
-本 fork 在上游 **v1.2.4** 的基础上，放进了我们自己提给上游的修复和一套自用改动，
-方便自己构建、也给朋友用。上游的功能说明、下载安装、隐私与免责声明请以上游仓库为准。
+本 fork 在上游 **v1.3.0** 的基础上（`perf/optimize-tokenizer` 已把上游 1.3.0 合并进来），
+放进了我们自己提给上游的修复和一套自用改动，方便自己构建、也给朋友用。
+上游的功能说明、下载安装、隐私与免责声明请以上游仓库为准。
 
 ## 我们的改动
 
@@ -52,15 +53,36 @@
 
 `feat/selfuse-on-1.2.4` 上 `tsc`、Node 测试与 Python 全套通过。
 
-### 三、本轮改动（已提交在 `perf/optimize-tokenizer`，未并入 `main`、未开 PR）
+### 三、本轮改动（提交在 `perf/optimize-tokenizer`，开着 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)，未并入 `main`）
 
-下面三块都已提交到分支上，还没有并入 `main`、也没提 PR：
+下面三块都已提交到分支上：
 
 - **手选若干条消息，只分析它们**：聊天输入框上方新增「选择消息」，进去后每条可分析的消息左侧出现勾选框，勾完点「分析选中」，就只对勾中的这几条做逐条情绪 / 意图分析——**本地 Laya 与 API 模式都支持**。选择期间会暂停「整个消息窗口的自动分析」，退出后恢复；勾选范围限在当前已加载的窗口内（最多 80 条），超出的会在工具条上标出条数。人物画像累计与沟通建议不受影响，仍按整段历史计算。隐私口径不变：手选只是把同一段窗口里被勾中的消息交给原本那条链路——本地模式仍然不出本机，API 模式向上游发送什么仍以上游说明为准，勾选不会扩大或缩小发送范围。
 - **修「保存并启用」的两个坑**：这个按钮过去有两种失败方式。一是编辑一条**已保存的** API 配置后点它，会被后端以 400 `invalid model source request` 拒绝、界面显示「启用失败」，而紧挨着的「测试连接」却成功——它把「连接字段」和「配置 ID」塞进了同一个请求，后端规定两者二选一。二是**新建**一条与已有配置同 Base URL、同模型 ID 的配置时，后端按连接命中了旧那条并就地更新，于是列表里不会多出一行，看起来就是「我加了第三个模型，下拉菜单里却没有」。现在这个按钮统一成「先保存（新建则新增一条、编辑则更新那条），再按 ID 切换」，两种情况下都会出现在模型列表里。
 - **修 API 画像「已解锁但四维全是空白」**：MBTI 四维只在观察阶段攒够证据后才会由模型给出，而画像卡片此前按「已分析文本数」判断是否解锁，于是停在中途的运行会显示已解锁、四个维度却全是待判断，也没有任何说明。现在卡片按后端真正的门槛（观察账本条数）解锁，锁定时说明还差什么，逐轴证据数也用真实条数而不是固定值，停在队列里的运行会直接说「观察阶段未运行，请重新分析」。
 
-### 四、与上游的已知分歧
+### 四、合并上游 1.3.0（2026-10-10）
+
+把 `upstream/main`（`b35efa5`，1.3.0 发布）合进 `perf/optimize-tokenizer`：分支基线从 v1.2.4 提到 v1.3.0，
+[PR #33](https://github.com/tswawa/WechatVibe/pull/33) 也从「冲突」回到可合并。
+
+上游这次带来的（**一律取上游实现**）：**助手仓库 / 聊天助手**（`ui/advisor`、`chatui/advisor*.js`、`docs/advisor.md`、`bridge/advisor_*.py`）；
+**「重置分析」按范围**（`/api/analysis-scope/clear`，重置进行中对新任务回 409）；**会话批量移除**（`/api/conversation-selection` 的 `sessions` + `selected:false`，一次最多 1000 个）；
+**API 画像观察账本**（`api_portrait_ledger.py`）与跨批次的显示统计继承；**chatui 源码行尾归一化**（`0c67aee` + `.gitattributes` 的 `chatui/*.{html,css,js} text`）；
+以及 **Laya 分词优化的上游版** —— 就是我们 PR #26 的那套缓存，上游另加了不可变返回、原文长度上限与显式清理，因此 `electron/laya/{tokenizer,prompt,agent}.ts` 与 `tests/laya-tokenizer.test.ts` 直接取上游。
+
+本 fork 保留的（上游没有，冲突时按功能重贴）：**手选消息**（`targetIds`）与**模型来源多配置**（`/api/model-source/profiles*`、按配置清 Key —— 上游没有多配置这一层）；
+**画像与 resume 的落盘加密**（`default_cipher`，上游写明文，`unprotect` 仍能读旧的明文行）；**宽情绪题 8 桶 / `generic-v10`**、消息内嵌图片、「请求分析」按钮（`requestedSessions`）、`/api/model-guidance`、`/api/api-workers`。
+
+这轮冲突解决里值得记下的三点：
+
+1. **chatui 的整文件冲突是行尾噪声**：上游把 chatui 源码归一化成 LF，分叉点却是混合行尾，于是逐行都对不上（`style.css` 整个文件、`index.html` 9 处）。做法是**把 base / ours / theirs 都转成 LF 后再做三方合并**，冲突立刻缩到 1 处（双方各加了一个弹窗，取并集）。
+2. **上游把「失效助手运行」「上下文容量变化时丢弃画像错误」写在 `model_source_activate` 里**，而本 fork 三条发布路径都走 `_commit_api_source_locked`，于是这段统一收进那个方法，三条路径一起生效。
+3. **两处上游新增测试要按 fork 行为适配**（否则 PR 上会红）：`bridge/test_api_portrait_reconciliation.py` 直接 `json.loads` 读写 `portrait_json` / `resume_json`，而本 fork 这两列是加密的，改成 `default_cipher().loads()/dumps()`；`tests/advisor-runtime.test.ts` 把夹具建在仓库内 `.local/advisor-build/runtime-tests/case-*`，运行时再往下嵌到 **268 字符**，超过 Windows 260 上限且本机没开长路径支持时删不掉、资源管理器会反复弹「永久删除此文件夹？」，改成建在系统临时目录（约 195 字符）。
+
+验证：`npm run typecheck` 干净；`npm run test:node` **595/595**；Python 侧除上游自带的 7 个 `test_advisor_*.py`（在纯净 `upstream/main` 上失败数完全相同，本机环境所致）外全部通过，含两个慢文件（`test_real_backend.py` 94s、`test-start-real-client.py` 79s）。
+
+### 五、与上游的已知分歧
 
 保留自用判定逻辑会带来两处可预期的不一致，下次升级上游时需要留意：
 
@@ -68,8 +90,10 @@
   因此 `tests/api-portrait-classifier.test.ts` 的两处断言按本 fork 的题库调整过（59 改 60、`affectionate` 改成 `caring`）。
 - 逐条显示走宽情绪题 `EMOTION_QUESTION`，上游的逐条显示仍走 18 个立场词；标签 schema 本 fork 是 `generic-v10`，上游是 `generic-v9`。
 
-升级上游时的做法（v1.2.4 这轮实际用的）：从目标版本开分支，上游已经覆盖的功能**直接取上游**，
-只按功能重贴上面这些 fork 独占块；比对时用 `git diff -w` 过滤行尾噪声，最后跑 `tsc`、Node 与 Python 全套。
+升级上游时的做法（v1.2.4 与 v1.3.0 两轮实际用的）：从目标版本开分支（v1.3.0 这轮直接 `git merge upstream/main`），
+上游已经覆盖的功能**直接取上游**，只按功能重贴上面这些 fork 独占块；比对时用 `git diff -w` 过滤行尾噪声，
+行尾已经归一化的文件可以先把三方都转成 LF 再合并；最后跑 `tsc`、Node 与 Python 全套。
+Python 侧注意 `scripts/run-python-tests.py` 是**串行遇错即停**，要用 `--only` 逐个文件确认其余文件真的跑过。
 v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github.com/silicon-sbt/WechatVibe/tree/selfuse/v1.2.0) 分支，仅作历史对照，不再维护。
 
 ## 可以单独用的修复分支（基于上游 main，不含自用改动）
@@ -87,8 +111,9 @@ v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github
 
 | 分支 | 内容 |
 | --- | --- |
-| `main` | 跟随上游 v1.2.4 + 「自用改动」 |
-| `feat/selfuse-on-1.2.4` | 本轮升级分支（自用改动搬到 1.2.4） |
+| `main` | 跟随上游 v1.3.0 + 「自用改动」 |
+| `perf/optimize-tokenizer` | 本轮分支：手选消息 / 模型来源多配置 / MBTI 门槛修 + 分词优化，已合并上游 1.3.0（[PR #33](https://github.com/tswawa/WechatVibe/pull/33) 开放） |
+| `feat/selfuse-on-1.2.4` | 上一轮升级分支（自用改动搬到 1.2.4） |
 | `feat/selfuse-on-1.2.3` | 上一轮升级分支（已并入 `main`，历史） |
 | `feat/selfuse-on-1.2.2` | 更早的升级分支（历史） |
 | `selfuse/v1.2.0` | v1.2.0 + 旧的原始自用补丁（存档，不再维护） |

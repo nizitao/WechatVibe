@@ -17,6 +17,9 @@ SCRIPTS = (
     "real-client-update-controller.cjs",
     "real-client-update-helper.cjs", "real-client-update-extract.py",
     "update-signing.pub", "model-files.json", "model-asset.json",
+    "advisor-worker.ts",
+    "advisor-package-grant.py",
+    "advisor-companion.cjs", "advisor-preload.cjs",
 )
 BRIDGE = (
     "account_api.py", "account_store.py", "conversation_selection.py",
@@ -28,9 +31,12 @@ BRIDGE = (
     "backend_contracts.py", "backend_service.py", "message_results.py", "message_contracts.py",
     "message_input.py", "portrait_contracts.py", "api_pool.py", "api_tasks.py", "node_analysis.py",
     "guidance_contracts.py",
-    "result_store.py", "api_portrait_statistics.py",
+    "result_store.py", "api_portrait_statistics.py", "api_portrait_ledger.py",
     "wechat_source.py", "real_backend.py", "real_http.py", "snapshot_cache.py", "wechat_bridge.py",
     "windows_file_owners.py",
+    "advisor_contracts.py", "advisor_store.py", "advisor_context.py", "advisor_service.py",
+    "advisor_runtime.py", "advisor_http.py",
+    "advisor_packages.py", "advisor_imports.py",
 )
 NATIVE_READER = (
     "__init__.py", "crypto.py", "database.py", "discovery.py", "errors.py",
@@ -64,6 +70,10 @@ PUBLIC_FILES = (
     "electron/api-portrait-classifier.ts",
     "electron/api-guidance.ts",
     "electron/local-message-insights.ts",
+    "electron/advisor-runtime.ts", "chatui/advisor.js", "chatui/advisor.css",
+    "chatui/advisor-frame.html", "chatui/advisor-frame.js", "chatui/advisor-ui-bundle.js",
+    "chatui/advisor-timeline.css", "licenses/OpenCode-MIT.txt",
+    "chatui/advisor-window.html", "chatui/advisor-window.css", "chatui/advisor-window.js",
     "shared/contracts.ts", "shared/message-input.ts", "src/lib/labels.ts",
     "native-reader/THIRD_PARTY_NOTICES.md",
 )

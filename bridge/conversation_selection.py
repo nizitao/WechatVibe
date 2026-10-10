@@ -184,3 +184,21 @@ class ConversationSelectionStore:
                              "VALUES (?,?)", [(account, session) for session in sessions])
 
         return self._write(account, body)
+
+    def remove_selected(self, account, sessions):
+        if (not isinstance(sessions, list) or not 1 <= len(sessions) <= 1000 or
+                len(set(_session_id(session) for session in sessions)) != len(sessions)):
+            raise ValueError("invalid session selection")
+
+        def body(conn):
+            state = self._state(conn, account)
+            if not set(sessions) <= set(state["selectedSessions"]):
+                raise ValueError("session not selected")
+            conn.executemany("DELETE FROM conversation_selection_v1 WHERE account=? AND session=?",
+                             [(account, session) for session in sessions])
+
+        # `_write` would create the database; removing from an account that has no file must
+        # stay a rejection, not a side effect.
+        if not self._path(account).is_file():
+            raise ValueError("session not selected")
+        return self._write(account, body)

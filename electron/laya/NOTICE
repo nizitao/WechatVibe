@@ -17,18 +17,22 @@ changes ("./x.ts" -> "./x", see README.md) and a provenance header added:
   calibration.ts
   agent.ts
 
-Three of them carry local, behaviour-preserving changes on top of that, each
-listed in its own provenance header:
+Local performance changes to tokenizer.ts, prompt.ts and agent.ts are adapted
+from nizitao's WechatVibe PR #26:
+  https://github.com/tswawa/WechatVibe/pull/26
+  Source revision: bca5c5ab4258e16340b5a4ecea94d070011853a9
 
-  tokenizer.ts  `encode` memoizes its result in a bounded FIFO cache; the
-                per-character `\p{White_Space}` regex became an equivalent
-                code-point test; token accumulation uses index loops.
-  prompt.ts     `buildSequence` accepts optional precomputed state ids.
-  agent.ts      `prepare` encodes the shared state once and passes the ids to
-                `buildSequence` instead of re-encoding per question.
+  tokenizer.ts  Bounded FIFO encode memoization, equivalent Unicode whitespace
+                membership and indexed token accumulation. This integration
+                also freezes returned ids, caps raw-text key length and exposes
+                explicit cache clearing for account/model/cache lifecycle events.
+  prompt.ts     Optional immutable precomputed state ids in buildSequence.
+  agent.ts      Encode each shared state once per prepare, lazily for nonempty
+                question sets.
 
-Token ids, sequences and answers are unchanged; `tests/laya-tokenizer.test.ts`
-pins that.
+The offline tests in tests/laya-tokenizer.test.ts are adapted from the same
+contribution and extended for immutable results, cache limits and clearing.
+They use synthetic tokenizers and do not measure production model performance.
 
 The tokenizer/sequence/answer parity test fixture
 (tests/fixtures/laya-parity-multilingual.json) is also copied from that
