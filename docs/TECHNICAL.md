@@ -201,7 +201,7 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | `guidance_contracts.py` (188) | 沟通建议契约（`GUIDANCE_REVISION = "api-guidance-v2"`） | 服务、IO |
 | `message_contracts.py` (95) | 消息标签契约：`FINE_LABEL_SCHEMA="generic-v9"`、`API_INSIGHT_REVISION="free-label-v6-compact"` | 服务、存储 |
 | `portrait_contracts.py` (83) | 画像契约：`API_PORTRAIT_REVISION="portrait-v2"`、evidence ledger v3、`mbtiBasis` | 服务、存储 |
-| `message_input.py` (238) | 消息身份/来源/时间/引用元数据的校验与投影（纯契约层） | 微信读取、媒体解码、OCR |
+| `message_input.py` (360) | 消息身份/来源/时间/引用元数据的校验与投影；**模型可见文本的单一来源**（剥离链接与占位，见 §6.11）（纯契约层） | 微信读取、媒体解码、OCR |
 | `message_results.py` (108) | Node 单条结果的纯校验（版本、schema、分布、groundedIntent） | IO、调度 |
 | `model_source.py` (464) | 多条 API 模型源配置（增删改查/选择）+ Windows DPAPI 加密 API Key 存储 | 调度 |
 | `local_model_source.py` (86) | 本地模型目录选择与状态（downloaded / bundled / custom） | — |
@@ -702,6 +702,28 @@ GET /api/media?user=&id=  → 校验签发与身份 → 返回 PNG 字节
 
 ---
 
+### 6.11 链接与占位不进分析
+
+一条消息里的链接**不进模型**：分析的是消息本身，URL 是噪声；API 模式下它还是不该外发的内容。规则只有一处来源 —— `bridge/message_input.py`：
+
+- `strip_links(text)`：去掉 `http(s)://…` 与 `www.…` 开头的连续字符（到空白为止，**尾部的 `。，` 等标点留给句子**）。**裸域名（如 `mp.weixin.qq.com/s/…`）不去**：太容易误伤正常文本，需要时再单独放开。
+- `analysis_text(text)`：`strip_links` 之后再判断「整条是否只是微信占位名」（`[链接]`/`[文件]`/`[音乐]`… 白名单见 `PLACEHOLDER_NAMES`）→ 是则返回 `""`。占位消息多数已被 `chat_server.classify` 归为 `kind == "other"`（`<appmsg>` 会取标题归 other），所以这条主要是兜底。
+- `has_analysis_content(text)`：`analysis_text` 之后还有非空白内容才算「可分析」。**纯标点仍算内容**（`？？？` 承载语气，与既定规则一致）；唯一被排除的是「去掉链接后只剩标点」的整条链接消息。
+
+落点（模型侧一律拿 `analysis_text` 的结果，界面与已存结果保持原文）：
+
+| 链路 | 判定 / 剥离位置 |
+| --- | --- |
+| 投影层（本地标签、API 标签、助手资料） | `message_input.prepare_item` / `to_wire`：返回副本的 `text` 就是模型可见文本 |
+| 本地逐条标签目标 | `_run_visible_priority`、`_run_fine_recent`、`_run_selected_targets`、`_resolve_selected_targets`（手选 400 也走同一判定）、`batch_engine.text_items`、`result_store.advance` 的 `eligible_count` |
+| API 逐条标签 | `start_model_insights` 的 `eligible` + 手工组装的 wire |
+| 沟通建议 | `start_guidance` 的窗口（`analysis_text` 后为空即整条丢弃）与 `eligible` |
+| API 画像 | `_api_portrait_history`：片段 `text` 用 `analysis_text`；**digest 仍取原文**（改链接仍算来源变化），只含链接的消息不再是 target、也不产生片段 |
+| 预测回复 | 窗口内每条消息都保留（草稿回复的是最后一条），但 `context` 里的文本已剥离链接 |
+| 前端「可分析」判定 | `chatui/app.js` 的 `hasAnalyzableText`（`stripMessageLinks` / `messageAnalysisText`）—— `fineWindow` 候选、`pickableMessage`、`apiInsightCandidates` |
+
+前端那份是**同规则的复刻**（跨端常量在本项目一贯如此），改动时两边一起改（见 §12.15）。注意 `updateLabel` / `updateApiInsightLabel` 里的 `eligible` 还管**已存标签的渲染**，不参与这里的收窄 —— 否则旧结果会突然消失。
+
 ## 7. 核心算法与业务逻辑
 
 ### 7.1 Laya 推理链路（本地）
@@ -1066,11 +1088,12 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 
 5. **合并上游 1.3.0**（`50314a0`）：把 `upstream/main`（`b35efa5`，助手仓库 / 聊天助手那一版）合进本分支，基线从 v1.2.4 提到 v1.3.0；冲突解决要点与验证结论见 README 的「合并上游 1.3.0」一节。
 6. **潜台词与沟通建议并入助手**：新增内置技能 `builtin-skill:guidance` 与内置助手 `builtin:guidance`（`bridge/advisor_contracts.py`），助手可引用存量结果（`result_store.api_guidance_latest` → `guidance_contracts.guidance_material` → `advisor_service._guidance_material`，占同一 token 预算），画像页 `#guidanceCard` 及其控制、`analyzeSelfStyle` 开关与相关样式、脚本全部移除 —— 见 §6.5 与 §12.11。
+7. **链接不进分析**：`bridge/message_input.py` 新增 `strip_links` / `analysis_text` / `has_analysis_content`（只去 `http(s)://` 与 `www.` 开头的链接，**裸域名与纯标点照旧**），所有送模型的文本经 `prepare_item` / `to_wire` 剥离，四条链路（本地标签、API 标签、沟通建议、画像）与批处理引擎的「可分析」判定统一改用它；前端 `chatui/app.js` 复刻同一规则（`hasAnalyzableText`）。界面原文、已存结果与画像 digest 仍是原文 —— 见 §6.11 与 §12.15。
 
 核对过的一致性状态（截至 2026-10-10）：
 
 - 三块的回归都在：`tests/message-picking.test.cjs`、`tests/model-source-settings.test.cjs`、`tests/api-mbti-gate.test.cjs`、`bridge/test_model_source.py`、`bridge/test_real_backend.py`；`tests/api-persona-ui.test.cjs` 的 MBTI 夹具已改为提供 `mbtiEvidenceCount` 与 `mbtiBasis`。
-- `npm run typecheck` 干净、`npm run test:node` **595/595**；Python 侧除上游自带的 14 个 `test_advisor_*.py`（在纯净 `upstream/main` 上失败数完全相同，本机环境所致）外，43 个文件全过（含两个慢文件）。
+- `npm run typecheck` 干净、`npm run test:node` **596/596**；Python 侧除上游自带的 14 个 `test_advisor_*.py`（在纯净 `upstream/main` 上失败数完全相同，本机环境所致）外，43 个文件全过（含两个慢文件）。
 - 新增运行时模块已在打包白名单里：`bridge/api_pool.py`、`bridge/guidance_contracts.py`（本 fork）与上游带来的 `bridge/advisor_*.py`、`bridge/api_portrait_ledger.py`，`scripts/stage-real-client.py` 已含这些名字。
 - tokenizer 性能优化（`f83513a` / `959b4e0`）已随上游 1.3.0 收编，本分支现取上游实现。
 
@@ -1228,7 +1251,23 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 
 手选消息的范围与守卫由 `tests/message-picking.test.cjs`（前端行为 + `scheduleRecent`/`ensureApiInsights`/`submitManualRecent` 三处抑制的接线）与 `bridge/test_real_backend.py` 的 `test_http_analyze_accepts_hand_picked_targets` + 三个 `test_selected_targets_*` / `test_selection_does_not_narrow_the_next_window_run` 钉住（后者已用「关掉守卫」验证过确实会失败）。
 
+链接不进分析（§6.11）由四处钉住：`bridge/test_message_input.py` 的 `LinkAndPlaceholderTests`（纯规则：只去协议/www、保留尾部标点、裸域名不动、占位与纯标点的边界、投影副本与 `to_wire`）、`bridge/test_real_backend.py:test_a_message_that_is_only_a_link_is_not_analysed`（本地：链路目标跳过 + 送给模型的文本无链接）、`bridge/test_api_insights.py` 的 `test_a_message_that_is_only_a_link_is_not_a_target_or_sent` 与 `test_guidance_is_insufficient_when_the_window_only_holds_a_link`（API 标签目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs` 的 `keeps a message that is only a link out of every analysis path`（前端判定 + 手选）。把 `has_analysis_content` 改回旧行为可确认这四处确实会失败。
+
 ---
+
+### 12.15 修改「链接是否参与分析」
+
+两侧要一起改（规则同源，前端是复刻）：
+
+| 层 | 文件 | 改什么 |
+| --- | --- | --- |
+| 规则（权威） | `bridge/message_input.py` | `LINK_PATTERN` / `LINK_TAIL` / `PLACEHOLDER_NAMES`，`strip_links` / `analysis_text` / `has_analysis_content` |
+| 规则（前端复刻） | `chatui/app.js` | `MESSAGE_LINK_PATTERN` / `MESSAGE_LINK_TAIL` / `MESSAGE_PLACEHOLDERS`，`stripMessageLinks` / `messageAnalysisText` / `hasAnalyzableText` |
+| 落点 | 见 §6.11 的表 | 新增分析链路时，记得同时改「要不要设为目标」与「送模型的文本」 |
+
+回归：`bridge/test_message_input.py`（纯规则）、`bridge/test_real_backend.py`（本地：目标跳过 + 送模型的文本无链接）、`bridge/test_api_insights.py`（API 标签的目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs`（前端判定 + 手选不提供链接消息）。把 `has_analysis_content` 改回旧行为，这几处都会失败 —— 可用来确认测试真的咬得住。
+
+两个刻意的边界：**纯标点仍算内容**（语气）；摘要/指纹类 digest 仍取**原文**，否则改一条链接不会被识别为来源变化。
 
 ## 14. 快速索引：按问题查文件
 

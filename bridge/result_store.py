@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import message_input
 import re
 import sqlite3
 import threading
@@ -315,7 +316,8 @@ class ResultStore:
                     (cursor == prior and not complete)):
                 return
             eligible = row[3]
-            if item is not None and item["kind"] == "text" and item["text"].strip():
+            if (item is not None and item["kind"] == "text" and
+                    message_input.has_analysis_content(item["text"])):
                 eligible += 1
             seq, shard, local_id = cursor if cursor is not None else (None, None, None)
             conn.execute("UPDATE progress_v1 SET cursor_seq=?,cursor_shard=?,cursor_local=?,complete=?,"

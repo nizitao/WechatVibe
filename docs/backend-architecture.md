@@ -15,7 +15,7 @@
 | `bridge/api_tasks.py` | API 任务注册、锁、运行计数与失效处理 | 业务模型调用、SQL、历史扫描 |
 | `bridge/message_contracts.py` / `portrait_contracts.py` | 消息标签与画像各自的版本、作用域和契约 | 服务、存储、运行时依赖 |
 | `bridge/message_results.py` | 本地 fine 与画像结果的纯校验 | IO、锁、调度 |
-| `bridge/message_input.py` / `shared/message-input.ts` | 消息身份、来源、时间和引用元数据的校验与兼容投影 | 微信读取、媒体解码、OCR |
+| `bridge/message_input.py` / `shared/message-input.ts` | 消息身份、来源、时间和引用元数据的校验与兼容投影；模型可见文本（剥离链接与占位）的单一来源 | 微信读取、媒体解码、OCR |
 | `electron/api-message-insights.ts` | API 消息提示词、标签提取与结果整理 | 画像推理、持久化 |
 | `electron/api-portrait-classifier.ts` | 一次 API 批量判断，复用本地问题及分类转换 | 最终画像评分、持久化 |
 | `electron/api-guidance.ts` | API 潜台词阅读与场景模拟建议的提示词、结果整理 | 画像推理、持久化 |

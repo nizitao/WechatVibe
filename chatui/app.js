@@ -1546,6 +1546,40 @@ function displayedEmotion(values, messageText) {
   if (second && top.probability - second.probability < 0.15) return [];
   return [top];
 }
+// Links never reach a model: a shared URL is not what the reading is about, and in API mode
+// it is not something we want to send. Keep this in step with `bridge/message_input.py`
+// (`strip_links` / `analysis_text` / `has_analysis_content`). Display and every stored result
+// keep the original text — this only decides what may be analysed.
+const MESSAGE_LINK_PATTERN = /(?:https?:\/\/|www\.)[^\s<>"'“”‘’（）()\[\]【】{}《》]+/giu;
+const MESSAGE_LINK_TAIL = "。，、；：！？…·.,;:!?)]}>”’\"'";
+const MESSAGE_PLACEHOLDERS = new Set([
+  "图片", "表情", "动画表情", "语音", "视频", "文件", "链接", "位置", "名片", "转账",
+  "红包", "微信红包", "小程序", "音乐", "聊天记录", "合并转发", "视频号", "消息",
+  "应用消息", "系统消息", "群公告", "拍一拍", "接龙", "卡券", "商品", "直播", "频道",
+  "语音通话", "视频通话",
+]);
+function stripMessageLinks(value) {
+  return String(value ?? "").replace(MESSAGE_LINK_PATTERN, match => {
+    let end = match.length;
+    // A trailing "。" or "，" belongs to the sentence, not to the link.
+    while (end > 0 && MESSAGE_LINK_TAIL.includes(match[end - 1])) end -= 1;
+    return match.slice(end);
+  });
+}
+function messageAnalysisText(value) {
+  const stripped = stripMessageLinks(value);
+  const match = /^\[([^\[\]\s]{1,16})\]$/u.exec(stripped.trim());
+  return match && MESSAGE_PLACEHOLDERS.has(match[1]) ? "" : stripped;
+}
+function hasAnalyzableText(value) {
+  const text = String(value ?? "");
+  if (!text.trim()) return false;
+  const remaining = messageAnalysisText(text);
+  if (!remaining.trim()) return false;
+  // Punctuation still counts on its own — it carries tone. The one case excluded is a
+  // message that carried nothing but a link (and the punctuation around it).
+  return remaining === text || /[^\s\p{P}]/u.test(remaining);
+}
 function hasIntentContent(messageText) {
   // Punctuation-only messages can carry tone or intent (for example “？” or
   // “。。”). Treat every non-whitespace message as analyzable; the model and
@@ -2187,7 +2221,7 @@ function fineWindow() {
   }
   const limit = Math.min(80, first < 0 ? Math.min(12, chatState.messages.length) : chatState.messages.length - first);
   const candidates = chatState.messages.slice(-Math.max(1, limit)).filter(message => message.side === "other" &&
-    message.kind === "text" && typeof message.text === "string" && message.text.trim());
+    message.kind === "text" && typeof message.text === "string" && hasAnalyzableText(message.text));
   return { limit: Math.max(1, limit), candidates };
 }
 function analyzableMessages(window = fineWindow()) {
@@ -2199,7 +2233,7 @@ function analyzableMessages(window = fineWindow()) {
 // the selection is analysed (and, in API mode, paid for).
 function pickableMessage(message) {
   if (message.side !== "other" || message.kind !== "text" ||
-      typeof message.text !== "string" || !message.text.trim()) return false;
+      typeof message.text !== "string" || !hasAnalyzableText(message.text)) return false;
   const apiMode = settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api";
   return !apiMode || (hasIntentContent(message.text) && !isIncompleteFragment(message.text));
 }
@@ -4835,7 +4869,7 @@ function parseApiPartialLabels(raw, ids) {
 function apiInsightCandidates() {
   if (!chatState.messages.length) return [];
   const eligible = message => message.side === "other" && message.kind === "text" &&
-    typeof message.text === "string" && !!message.text.trim() &&
+    typeof message.text === "string" && hasAnalyzableText(message.text) &&
     hasIntentContent(message.text) && !isIncompleteFragment(message.text) &&
     (!chatState.historyState || typeof message.historyCursor === "string");
   // Analyze the entire message window already loaded for this conversation.

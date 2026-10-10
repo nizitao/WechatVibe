@@ -20,6 +20,9 @@ function section(start, end) {
   return app.slice(first, last);
 }
 const PICK_SOURCE = section("function pickableMessage(", "function uncoveredMessages(");
+// The link rule lives beside the other text predicates; `pickableMessage` only calls it, so
+// the slice has to carry it (and it must stay in step with `bridge/message_input.py`).
+const LINK_SOURCE = section("// Links never reach a model", "function hasIntentContent(");
 
 function matches(node, selector) {
   return selector.split(".").filter(Boolean).every(name => node.classes.includes(name));
@@ -104,9 +107,10 @@ function harness(messages = [], seed = {}) {
   installViewState(context);
   context.settingsState.modelSourceResolved = true;
   context.settingsState.modelSourceSnapshot = { mode: "local", api: null, sourceId: "local" };
-  vm.runInContext(`${PICK_SOURCE}
+  vm.runInContext(`${LINK_SOURCE}${PICK_SOURCE}
     globalThis.picks = { pickableMessage, pickedMessages, pickedWindow, renderPickBar,
-      setPickedMessage, syncPickControls, setMessagePicking, pickAllMessages, attachPickControl };`,
+      setPickedMessage, syncPickControls, setMessagePicking, pickAllMessages, attachPickControl,
+      stripMessageLinks, messageAnalysisText, hasAnalyzableText };`,
   context);
   const container = byId("chatMessages");
   container.children = [];
@@ -129,6 +133,33 @@ it("offers a checkbox only for messages the active source can analyse", () => {
   // The API path additionally drops messages without intent content.
   context.settingsState.modelSourceSnapshot = { mode: "api", api: null, sourceId: "api-a" };
   assert.equal(context.picks.pickableMessage(message("m1", "other", "嗯")), true);
+});
+
+it("keeps a message that is only a link out of every analysis path", () => {
+  const { picks, context, nodes } = harness([
+    message("m1", "other", "https://example.com/share"),
+    message("m2", "other", "www.example.com/a"),
+    message("m3", "other", "[链接]"),
+    message("m4", "other", "看这个 https://example.com/a 挺有意思"),
+    message("m5", "other", "？？？"),
+  ]);
+  // The rule itself, shared with `bridge/message_input.py`.
+  assert.equal(picks.hasAnalyzableText("https://example.com/a"), false);
+  assert.equal(picks.hasAnalyzableText("https://example.com/a。"), false, "trailing punctuation stays with the sentence");
+  assert.equal(picks.hasAnalyzableText("[链接]"), false);
+  assert.equal(picks.hasAnalyzableText("[重要]"), true, "only WeChat placeholder names are dropped");
+  assert.equal(picks.hasAnalyzableText("？？？"), true, "punctuation alone still carries tone, as before");
+  assert.equal(picks.messageAnalysisText("看 https://example.com/a。"), "看 。");
+  assert.equal(picks.messageAnalysisText("见 mp.weixin.qq.com/s/a"), "见 mp.weixin.qq.com/s/a",
+    "a bare domain without a scheme is not stripped");
+  // Hand-picking never offers them, and the API submit list never carries them either.
+  assert.deepEqual([nodes[0].classList.contains("pickable"), nodes[1].classList.contains("pickable"),
+    nodes[2].classList.contains("pickable"), nodes[3].classList.contains("pickable"),
+    nodes[4].classList.contains("pickable")],
+  [false, false, false, true, true]);
+  assert.equal(picks.pickableMessage(message("m9", "other", "https://example.com/a")), false);
+  context.settingsState.modelSourceSnapshot = { mode: "api", api: null, sourceId: "api-a" };
+  assert.equal(picks.pickableMessage(message("m9", "other", "https://example.com/a")), false);
 });
 
 it("sends exactly the picked ids inside the tail window the backend resolves", () => {

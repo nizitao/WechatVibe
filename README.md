@@ -92,7 +92,15 @@
 
 回归：`bridge/test_api_guidance.py`（17 例）、`bridge/test_advisor_guidance_reference.py`（5 例）、`tests/api-persona-ui.test.cjs`（48 例）；`npm run typecheck`、`npm run test:node`（595/595）与除上游自带 `test_advisor_*.py` 外的 Python 全量都通过。
 
-### 六、与上游的已知分歧
+### 六、链接不进分析（工作区未提交）
+
+聊天里的链接不再参与任何分析：逐条情绪 / 意图标签（本地 Laya 与 API）、沟通建议、API 画像、助手资料都一样 —— 送进模型的文本先去掉链接；一条消息若**只有链接**（或只有链接加标点、只是 `[链接]`/`[文件]` 这类微信占位），就不再作为分析目标，不产生结果也不消耗调用。界面显示的原文、已存结果与画像的来源指纹仍是原文，不受影响。
+
+判定范围刻意收窄：只认 `http://`、`https://`、`www.` 开头的链接（尾部的 `。，` 等标点留给句子），**裸域名**（如 `mp.weixin.qq.com/s/…` 不带协议头）暂不处理，纯标点消息也照旧算内容（`？？？` 这类承载语气）。如果你发现自己转发的链接多数没有协议头、仍被分析，说一声我把裸域名判定加上。
+
+回归：`bridge/test_message_input.py`（规则本身）、`bridge/test_real_backend.py`（本地链路跳过 + 送模型文本无链接）、`bridge/test_api_insights.py`（API 标签目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs`（前端判定与手选）。
+
+### 七、与上游的已知分歧
 
 保留自用判定逻辑会带来两处可预期的不一致，下次升级上游时需要留意：
 

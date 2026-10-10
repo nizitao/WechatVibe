@@ -1074,7 +1074,8 @@ class Backend:
             store.register_api_source(account, source_id, config["protocol"], config["model"])
             text_window = [item for item in window if item["side"] in ("self", "other") and
                            item["kind"] == "text" and isinstance(item["text"], str)]
-            eligible = [item for item in text_window if item["side"] == "other" and item["text"].strip()]
+            eligible = [item for item in text_window if item["side"] == "other" and
+                        message_input.has_analysis_content(item["text"])]
             if target_ids is None:
                 selected = eligible[-limit:]
             else:
@@ -1108,7 +1109,9 @@ class Backend:
                 for item in batch_window:
                     entry = {"id": item["id"],
                              "sender": "SELF" if item["side"] == "self" else "OTHER",
-                             "text": item["text"]}
+                             # Links never reach the model; the stored and displayed text is
+                             # untouched (`message_input.analysis_text`).
+                             "text": message_input.analysis_text(item["text"])}
                     if item["id"] in prepared:
                         entry["inputMeta"] = prepared[item["id"]]["inputMeta"]
                     wire.append(entry)
@@ -1369,13 +1372,19 @@ class Backend:
             text = item["text"]
             if not isinstance(text, str):
                 continue
+            # Links never reach the model, and a message that is only a link carries no
+            # reading either, so it is dropped from the window as well.
+            text = message_input.analysis_text(text)
+            if not text.strip():
+                continue
             characters += len(text)
             if characters > GUIDANCE_CONTEXT_CHARACTERS:
                 break
             wire.append({"id": item["id"],
                          "sender": "SELF" if item["side"] == "self" else "OTHER",
                          "text": text})
-            if (item["side"] == "other" and text.strip() and len(eligible) < MAX_SUBTEXTS and
+            if (item["side"] == "other" and message_input.has_analysis_content(item["text"]) and
+                    len(eligible) < MAX_SUBTEXTS and
                     (not group or not member or item.get("senderId") == member)):
                 eligible.append(item["id"])
         if not eligible:
@@ -1541,6 +1550,15 @@ class Backend:
                 if first_item and skip_first_pieces and item_sort != partial_sort:
                     raise ValueError("unfinished portrait source changed")
                 if item.get("kind") != "text" or sender not in ("self", "other") or not isinstance(text, str) or not text:
+                    if first_item and skip_first_pieces:
+                        raise ValueError("unfinished portrait source changed")
+                    previous_sort, first_item = item_sort, False
+                    continue
+                # The digests above keep the raw text, so editing a link still counts as a
+                # source change; the model only ever receives the text without links, and a
+                # message that was nothing but a link is not a portrait target at all.
+                text = message_input.analysis_text(text)
+                if not text.strip():
                     if first_item and skip_first_pieces:
                         raise ValueError("unfinished portrait source changed")
                     previous_sort, first_item = item_sort, False
@@ -2736,7 +2754,10 @@ class Backend:
             context_items.pop(0)
         if context_items and len(context_items[-1]["text"]) > 4000:
             raise ForecastRequestError(422, "content-too-long", "这段内容过长，请缩短草稿或稍后重试")
-        context = [{"id": item["id"], "side": item["side"], "text": item["text"],
+        # Reply prediction keeps every message in its window (the draft answers the last one),
+        # but it never sends a link to the model (`message_input.analysis_text`).
+        context = [{"id": item["id"], "side": item["side"],
+                    "text": message_input.analysis_text(item["text"]),
                     "time": item.get("time", 0)} for item in context_items]
         if not context:
             raise ForecastRequestError(422, "no-text-context", "最近对话没有可用于预测的文字消息")
@@ -2989,7 +3010,8 @@ class Backend:
         window = self.source.messages(user, limit + 3)
         tail = window[max(0, len(window) - limit):]
         eligible = {item["id"] for item in tail
-                    if item["side"] == "other" and item["kind"] == "text" and item["text"].strip()}
+                    if item["side"] == "other" and item["kind"] == "text" and
+                    message_input.has_analysis_content(item["text"])}
         if any(item not in eligible for item in target_ids):
             raise ValueError("analysis target is no longer in the current window")
         wanted = set(target_ids)
@@ -3006,7 +3028,7 @@ class Backend:
         start = max(0, len(window) - limit)
         selected = [(index, item) for index, item in enumerate(window)
                     if index >= start and item["id"] in wanted and item["side"] == "other" and
-                    item["kind"] == "text" and item["text"].strip()]
+                    item["kind"] == "text" and message_input.has_analysis_content(item["text"])]
         if not selected:
             return
         if self.batch_engine:
@@ -3045,7 +3067,7 @@ class Backend:
         self._assert_scope(scope)
         selected = [(index, item) for index, item in enumerate(window)
                     if index >= len(window) - limit and item["side"] == "other" and
-                    item["kind"] == "text" and item["text"].strip()]
+                    item["kind"] == "text" and message_input.has_analysis_content(item["text"])]
         known = store.fine_known(account, user, version, [item["id"] for _index, item in selected])
         job["total"] = len(selected)
         job["processed"] = sum(item["id"] in known for _index, item in selected)
@@ -3085,7 +3107,7 @@ class Backend:
             item = window[index]
             analyzed = False
             if ((highwater is None or tuple(item["_sort"]) <= highwater) and
-                    item["kind"] == "text" and item["text"].strip()):
+                    item["kind"] == "text" and message_input.has_analysis_content(item["text"])):
                 stable_id = item["id"]
                 if stable_id not in counted_ids:
                     counted_ids.add(stable_id)
@@ -3154,12 +3176,14 @@ class Backend:
                 return
             if after is not None and next_after <= after:
                 raise RuntimeError("quoted backfill cursor did not advance")
-            eligible = [item for item in page if item["kind"] == "text" and item["text"].strip()]
+            eligible = [item for item in page if item["kind"] == "text" and
+                        message_input.has_analysis_content(item["text"])]
             known = self.batch_engine.known(account, user, version, store, subject, eligible)
             pending, characters = [], 0
             for item in page:
                 position = tuple(item["_sort"])
-                if item["id"] in known or item["kind"] != "text" or not item["text"].strip():
+                if (item["id"] in known or item["kind"] != "text" or
+                        not message_input.has_analysis_content(item["text"])):
                     continue
                 if member is not None and item["senderId"] != member:
                     continue
@@ -3233,7 +3257,7 @@ class Backend:
                 first = first or stable_id
                 last = stable_id
                 analyzed = False
-                if item["kind"] == "text" and item["text"].strip():
+                if item["kind"] == "text" and message_input.has_analysis_content(item["text"]):
                     if stable_id not in counted_ids:
                         counted_ids.add(stable_id)
                         job["total"] += 1
@@ -3304,7 +3328,7 @@ class Backend:
                 # Results and skips always reach durable storage before their scan cursor.
                 store.advance(account, user, version, position, saved_context, item)
                 cursor = position
-                if item["kind"] == "text" and item["text"].strip():
+                if item["kind"] == "text" and message_input.has_analysis_content(item["text"]):
                     job["total"] += 1
                     job["processed"] += 1
                 job["scope"]["last"] = item["id"]
@@ -3352,7 +3376,7 @@ class Backend:
                     continue
                 analyzed = False
                 prepared = None
-                if item["kind"] == "text" and item["text"].strip():
+                if item["kind"] == "text" and message_input.has_analysis_content(item["text"]):
                     if not store.has(account, user, version, item["id"]):
                         prepared = self._analyze_item(account, user, version, store,
                                                       [*context, item], item, defer=True)
@@ -3389,7 +3413,8 @@ class Backend:
         self._assert_scope(scope)
         selected = window[-limit:]
         cached = store.ids(account, user, version)
-        eligible = [item for item in selected if item["kind"] == "text" and item["text"].strip()]
+        eligible = [item for item in selected
+                    if item["kind"] == "text" and message_input.has_analysis_content(item["text"])]
         pending = [item for item in eligible if item["id"] not in cached]
         positions = {message["id"]: index for index, message in enumerate(window)}
         job["total"] = len(eligible)
