@@ -19,7 +19,7 @@ from backend_contracts import (
 from guidance_contracts import GUIDANCE_REVISION, valid_guidance
 from portrait_contracts import (empty_portrait_evidence, portrait_synthesis_fingerprint,
                                 valid_mbti_basis, valid_portrait_evidence, valid_synthesis_fingerprint)
-from payload_crypto import default_cipher
+from payload_crypto import PayloadUnreadable, default_cipher
 from profile_signals import keyword_counts
 from profile_state import (empty_state as empty_profile_state, add_result as add_profile_result,
                            covers_tail_emotions)
@@ -452,6 +452,35 @@ class ResultStore:
             with self.connect() as conn:
                 conn.execute("DELETE FROM api_guidance_v1 WHERE account=? AND session=? AND "
                              "source_id=? AND subject=?", (account, user, source_id, subject))
+            return None
+        return saved
+
+    def api_guidance_latest(self, account, user):
+        """Newest saved guidance for one conversation, whatever source produced it, or None.
+
+        The assistant reads this as reference material, so it is deliberately not scoped to
+        the active model source: an analysis the user already paid for stays citable after a
+        source switch. A conversation-level row (subject is the session itself) wins over a
+        member's row, and a row that fails the contract or cannot be decrypted here is dropped
+        instead of being handed to the model.
+        """
+        with self.connect() as conn:
+            row = conn.execute("SELECT source_id,subject,revision,scenario,analyze_self,payload_json,updated_at "
+                               "FROM api_guidance_v1 WHERE account=? AND session=? "
+                               "ORDER BY (subject=?) DESC, updated_at DESC, rowid DESC LIMIT 1",
+                               (account, user, user)).fetchone()
+            if row is None:
+                return None
+            try:
+                guidance = default_cipher().loads(row[5])
+            except (PayloadUnreadable, ValueError, TypeError):
+                guidance = None
+            saved = {"sourceId": row[0], "subject": row[1], "revision": row[2], "scenario": row[3],
+                     "analyzeSelf": bool(row[4]), "guidance": guidance, "updatedAt": row[6]}
+        if not valid_guidance(saved["guidance"]):
+            with self.connect() as conn:
+                conn.execute("DELETE FROM api_guidance_v1 WHERE account=? AND session=? AND "
+                             "source_id=? AND subject=?", (account, user, row[0], row[1]))
             return None
         return saved
 

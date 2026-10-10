@@ -82,7 +82,17 @@
 
 验证：`npm run typecheck` 干净；`npm run test:node` **595/595**；Python 侧除上游自带的 7 个 `test_advisor_*.py`（在纯净 `upstream/main` 上失败数完全相同，本机环境所致）外全部通过，含两个慢文件（`test_real_backend.py` 94s、`test-start-real-client.py` 79s）。
 
-### 五、与上游的已知分歧
+### 五、潜台词与沟通建议并进助手（工作区未提交）
+
+画像页那张「潜台词与沟通建议」卡已移除 —— 连同场景选择、「开始分析」/「重算」、重算反馈对话框和设置里的「分析我自己的对话风格」开关（`analyzeSelfStyle`），`chatui/app.js` 里那一段渲染/轮询代码与 `.guidance-*` / `.feedback-modal-*` 样式一并删除。这份能力现在只从**助手**进入：
+
+- **内置技能 + 内置助手**：新增「潜台词与沟通建议」技能与「沟通参谋」助手（`bridge/advisor_contracts.py`），助手用自己的模型逐条解读潜台词、给局势判断和沟通建议，并给出可直接发出的回复草稿；默认按普通联系人，说明是与领导 / 上级时改用更稳妥、留余地的说法，证据不足时直说不确定。
+- **可引用已有结果**：这个会话若曾生成过分析，助手本轮就能在资料里读到它（`api_guidance_latest` 按会话取最新一条 → `guidance_material()` 渲染 → 附在托管资料末尾，占用同一个上下文预算），不必重新花钱分析；没有存量结果且本轮选了该技能时，助手会被告知「尚无结果」并自行分析。
+- **注意**：原生成链路 `POST /api/model-guidance` 现在**没有界面入口**（接口、契约、存储与测试都保留，存量结果仍会被助手引用）。如果你想在面板里保留一个「生成 / 重算」按钮，说一声我加上。
+
+回归：`bridge/test_api_guidance.py`（17 例）、`bridge/test_advisor_guidance_reference.py`（5 例）、`tests/api-persona-ui.test.cjs`（48 例）；`npm run typecheck`、`npm run test:node`（595/595）与除上游自带 `test_advisor_*.py` 外的 Python 全量都通过。
+
+### 六、与上游的已知分歧
 
 保留自用判定逻辑会带来两处可预期的不一致，下次升级上游时需要留意：
 

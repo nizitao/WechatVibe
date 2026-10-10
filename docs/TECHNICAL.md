@@ -638,14 +638,19 @@ POST /api/model-guidance
          ② valid_guidance(guidance)，否则 invalid-guidance
          ③ subtexts 的 id 必须互不重复且 ⊆ target_ids（未知编号不转交给别的目标）
  → store.api_guidance_save(scope=source_id+":"+GUIDANCE_REVISION, subject, guidance) 整份替换
- → GET /api/model-guidance → 前端渲染 #guidanceCard
+ → GET /api/model-guidance（画像页卡片已移除，见下；接口保留给存量结果、测试与直接调用）
 ```
 
 **场景语义**：`general`（普通联系人）/ `leader`（与领导、上级）——后者要求保留对方面子、先接住责任再谈条件、不做无边界退让。
 
-**「重算」流程**（`#btnRecomputeGuidance`）：先弹对话框收集用户对上一次结果的不满意之处 → 作为 `userFeedback` 传给模型（`feedback` 字段）→ 提示词明确它是**用户本人写的修正要求而非聊天内容**，并要求在与聊天证据冲突时**以证据为准** → 留空即按最新聊天重算。
+**`feedback` 字段**：`POST /api/model-guidance` 仍接受 `feedback`（≤400 字）→ 提示词明确它是**用户本人写的修正要求而非聊天内容**，并要求在与聊天证据冲突时**以证据为准**。它原先由画像页的「重算」对话框（`#btnRecomputeGuidance` + `#feedbackModal`）收集，该界面已随卡片一并移除（见下），现在只有测试与直接调用会用到它。
 
 **契约保证**：解读与建议来自**同一次 provider turn**，因此一起校验——不可能出现「存储的解读与旁边建议互相矛盾」；`analyzeSelf=false` 时 `forSelf` 必须为 `null`（缺失自我段绝不能被渲染成「没有问题」），多余的自我段属契约违规。任务自身有独立注册表，切换模型来源时与其它模型任务一同失效（`api_tasks.invalidate_models` / `invalidate_source` 都会清 `guidance_jobs`）。
+
+**现在谁在用这份能力**：画像页的 `#guidanceCard` 已移除 —— 连同 `#selectGuidanceScenario`、`#btnRunGuidance`、`#btnRecomputeGuidance`、`#feedbackModal` 与设置里的「分析我自己的对话风格」开关（`analyzeSelfStyle`），`chatui/app.js` 里那一整段渲染/轮询/提交代码和对应样式也已删除。潜台词与沟通建议只从**助手**侧进入，两条路一起用：
+
+- **助手自己生成**：内置技能 `builtin-skill:guidance`（「潜台词与沟通建议」）+ 内置助手 `builtin:guidance`（「沟通参谋」），定义在 `bridge/advisor_contracts.py`；助手用自己的模型与托管资料产出解读与建议。因此 `POST /api/model-guidance` 目前**没有界面入口**。
+- **引用存量结果**：`result_store.api_guidance_latest(account, user)` 按会话取最新一条（不限模型来源；会话级 `subject` 优先于成员级；坏行直接删掉），`guidance_contracts.guidance_material(saved)` 把它渲染成一段参考文字，`advisor_service._guidance_material()` 附在托管资料末尾并从**同一 token 预算**里扣除。没有存量结果**且本轮选了该技能**时，改附一行 `GUIDANCE_MISSING_NOTE`，让助手直接分析当前会话。
 
 ### 6.6 会话添加与「信息列表」
 
@@ -1055,14 +1060,19 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 2. **修复「保存并启用」的两个坑**：`activate` 带 `profileId` 时不接受连接字段（否则 400「启用失败」），而它的连接字段形式又会命中已有连接就地更新（否则「加了新配置但下拉菜单里没有」）；前端因此统一成「先 `/api/model-source/profiles` 落盘、再按 id 切换」—— 见 §5.2 与 §12.13。
 3. **API 画像 MBTI 观察门槛**：卡片按观察账本 `available.mbtiEvidenceCount` 解锁、逐轴证据数取 `mbtiBasis.evidenceCount`（原先硬编码 1）、失速任务不再显示「正在准备」；`bridge/result_store.py` 的 `api_portrait_get` 负责暴露该计数，`electron/laya/personality.ts` 与 `electron/api-portrait-classifier.ts` 的 API 题面升到 `mbti-api-context-v2`（见 §7.5）。
 
-4. **压缩四条分析提示词**（`8b48c2f`）：逐条标签 / 沟通建议 / 观察提取 / 画像合成四条 system 提示词保持 schema 与判定语义不变，只合并重复规则、显式写死粒度与长度上限；`electron/api-portrait.ts` 顺带删掉调用点里重复的 schema/长度说明。版本串随之升到 `free-label-v6-compact`、`api-guidance-v2`（TS + Python + `chatui/app.js` 三处副本）、`api-laya-portrait-v3`（三处闸门的位置见 §5 的 `*_contracts.py` 清单与 scope 表）。
+4. **压缩四条分析提示词**（`8b48c2f`）：逐条标签 / 沟通建议 / 观察提取 / 画像合成四条 system 提示词保持 schema 与判定语义不变，只合并重复规则、显式写死粒度与长度上限；`electron/api-portrait.ts` 顺带删掉调用点里重复的 schema/长度说明。版本串随之升到 `free-label-v6-compact`、`api-guidance-v2`（TS + Python + `chatui/app.js` 两处副本；卡片移除后前端那份已删除）、`api-laya-portrait-v3`（三处闸门的位置见 §5 的 `*_contracts.py` 清单与 scope 表）。
 
-本轮核对过的一致性状态：
+**2026-10-10 追加**：
+
+5. **合并上游 1.3.0**（`50314a0`）：把 `upstream/main`（`b35efa5`，助手仓库 / 聊天助手那一版）合进本分支，基线从 v1.2.4 提到 v1.3.0；冲突解决要点与验证结论见 README 的「合并上游 1.3.0」一节。
+6. **潜台词与沟通建议并入助手**：新增内置技能 `builtin-skill:guidance` 与内置助手 `builtin:guidance`（`bridge/advisor_contracts.py`），助手可引用存量结果（`result_store.api_guidance_latest` → `guidance_contracts.guidance_material` → `advisor_service._guidance_material`，占同一 token 预算），画像页 `#guidanceCard` 及其控制、`analyzeSelfStyle` 开关与相关样式、脚本全部移除 —— 见 §6.5 与 §12.11。
+
+核对过的一致性状态（截至 2026-10-10）：
 
 - 三块的回归都在：`tests/message-picking.test.cjs`、`tests/model-source-settings.test.cjs`、`tests/api-mbti-gate.test.cjs`、`bridge/test_model_source.py`、`bridge/test_real_backend.py`；`tests/api-persona-ui.test.cjs` 的 MBTI 夹具已改为提供 `mbtiEvidenceCount` 与 `mbtiBasis`。
-- `npm run test:node` 486/486、`npm run typecheck`、`scripts/run-python-tests.py`（另跑 `--only test_real_backend.py`）本轮全绿。
-- 本轮没有新增运行时模块，`scripts/stage-real-client.py` 白名单无需变更。
-- 另有 tokenizer 性能优化（提交 `f83513a` / `959b4e0`，记忆化编码 + 复用共享 state token ids）在同一分支上。
+- `npm run typecheck` 干净、`npm run test:node` **595/595**；Python 侧除上游自带的 14 个 `test_advisor_*.py`（在纯净 `upstream/main` 上失败数完全相同，本机环境所致）外，43 个文件全过（含两个慢文件）。
+- 新增运行时模块已在打包白名单里：`bridge/api_pool.py`、`bridge/guidance_contracts.py`（本 fork）与上游带来的 `bridge/advisor_*.py`、`bridge/api_portrait_ledger.py`，`scripts/stage-real-client.py` 已含这些名字。
+- tokenizer 性能优化（`f83513a` / `959b4e0`）已随上游 1.3.0 收编，本分支现取上游实现。
 
 发布前仍须走 §12.10 的更新流程与 §13 的全量回归。
 
@@ -1152,10 +1162,12 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 | 契约 | `electron/api-guidance.ts` 的 `GUIDANCE_VERSION` | **必须与 Python 侧 `GUIDANCE_REVISION` 一致**，否则 `node_analysis.model_guidance()` 抛 `guidance-version-invalid` |
 | 服务 | `bridge/node_analysis.py` | 响应字段白名单与三重复核（版本、`valid_guidance`、id 归属） |
 | 服务 | `bridge/backend_service.py` | 窗口构造、eligible 筛选、重试、落库 |
-| 存储 | `bridge/result_store.py` | `api_guidance_v1` 的读写（读取时校验失败即删行） |
-| 前端 | `chatui/app.js` / `index.html` | `#guidanceCard`、`#selectGuidanceScenario`、`#btnRunGuidance`、`#btnRecomputeGuidance`、重算反馈对话框 |
+| 存储 | `bridge/result_store.py` | `api_guidance_v1` 的读写（读取校验失败即删行），以及 `api_guidance_latest` 的「按会话取最新」 |
+| 助手 | `bridge/advisor_contracts.py` | 内置技能 `builtin-skill:guidance` 与内置助手 `builtin:guidance`（「沟通参谋」）的正文与开关常量 `GUIDANCE_SKILL_ID` |
+| 助手 | `bridge/advisor_service.py` + `guidance_contracts.guidance_material()` | 参考资料：渲染存量结果、`GUIDANCE_MISSING_NOTE`，并从同一 token 预算扣除 |
+| 界面 | —— | 画像页那张卡（`#guidanceCard`、场景选择、开始分析/重算、反馈对话框、`analyzeSelfStyle` 开关、`chatui/style.css` 的 `.guidance-*`/`.feedback-modal-*`）**已删除**。要改用户可见的部分，改的是助手侧：`chatui/advisor*.js`、`docs/advisor.md` |
 
-改动后建议用 `tests/api-guidance.test.ts` + `bridge/test_api_guidance.py` 双侧回归；作用域串 `source_id:GUIDANCE_REVISION` 变了就等于换了一批结果（旧结果保留但不被复用）。
+改动后建议用 `tests/api-guidance.test.ts` + `bridge/test_api_guidance.py` 双侧回归，助手侧另跑 `bridge/test_advisor_guidance_reference.py`；作用域串 `source_id:GUIDANCE_REVISION` 变了就等于换了一批结果（旧结果保留但不被复用）。
 
 ### 12.12 修改并行度 / 弹性策略
 
@@ -1236,8 +1248,9 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 | 网络与协议兼容 | `electron/model-connectors.ts` |
 | API 标签提示词与解析 | `electron/api-message-insights.ts`、`api-insight-stream.ts`、`api-analysis-json.ts` |
 | API 画像分类器 | `electron/api-portrait-classifier.ts` |
-| 沟通建议 | `electron/api-guidance.ts`、`bridge/guidance_contracts.py`、`bridge/backend_service.py` |
-| 沟通建议 | `electron/api-guidance.ts`、`bridge/guidance_contracts.py`、`bridge/backend_service.py`（`start_guidance`/`_run_guidance`） |
+| 沟通建议（生成链路，现无界面入口） | `electron/api-guidance.ts`、`bridge/guidance_contracts.py`、`bridge/backend_service.py`（`start_guidance`/`_run_guidance`） |
+| 沟通建议（在助手里用） | `bridge/advisor_contracts.py`（内置技能/助手）、`bridge/advisor_service.py`（参考资料）、`bridge/guidance_contracts.py:guidance_material()` |
+| 助手（仓库 / 会话 / 托管资料 / 引擎） | `bridge/advisor_service.py`、`advisor_context.py`、`advisor_store.py`、`advisor_runtime.py`、`advisor_http.py`、`chatui/advisor*.js`、`ui/advisor/*` |
 | 并行度与降档 | `bridge/api_pool.py`、`backend_service.py`（`_load_monitor`/`_apply_load_sample`） |
 | 微信数据读取 | `bridge/wechat_source.py`、`bridge/history_browser.py` |
 | 密钥获取 | `bridge/live_source.py`、`native-reader/wr/crypto.py` |

@@ -366,27 +366,8 @@
           </div>
         </div>
 
-        <!-- 5. Deep semantic reading + scenario simulation (API mode) -->
-        <div class="persona-card persona-card-wide" id="guidanceCard" hidden>
-          <div class="card-header">
-            <span class="card-title">
-              <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1010 10A10 10 0 0012 2zm0 18a8 8 0 118-8 8 8 0 01-8 8zm.5-13H11v6l5.2 3.1.8-1.3-4.5-2.7z"/></svg>
-              潜台词与沟通建议
-            </span>
-            <span class="card-badge" id="guidanceBadge">待分析</span>
-          </div>
-          <div class="guidance-controls">
-            <label class="guidance-scenario-label" for="selectGuidanceScenario">沟通场景</label>
-            <select id="selectGuidanceScenario" aria-label="沟通场景">
-              <option value="general">普通联系人</option>
-              <option value="leader">与领导／上级</option>
-            </select>
-            <button type="button" class="ui-retry" id="btnRunGuidance">开始分析</button>
-            <button type="button" class="ui-retry" id="btnRecomputeGuidance" hidden>重算</button>
-          </div>
-          <div class="guidance-status" id="guidanceStatus" role="status"></div>
-          <div class="guidance-body" id="guidanceBody"></div>
-        </div>
+        <!-- 潜台词与沟通建议 moved into the assistant panel (助手仓库 / 聊天助手):
+             `builtin-skill:guidance` plus the saved result as reference material. -->
 
       </div><!-- /persona-dashboard -->
     </div><!-- /personaView -->
@@ -575,14 +556,6 @@
             <div class="settings-row worker-hint-row">
               <span id="apiWorkerLimitHint" class="model-source-status" role="status"></span>
             </div>
-            <div class="settings-row settings-row-wide settings-checkbox-row">
-              <label for="chkAnalyzeSelfStyle">分析我自己的对话风格</label>
-              <span class="settings-checkbox-control">
-                <input type="checkbox" id="chkAnalyzeSelfStyle">
-                <span id="analyzeSelfStyleState">已关闭</span>
-              </span>
-            </div>
-            <p class="settings-hint">开启后，沟通建议会分成"针对他人"和"针对自己"两套分别给出。</p>
             <div class="model-source-actions">
               <button type="button" class="settings-action-btn" id="btnTestApiModel">测试连接</button>
               <button type="button" class="settings-action-btn" id="btnSaveApiProfile">仅保存配置</button>
@@ -746,24 +719,6 @@
       <a id="updateReleaseLink" href="https://github.com/tswawa/WechatVibe/releases" target="_blank" rel="noopener noreferrer">官方发布页</a>
       <button type="button" class="update-check-button" id="btnCheckUpdates">检查更新</button>
       <button type="button" class="update-primary-button" id="btnBeginUpdate" hidden>下载并安装</button>
-    </div>
-  </div>
-</div>
-<!-- Recompute feedback: what the user disliked about the previous AI result. -->
-<div class="feedback-modal-overlay" id="feedbackModal" role="dialog" aria-modal="true" aria-labelledby="feedbackModalTitle">
-  <div class="feedback-modal-card">
-    <div class="feedback-modal-head">
-      <h2 id="feedbackModalTitle">重算分析结果</h2>
-      <button type="button" class="feedback-modal-close" id="btnCloseFeedback" title="关闭" aria-label="关闭重算对话框">×</button>
-    </div>
-    <div class="feedback-modal-body">
-      <p class="feedback-modal-hint">告诉我们哪里不满意，AI 会据此重新生成。也可以留空，仅按最新聊天重算。</p>
-      <textarea id="feedbackInput" rows="4" maxlength="400" placeholder="例如：对方语气已经很差了，别再判断成中性；回复建议太笼统，给一句能直接发的话。"></textarea>
-      <div class="feedback-modal-error" id="feedbackError" role="status" hidden></div>
-    </div>
-    <div class="feedback-modal-actions">
-      <button type="button" class="feedback-secondary-button" id="btnCancelFeedback">取消</button>
-      <button type="button" class="feedback-primary-button" id="btnSubmitFeedback">重新生成</button>
     </div>
   </div>
 </div>

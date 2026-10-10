@@ -61,7 +61,7 @@ function getVisibleUnreadCount(session) {
   if (hasNewTime || hasNewPreview) return serverUnread;
   return 0;
 }
-const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false, analyzeSelfStyle: false };
+const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false };
 const CURRENT_LABEL_SCHEMA = "generic-v9";
 const GENERIC_INTENT_LABELS = Object.freeze({
   small_talk: "闲聊", share_news: "分享", ask_question: "提问", seek_help: "求助", deny: "否认",
@@ -101,9 +101,6 @@ if (typeof settingsState.settings.intent !== "boolean") settingsState.settings.i
 // Analysing every added chat in the background is opt-in: it can keep the CPU or GPU busy
 // for hours on a large account.
 if (typeof settingsState.settings.backgroundAnalyze !== "boolean") settingsState.settings.backgroundAnalyze = false;
-// Reading and advising on the user's own dialogue style costs an extra judgement and
-// is opt-in; when it is off the advice only ever describes the other person.
-if (typeof settingsState.settings.analyzeSelfStyle !== "boolean") settingsState.settings.analyzeSelfStyle = false;
 const save = () => localStorage.setItem("real-ui-settings-1", JSON.stringify(settingsState.settings));
 chatState.sessions = new Map();
 chatState.selectedConversations = new Set();
@@ -423,7 +420,6 @@ function placeReplyPrediction(scroll = true) {
 function resetAccountView(message = "当前微信账号未就绪", preserveOtherCaches = false) {
   cancelApiInsightWork();
   cancelApiPortraitPoll();
-  cancelGuidancePoll();
   clearTimeout(startupAccountRetryTimer);
   startupAccountRetryTimer = null;
   clearInlineIntentPending();
@@ -831,7 +827,6 @@ function clearUnselectedConversation() {
     portraitState.profileGeneration++;
     cancelApiInsightWork();
     cancelApiPortraitPoll();
-    cancelGuidancePoll();
     chatState.currentUser = null;
     chatState.messages = [];
     labelState.results = {};
@@ -2630,7 +2625,6 @@ function switchView(target) {
   if (target === "persona" && (!chatState.messageSourceReady || !chatState.currentUser)) return;
   if (target !== "chat") clearReplyPrediction();
   if (target !== "persona") cancelApiPortraitPoll();
-  if (target !== "persona") cancelGuidancePoll();
   chatState.view = target;
   byId("chatView").classList.toggle("active", target === "chat");
   byId("personaView").classList.toggle("active", target === "persona");
@@ -3760,7 +3754,6 @@ async function loadProfile(member = "", retry = false) {
   if (!chatState.currentUser || !settingsState.modelSourceResolved) return;
   byId("btnResetPortrait").disabled = !chatState.currentAccount || !chatState.selectedConversations?.has(chatState.currentUser);
   const apiMode = syncPortraitMode();
-  syncGuidanceMode();
   const token = ++portraitState.profileGeneration;
   const account = chatState.currentAccount;
   const user = chatState.currentUser;
@@ -3770,9 +3763,7 @@ async function loadProfile(member = "", retry = false) {
   if (chatState.sessions.get(user)?.isGroup) rememberProfileMember(account, user, member);
   if (apiMode) {
     portraitState.profilePending = false;
-    cancelGuidancePoll();
     void loadApiPortrait(member);
-    void loadGuidance();
     return;
   }
   if (key !== portraitState.renderedProfileKey) {
@@ -3837,324 +3828,9 @@ function applySettings() {
   byId("btnToggleBackgroundAnalyze").classList.toggle("active", settingsState.settings.backgroundAnalyze);
   byId("btnToggleBackgroundAnalyze").setAttribute("aria-pressed", String(settingsState.settings.backgroundAnalyze));
   byId("btnToggleBackgroundAnalyze").textContent = settingsState.settings.backgroundAnalyze ? "已开启" : "已关闭";
-  byId("chkAnalyzeSelfStyle").checked = settingsState.settings.analyzeSelfStyle;
-  text("analyzeSelfStyleState", settingsState.settings.analyzeSelfStyle ? "已开启" : "已关闭");
   if (settingsState.analysisOverviewSnapshot) renderAnalysisOverview(settingsState.analysisOverviewSnapshot);
   refreshLabels();
-  // A saved result carries the switch it was produced with, so the memo is dropped and
-  // the next read redraws the card instead of leaving a stale self block on screen.
-  portraitState.guidanceRenderedKey = null;
 }
-
-// ---------------------------------------------------------------------------
-// Deep semantic reading + scenario simulation (API mode)
-// One provider turn produces both, so the per-message reading and the advice beside
-// it always describe the same conversation. The card only exists in API mode.
-// ---------------------------------------------------------------------------
-// Must match electron/api-guidance.ts and bridge/guidance_contracts.py.
-const GUIDANCE_VERSION = "api-guidance-v2";
-const GUIDANCE_SCENARIOS = ["general", "leader"];
-const GUIDANCE_POLARITIES = ["positive", "neutral", "negative", "mixed"];
-const GUIDANCE_STATUSES = ["ok", "uncertain", "insufficient"];
-const GUIDANCE_POLARITY_LABELS = { positive: "偏正面", neutral: "中性", negative: "偏负面", mixed: "好坏参半" };
-const GUIDANCE_ERRORS = {
-  "context-too-long": "模型不支持当前请求上下文，请调整设置中的上下文大小",
-  "invalid-output": "模型返回格式不正确", "invalid-guidance": "模型返回的分析结果不完整",
-  "guidance-version-invalid": "分析规则已更新，请重新分析",
-  "invalid-request": "当前请求超出分析范围",
-  "timeout": "模型响应超时", "rate-limit": "接口请求受限", "empty-response": "模型未返回内容",
-  "response-too-large": "模型返回内容过长", "auth": "API Key 无效", "network": "网络连接失败",
-  "provider-error": "模型服务返回错误", "model-source-changed": "模型来源已切换",
-};
-const guidanceSubtextLimit = 6;
-portraitState.guidanceSnapshot = null;
-portraitState.guidanceRendered = null;
-portraitState.guidanceRenderedKey = null;
-portraitState.guidanceRequest = 0;
-portraitState.guidancePollTimer = null;
-portraitState.guidanceLoadingKey = null;
-portraitState.guidanceBusy = false;
-portraitState.guidanceSubmitError = "";
-portraitState.guidanceScenario = "general";
-
-function guidanceScopeKey() {
-  return JSON.stringify([chatState.currentAccount, chatState.currentUser,
-    settingsState.modelSourceSnapshot.sourceId, portraitState.activeMember || chatState.currentUser]);
-}
-function guidanceText(value, maximum) {
-  return typeof value === "string" ? value.trim().slice(0, maximum) : "";
-}
-// Shape check only. The backend already validated the payload against the stored
-// contract; this keeps a stale or foreign response from reaching the renderer.
-function normalizeGuidance(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  if (value.version !== GUIDANCE_VERSION || !GUIDANCE_SCENARIOS.includes(value.scenario) ||
-      typeof value.analyzeSelf !== "boolean" || !Array.isArray(value.subtexts) ||
-      !value.subtexts.length || value.subtexts.length > 12) return null;
-  const subtexts = [];
-  const seen = new Set();
-  for (const item of value.subtexts) {
-    if (!item || typeof item !== "object" || typeof item.id !== "string" || !item.id ||
-        seen.has(item.id) || !GUIDANCE_STATUSES.includes(item.status)) return null;
-    seen.add(item.id);
-    if (item.status !== "ok") { subtexts.push({ id: item.id, status: item.status }); continue; }
-    const sentiment = item.sentiment && typeof item.sentiment === "object" &&
-      GUIDANCE_POLARITIES.includes(item.sentiment.polarity)
-      ? { polarity: item.sentiment.polarity, label: guidanceText(item.sentiment.label, 6) } : null;
-    const surface = guidanceText(item.surface, 24);
-    const implied = guidanceText(item.implied, 48);
-    const tactic = guidanceText(item.tactic, 10);
-    if (!surface && !implied && !tactic && !sentiment) return null;
-    subtexts.push({ id: item.id, status: "ok", surface, implied, tactic, sentiment });
-  }
-  const advice = value.advice;
-  if (!advice || typeof advice !== "object" || Array.isArray(advice)) return null;
-  const others = advice.forOthers;
-  if (!others || typeof others !== "object" || Array.isArray(others) ||
-      !Array.isArray(others.strategies) || !others.strategies.length || others.strategies.length > 4 ||
-      !Array.isArray(others.replies) || !others.replies.length || others.replies.length > 3) return null;
-  const reading = guidanceText(others.reading, 80);
-  const strategies = others.strategies.map(item => guidanceText(item, 48)).filter(Boolean);
-  if (!reading || !strategies.length) return null;
-  const replies = [];
-  for (const reply of others.replies) {
-    const text = reply && typeof reply === "object" ? guidanceText(reply.text, 90) : "";
-    if (!text) return null;
-    replies.push({ tone: guidanceText(reply.tone, 8), text });
-  }
-  const forOthers = { reading, strategies, replies };
-  let forSelf = null;
-  if (value.analyzeSelf) {
-    const self = advice.forSelf;
-    if (!self || typeof self !== "object" || Array.isArray(self) || !Array.isArray(self.strengths) ||
-        !Array.isArray(self.improvements) || !self.strengths.length || self.strengths.length > 3 ||
-        !self.improvements.length || self.improvements.length > 3) return null;
-    const summary = guidanceText(self.summary, 80);
-    const strengths = self.strengths.map(item => guidanceText(item, 36)).filter(Boolean);
-    const improvements = self.improvements.map(item => guidanceText(item, 36)).filter(Boolean);
-    if (!summary || !strengths.length || !improvements.length) return null;
-    forSelf = { summary, strengths, improvements };
-  } else if (advice.forSelf !== null && advice.forSelf !== undefined) return null;
-  return { scenario: value.scenario, analyzeSelf: value.analyzeSelf, subtexts, advice: { forOthers, forSelf } };
-}
-function guidanceGroup(title) {
-  const group = element("div", "guidance-group");
-  group.appendChild(element("div", "guidance-group-title", title));
-  return group;
-}
-function guidanceBullets(items) {
-  const list = element("ul", "guidance-points");
-  for (const item of items) list.appendChild(element("li", "", item));
-  return list;
-}
-function renderGuidanceBody(guidance) {
-  const container = byId("guidanceBody");
-  container.replaceChildren();
-  portraitState.guidanceRendered = guidance;
-  if (!guidance) {
-    container.appendChild(element("div", "guidance-empty", "还没有分析结果，点击“开始分析”生成潜台词解读与沟通建议。"));
-    return;
-  }
-  const readable = guidance.subtexts.filter(item => item.status === "ok");
-  if (readable.length) {
-    const group = guidanceGroup(`潜台词解读 · 最近 ${Math.min(readable.length, guidanceSubtextLimit)} 条`);
-    const list = element("div", "guidance-subtexts");
-    for (const item of readable.slice(-guidanceSubtextLimit)) {
-      const row = element("div", "guidance-subtext");
-      row.dataset.status = item.status;
-      const meta = element("div", "guidance-subtext-meta");
-      if (item.tactic) meta.appendChild(element("span", "guidance-tag", item.tactic));
-      if (item.sentiment) {
-        const tag = element("span", "guidance-tag",
-          item.sentiment.label || GUIDANCE_POLARITY_LABELS[item.sentiment.polarity] || "");
-        tag.dataset.polarity = item.sentiment.polarity;
-        meta.appendChild(tag);
-      }
-      if (meta.childNodes.length) row.appendChild(meta);
-      if (item.surface) {
-        const line = element("div", "guidance-subtext-row");
-        line.append(element("b", "", "表层"), document.createTextNode(item.surface));
-        row.appendChild(line);
-      }
-      if (item.implied) {
-        const line = element("div", "guidance-subtext-row");
-        line.append(element("b", "", "真实意图"), document.createTextNode(item.implied));
-        row.appendChild(line);
-      }
-      list.appendChild(row);
-    }
-    group.appendChild(list);
-    container.appendChild(group);
-  }
-  const others = guidanceGroup("针对他人");
-  others.appendChild(element("div", "guidance-reading", guidance.advice.forOthers.reading));
-  others.appendChild(guidanceBullets(guidance.advice.forOthers.strategies));
-  const replies = element("ul", "guidance-replies");
-  for (const reply of guidance.advice.forOthers.replies) {
-    const item = element("li", "guidance-reply");
-    if (reply.tone) item.appendChild(element("div", "guidance-reply-tone", reply.tone));
-    item.appendChild(element("div", "guidance-reply-text", reply.text));
-    replies.appendChild(item);
-  }
-  others.appendChild(replies);
-  container.appendChild(others);
-  // The two sets stay separate: the self block exists only when the switch is on.
-  if (guidance.advice.forSelf) {
-    const self = guidanceGroup("针对自己");
-    self.appendChild(element("div", "guidance-reading", guidance.advice.forSelf.summary));
-    self.appendChild(element("div", "guidance-subtext-row", "做得好的地方"));
-    self.appendChild(guidanceBullets(guidance.advice.forSelf.strengths));
-    self.appendChild(element("div", "guidance-subtext-row", "可以调整的地方"));
-    self.appendChild(guidanceBullets(guidance.advice.forSelf.improvements));
-    container.appendChild(self);
-  }
-}
-function renderGuidance(data) {
-  const scope = guidanceScopeKey();
-  portraitState.guidanceSnapshot = { ...data, _scope: scope };
-  const job = data.job || {};
-  const running = ["queued", "running"].includes(job.status);
-  const guidance = normalizeGuidance(data.guidance);
-  const key = JSON.stringify([scope, guidance, job.status, job.error || ""]);
-  if (portraitState.guidanceRenderedKey !== key) {
-    renderGuidanceBody(guidance);
-    portraitState.guidanceRenderedKey = key;
-  }
-  let state = "";
-  if (data.suspended) state = "分析缓存已暂停";
-  else if (job.status === "error") state = GUIDANCE_ERRORS[job.error] || "分析失败，请重试";
-  else if (running) state = "正在分析潜台词与沟通建议…";
-  else if (job.status === "insufficient") state = "暂无对方文本，无法分析潜台词";
-  else if (guidance) state = guidance.scenario === "leader" ? "与领导／上级 · 已更新" : "普通联系人 · 已更新";
-  else state = "待分析";
-  text("guidanceStatus", state);
-  text("guidanceBadge", guidance ? (guidance.analyzeSelf ? "含自我分析" : "仅对方") : "待分析");
-  const run = byId("btnRunGuidance");
-  const recompute = byId("btnRecomputeGuidance");
-  run.hidden = running || !!portraitState.guidanceSubmitError;
-  run.disabled = running || portraitState.guidanceBusy;
-  // Recompute needs a previous result to compare against; otherwise the same button
-  // would ask for feedback before anything has been generated.
-  recompute.hidden = running || !guidance;
-  recompute.disabled = running || portraitState.guidanceBusy;
-}
-function syncGuidanceMode() {
-  const apiMode = settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api";
-  byId("guidanceCard").hidden = !apiMode;
-  if (apiMode) byId("selectGuidanceScenario").value = portraitState.guidanceScenario;
-  if (!apiMode) {
-    cancelGuidancePoll();
-    portraitState.guidanceSnapshot = null;
-    portraitState.guidanceRendered = null;
-    portraitState.guidanceRenderedKey = null;
-    portraitState.guidanceSubmitError = "";
-    byId("guidanceBody").replaceChildren();
-    text("guidanceStatus", "");
-  }
-  return apiMode;
-}
-function cancelGuidancePoll() {
-  ++portraitState.guidanceRequest;
-  clearTimeout(portraitState.guidancePollTimer);
-  portraitState.guidancePollTimer = null;
-  portraitState.guidanceLoadingKey = null;
-}
-async function loadGuidance() {
-  if (!chatState.currentUser || !chatState.currentAccount ||
-      !settingsState.modelSourceResolved || settingsState.modelSourceSnapshot.mode !== "api") return;
-  const account = chatState.currentAccount, user = chatState.currentUser, member = portraitState.activeMember;
-  const sourceId = settingsState.modelSourceSnapshot.sourceId;
-  const loadingKey = guidanceScopeKey();
-  if (portraitState.guidanceLoadingKey === loadingKey) return;
-  portraitState.guidanceLoadingKey = loadingKey;
-  const token = ++portraitState.guidanceRequest;
-  const params = new URLSearchParams({ user });
-  if (member) params.set("member", member);
-  try {
-    const data = await api("/api/model-guidance?" + params, {}, chatState.controller?.signal);
-    if (token !== portraitState.guidanceRequest || loadingKey !== guidanceScopeKey()) return;
-    if (!data || data.account !== account || data.sourceId !== sourceId ||
-        data.subject !== (member || user) || data.version !== GUIDANCE_VERSION) throw new Error("分析数据无效");
-    renderGuidance(data);
-    if (data.suspended || ["queued", "running"].includes(data.job?.status))
-      portraitState.guidancePollTimer = setTimeout(() => { void loadGuidance(); }, 2200);
-  } catch (error) {
-    if (token === portraitState.guidanceRequest && error?.name !== "AbortError") {
-      text("guidanceStatus", "分析读取失败，请稍后重试");
-      byId("btnRunGuidance").hidden = false;
-      byId("btnRunGuidance").disabled = false;
-    }
-  } finally {
-    if (portraitState.guidanceLoadingKey === loadingKey) portraitState.guidanceLoadingKey = null;
-  }
-}
-async function startGuidance(feedback = "") {
-  const account = chatState.currentAccount, user = chatState.currentUser;
-  const member = portraitState.activeMember, sourceId = settingsState.modelSourceSnapshot.sourceId;
-  if (!account || !user || settingsState.modelSourceSnapshot.mode !== "api" || portraitState.guidanceBusy) return;
-  portraitState.guidanceBusy = true;
-  portraitState.guidanceSubmitError = "";
-  byId("btnRunGuidance").disabled = true;
-  byId("btnRecomputeGuidance").disabled = true;
-  text("guidanceStatus", feedback ? "正在按你的反馈重新生成…" : "正在提交分析…");
-  try {
-    const body = { account, user, scenario: portraitState.guidanceScenario,
-      analyzeSelf: settingsState.settings.analyzeSelfStyle };
-    if (member) body.member = member;
-    const note = guidanceText(feedback, 400);
-    if (note) body.feedback = note;
-    const data = await api("/api/model-guidance", { method: "POST", body: JSON.stringify(body) });
-    if (account !== chatState.currentAccount || user !== chatState.currentUser ||
-        sourceId !== settingsState.modelSourceSnapshot.sourceId) return;
-    if (data?.account !== account || data.sourceId !== sourceId) throw new Error("分析任务不匹配");
-    cancelGuidancePoll();
-    await loadGuidance();
-  } catch (error) {
-    if (account !== chatState.currentAccount || user !== chatState.currentUser) return;
-    const reason = modelSourceRequestError(error);
-    portraitState.guidanceSubmitError = reason;
-    text("guidanceStatus", "提交失败（" + reason + "）");
-    byId("btnRunGuidance").hidden = false;
-  } finally {
-    portraitState.guidanceBusy = false;
-    byId("btnRunGuidance").disabled = false;
-    byId("btnRecomputeGuidance").disabled = false;
-  }
-}
-function openFeedbackDialog() {
-  byId("feedbackInput").value = "";
-  byId("feedbackError").hidden = true;
-  byId("feedbackModal").classList.add("show");
-  byId("feedbackInput").focus();
-}
-function closeFeedbackDialog() {
-  byId("feedbackModal").classList.remove("show");
-}
-byId("feedbackModal").addEventListener("click", (event) => {
-  if (event.target === byId("feedbackModal")) closeFeedbackDialog();
-});
-byId("btnCloseFeedback").addEventListener("click", closeFeedbackDialog);
-byId("btnCancelFeedback").addEventListener("click", closeFeedbackDialog);
-byId("btnSubmitFeedback").addEventListener("click", () => {
-  const feedback = byId("feedbackInput").value.trim();
-  if (feedback.length > 400) {
-    text("feedbackError", "请控制在 400 字以内");
-    byId("feedbackError").hidden = false;
-    return;
-  }
-  closeFeedbackDialog();
-  void startGuidance(feedback);
-});
-byId("btnRunGuidance").addEventListener("click", () => {
-  const selected = byId("selectGuidanceScenario").value;
-  portraitState.guidanceScenario = GUIDANCE_SCENARIOS.includes(selected) ? selected : "general";
-  void startGuidance();
-});
-byId("selectGuidanceScenario").addEventListener("change", (event) => {
-  portraitState.guidanceScenario = GUIDANCE_SCENARIOS.includes(event.target.value) ?
-    event.target.value : "general";
-});
-byId("btnRecomputeGuidance").addEventListener("click", openFeedbackDialog);
 
 settingsState.runtimeSnapshot = null;
 settingsState.runtimeRequest = 0;
@@ -6446,15 +6122,6 @@ byId("btnToggleBackgroundAnalyze").addEventListener("click", () => {
   save();
   applySettings();
   if (settingsState.settings.backgroundAnalyze) void backgroundAnalyzeAll();
-});
-byId("chkAnalyzeSelfStyle").addEventListener("change", (event) => {
-  settingsState.settings.analyzeSelfStyle = !!event.target.checked;
-  save();
-  applySettings();
-  // Regenerating costs a model call, so the switch never triggers one on its own; the
-  // card says so instead of silently showing advice produced under the old setting.
-  if (portraitState.guidanceRendered && settingsState.modelSourceSnapshot.mode === "api")
-    text("guidanceStatus", "设置已保存，点击“开始分析”或“重算”后生效");
 });
 byId("btnApiWorkerMinus").addEventListener("click", () => { void changeApiWorkerSettings(-1); });
 byId("btnApiWorkerPlus").addEventListener("click", () => { void changeApiWorkerSettings(1); });

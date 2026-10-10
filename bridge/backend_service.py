@@ -221,8 +221,27 @@ class Backend:
                 from advisor_service import AdvisorService
                 from advisor_runtime import runtime_factory
                 service = self._advisor = AdvisorService(
-                    self.source, self.model_source_store, ROOT, runtime_factory(ROOT))
+                    self.source, self.model_source_store, ROOT, runtime_factory(ROOT),
+                    guidance_provider=self._guidance_reference)
             return service
+
+    def _guidance_reference(self, account, user):
+        """The conversation's saved 「潜台词与沟通建议」, for the assistant's reference material.
+
+        The assistant only reads it: nothing here may change analysis state, so an account
+        that is not the verified one, or a store that cannot answer, reads as "nothing to
+        cite" rather than raising into an assistant run.
+        """
+        try:
+            current, _workdir, store = self._scoped_identity()
+        except Exception:  # noqa: BLE001 - reference material must never fail a run
+            return None
+        if current != account:
+            return None
+        try:
+            return store.api_guidance_latest(account, user)
+        except Exception:  # noqa: BLE001 - same reason
+            return None
 
     def _observe_advisor_window(self, account, workdir, user, messages, has_more_before):
         advisor = getattr(self, "_advisor", None)
