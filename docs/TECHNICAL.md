@@ -198,8 +198,8 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | `api_tasks.py` (120) | API 任务注册表、锁、条件变量、运行计数、失效判定 | 业务模型调用、SQL |
 | `api_pool.py` (180) | API-only analyzer 池、租约、限流自适应升降 | 业务逻辑 |
 | `api_portrait_statistics.py` (252) | API 分片适配：信号校验、`append_batch` 累计、画像派生（无 IO） | 模型请求、DB IO |
-| `guidance_contracts.py` (188) | 沟通建议契约（`GUIDANCE_REVISION = "api-guidance-v1"`） | 服务、IO |
-| `message_contracts.py` (95) | 消息标签契约：`FINE_LABEL_SCHEMA="generic-v9"`、`API_INSIGHT_REVISION="free-label-v5-simple"` | 服务、存储 |
+| `guidance_contracts.py` (188) | 沟通建议契约（`GUIDANCE_REVISION = "api-guidance-v2"`） | 服务、IO |
+| `message_contracts.py` (95) | 消息标签契约：`FINE_LABEL_SCHEMA="generic-v9"`、`API_INSIGHT_REVISION="free-label-v6-compact"` | 服务、存储 |
 | `portrait_contracts.py` (83) | 画像契约：`API_PORTRAIT_REVISION="portrait-v2"`、evidence ledger v3、`mbtiBasis` | 服务、存储 |
 | `message_input.py` (238) | 消息身份/来源/时间/引用元数据的校验与投影（纯契约层） | 微信读取、媒体解码、OCR |
 | `message_results.py` (108) | Node 单条结果的纯校验（版本、schema、分布、groundedIntent） | IO、调度 |
@@ -458,7 +458,7 @@ styleCount, style{6 维}, axes{EI,SN,TF,JP: [left,right,evidence,insufficient]},
 | 账号 | `account`（= 账号目录名，`wxid_xxx_1234`）+ `workdir` 解析后路径 | 所有表主键、`Backend._scoped_identity()` |
 | 模型来源 | `sourceId`：`"local:laya"` 或 32 位 hex | `api_insights_v1`、`api_portrait_v1`、`api_guidance_v1` |
 | 分析版本 | `analysisVersion`（Node 侧 `ANALYSIS_VERSION`，含 catalog 版本） | `results_v2`、`batch_*` 的 `base_version` |
-| 契约修订 | `free-label-v5-simple` / `portrait-v2` / `api-guidance-v1` | 拼成 `scope = sourceId + ":" + REVISION` |
+| 契约修订 | `free-label-v6-compact` / `portrait-v2` / `api-guidance-v2` | 拼成 `scope = sourceId + ":" + REVISION` |
 | 批次版本 | `message-batch-v1` | `batch_*` 主键 |
 | 分类器版本 | `apiPortraitVersion`（Node 侧） | `resume_json.portraitStatistics.classifierVersion` |
 | 画像主体 | `subject`（群成员 wxid 或 ""） | `api_portrait_v1`、`profile_state_v1`、`batch_*` |
@@ -631,7 +631,7 @@ POST /api/model-guidance
        两者取自消息标签使用的同一份 portrait summary，保证建议与画像卡不会描述同一个人 differently
      · 前端把消息 ID 换成提示词内短别名（g1,g2,…），真实 ID 只存在于程序内部
      · NodeAnalysis.model_guidance() → JSONL {"cmd":"model:guidance"}
-         → electron/api-guidance.analyzeApiGuidance（GUIDANCE_VERSION="api-guidance-v1"，
+         → electron/api-guidance.analyzeApiGuidance（GUIDANCE_VERSION="api-guidance-v2"，
            GUIDANCE_MIN_CONTEXT=8192，GUIDANCE_TIMEOUT_MS=180000）
      · 双重校验：Node 侧已规范化 → Python 侧再验一次
          ① response.guidanceVersion == GUIDANCE_REVISION，否则 guidance-version-invalid
@@ -1049,11 +1049,13 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 
 **本节是快照，落笔前必须用 `git status` 复核，不要照抄上一版。**
 
-截至 2026-10-07：API 沟通建议、API worker 池、并行测试体系、多档案模型来源、分析请求名单与结果落盘加密都已提交（`b2e6006`、`5c8c9a1`、`5cf5783`、`336d8c8` 等），`scripts/stage-real-client.py` 白名单与 `package.json` 的并行测试入口均已就位。此后又落了三块互相独立的工作（同一次提交）：
+截至 2026-10-07：API 沟通建议、API worker 池、并行测试体系、多档案模型来源、分析请求名单与结果落盘加密都已提交（`b2e6006`、`5c8c9a1`、`5cf5783`、`336d8c8` 等），`scripts/stage-real-client.py` 白名单与 `package.json` 的并行测试入口均已就位。此后又落了四块互相独立的工作（分四个提交）：
 
 1. **手选消息分析**：`/api/analyze` 接受 `targetIds`，界面「选择消息」只分析勾中的几条 —— 见 §6.2 与 §12.14。
 2. **修复「保存并启用」的两个坑**：`activate` 带 `profileId` 时不接受连接字段（否则 400「启用失败」），而它的连接字段形式又会命中已有连接就地更新（否则「加了新配置但下拉菜单里没有」）；前端因此统一成「先 `/api/model-source/profiles` 落盘、再按 id 切换」—— 见 §5.2 与 §12.13。
 3. **API 画像 MBTI 观察门槛**：卡片按观察账本 `available.mbtiEvidenceCount` 解锁、逐轴证据数取 `mbtiBasis.evidenceCount`（原先硬编码 1）、失速任务不再显示「正在准备」；`bridge/result_store.py` 的 `api_portrait_get` 负责暴露该计数，`electron/laya/personality.ts` 与 `electron/api-portrait-classifier.ts` 的 API 题面升到 `mbti-api-context-v2`（见 §7.5）。
+
+4. **压缩四条分析提示词**（`8b48c2f`）：逐条标签 / 沟通建议 / 观察提取 / 画像合成四条 system 提示词保持 schema 与判定语义不变，只合并重复规则、显式写死粒度与长度上限；`electron/api-portrait.ts` 顺带删掉调用点里重复的 schema/长度说明。版本串随之升到 `free-label-v6-compact`、`api-guidance-v2`（TS + Python + `chatui/app.js` 三处副本）、`api-laya-portrait-v3`（三处闸门的位置见 §5 的 `*_contracts.py` 清单与 scope 表）。
 
 本轮核对过的一致性状态：
 
