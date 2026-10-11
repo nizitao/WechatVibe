@@ -1740,6 +1740,161 @@ function messageNode(message) {
   attachPickControl(message, item);
   return item;
 }
+// ── 消息右键菜单：单条「重新算」 ─────────────────────────────────────────────
+// Recomputing one message is two steps: forget its saved row, then submit that single id
+// through the ordinary path of the active source. Both paths deliberately skip an id that
+// already has a result (that is what makes the automatic runs incremental), so resending
+// the id on its own would be a no-op — the forget call has to come first.
+let messageMenuMessage = null;
+let recomputeBusy = false;
+function messageSourceId() {
+  const source = settingsState.modelSourceSnapshot;
+  return source.mode === "local" ? source.sourceId || "local" : source.sourceId;
+}
+// Same predicate as the local label row: any text this fork would send to the local model.
+function localRecomputable(message) {
+  return message.side === "other" && message.kind === "text" &&
+    typeof message.text === "string" && hasAnalyzableText(message.text) &&
+    !isIncompleteFragment(message.text);
+}
+/** "" when「重新算」can run for this message, otherwise the reason to show instead. */
+function messageMenuReason(message) {
+  if (!message) return "没有可重算的消息";
+  if (!settingsState.settings.intent) return "请先开启「意图识别」";
+  if (usingApiInsights()) {
+    if (!apiInsightWorkCurrent(labelState.apiInsightWork)) return "当前会话分析尚未就绪，请稍后再试";
+    if (!pickableMessage(message)) return "这条消息不参与分析";
+    if (chatState.historyState && typeof message.historyCursor !== "string") return "这条消息不在当前窗口中";
+    const entry = activeApiInsightEntry();
+    if (["queued", "running"].includes(entry?.job?.status)) return "已有分析正在进行，请稍后再试";
+    return "";
+  }
+  if (!canAnalyzeLocal()) return "当前模型来源不可用，无法分析";
+  // `/api/analyze` resolves hand-picked ids inside the latest tail window only.
+  if (chatState.historyState) return "请先返回最新消息再重算";
+  if (!localRecomputable(message)) return "这条消息不参与分析";
+  if (labelState.recentPending || ["queued", "running"].includes(labelState.currentRecentJob?.status))
+    return "已有分析正在进行，请稍后再试";
+  if (!portraitState.activeAnalysisScope) return "分析尚未就绪，请稍后再试";
+  if (!pickedWindow([message]).candidates.length) return "这条消息不在最近窗口中";
+  return "";
+}
+function messageFromNode(node) {
+  const item = node?.closest?.(".msg-item");
+  if (!item) return null;
+  return chatState.messages.find(message => String(message.id) === item.dataset.messageId) || null;
+}
+function openMessageMenu(message, x, y) {
+  const menu = byId("messageContextMenu");
+  messageMenuMessage = message || null;
+  const reason = messageMenuReason(message);
+  const hint = byId("messageContextHint");
+  hint.textContent = reason;
+  hint.hidden = !reason;
+  byId("btnRecomputeMessage").disabled = !!reason;
+  menu.hidden = false;
+  // Clamp inside the viewport: a menu opened near the right or bottom edge must stay whole.
+  const bounds = menu.getBoundingClientRect();
+  const width = bounds.width || menu.offsetWidth || 150;
+  const height = bounds.height || menu.offsetHeight || 42;
+  menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - width - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - height - 8))}px`;
+  byId("btnRecomputeMessage").focus();
+}
+function closeMessageMenu() {
+  const menu = byId("messageContextMenu");
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  menu.style.left = "";
+  menu.style.top = "";
+  messageMenuMessage = null;
+}
+async function forgetMessageAnalysis(message) {
+  const body = { account: chatState.currentAccount, user: chatState.currentUser,
+    sourceId: messageSourceId(), messageId: String(message.id) };
+  const result = await api("/api/analysis-target/forget",
+    { method: "POST", body: JSON.stringify(body) });
+  if (result?.forgotten !== true || result.account !== body.account || result.user !== body.user ||
+      result.sourceId !== body.sourceId || result.messageId !== body.messageId)
+    throw new Error("重算结果不匹配");
+  return body;
+}
+// The row has to stop showing the old label before the new run reports anything, otherwise a
+// recompute of a finished message would look like it did nothing.
+function dropMessageResult(message) {
+  const id = String(message.id);
+  if (usingApiInsights()) {
+    const entry = activeApiInsightEntry();
+    if (entry?.results) delete entry.results[id];
+  } else delete labelState.results[id];
+  refreshLabels();
+}
+function submitRecomputedMessage(message) {
+  const id = String(message.id);
+  if (usingApiInsights()) {
+    const work = labelState.apiInsightWork;
+    if (!work || !apiInsightWorkCurrent(work)) {
+      setStripStatus("当前会话分析尚未就绪，请稍后再试");
+      return;
+    }
+    void submitApiInsightJob(work, [message], apiInsightSignature([message]));
+    setStripStatus("正在重算这一条…");
+    return;
+  }
+  const window = pickedWindow([message]);
+  if (!window.candidates.length) {
+    toast("这条消息不在最近窗口中");
+    return;
+  }
+  labelState.recentFailed = false;
+  labelState.manualRecentAwaitingPost = true;
+  labelState.manualRecentJobId = null;
+  portraitState.analysisGeneration++;
+  setIntentActionState("submitting");
+  void analyzeRecent(chatState.currentUser, chatState.generation, chatState.controller.signal,
+    fineWindowSignature(window), window.limit, window, [id]);
+  setStripStatus("正在重算这一条…");
+}
+async function recomputeMessage(message) {
+  closeMessageMenu();
+  const reason = messageMenuReason(message);
+  if (reason) {
+    toast(reason);
+    return;
+  }
+  if (recomputeBusy) return;
+  const generation = chatState.generation;
+  recomputeBusy = true;
+  let body = null;
+  try {
+    body = await forgetMessageAnalysis(message);
+  } catch (error) {
+    if (!handleAccountBoundaryError(error)) toast("重算失败，请稍后重试");
+    return;
+  } finally {
+    recomputeBusy = false;
+  }
+  // The answer belongs to the account, conversation and source the menu was opened on.
+  // Anything else means the view moved on, and this label is no longer ours to touch.
+  if (chatState.generation !== generation || chatState.currentAccount !== body.account ||
+      chatState.currentUser !== body.user || messageSourceId() !== body.sourceId) return;
+  dropMessageResult(message);
+  submitRecomputedMessage(message);
+}
+byId("chatMessages").addEventListener("contextmenu", event => {
+  const message = messageFromNode(event.target);
+  if (!message) return;
+  event.preventDefault();
+  openMessageMenu(message, event.clientX, event.clientY);
+});
+byId("chatMessages").addEventListener("scroll", closeMessageMenu);
+byId("messageContextMenu").addEventListener("contextmenu", event => event.preventDefault());
+byId("btnRecomputeMessage").addEventListener("click", () => { void recomputeMessage(messageMenuMessage); });
+document.addEventListener("click", event => {
+  if (!event.target.closest?.("#messageContextMenu")) closeMessageMenu();
+});
+document.addEventListener("keydown", event => { if (event.key === "Escape") closeMessageMenu(); });
+window.addEventListener("resize", closeMessageMenu);
 function renderMessages(next, restoreScroll = null, historyAnchor = null) {
   const container = byId("chatMessages");
   const previousMessages = chatState.messages;
@@ -5870,7 +6025,9 @@ byId("btnConfirmDeleteApiProfile").addEventListener("click", () => { void delete
 function handleModelMenuClick(event) {
   if (event.target.closest("[data-manage]")) {
     closeModelBadgeMenu();
-    byId("btnSettings").click();
+    if (!byId("settingsModal").classList.contains("show")) byId("btnSettings").click();
+    // The profile fields live in their own tab, so "管理配置" has to land there.
+    document.querySelector('.settings-tab-btn[data-tab="model"]')?.click();
     byId("selectModelSource").value = "api";
     settingsState.modelSourceDraftDirty = true;
     invalidateModelDiscovery();
@@ -6191,7 +6348,8 @@ byId("btnCancelDeleteAccount").addEventListener("click", () => {
 byId("btnConfirmDeleteAccount").addEventListener("click", () => { void deleteManagedAccount(); });
 document.querySelectorAll(".settings-tab-btn").forEach(tab => tab.addEventListener("click", () => {
   document.querySelectorAll(".settings-tab-btn").forEach(node => node.classList.toggle("active", node === tab));
-  document.querySelectorAll(".settings-panel").forEach(node => node.classList.toggle("active", node.id === ({ general: "panelGeneral", about: "panelAbout" })[tab.dataset.tab]));
+  document.querySelectorAll(".settings-panel").forEach(node =>
+    node.classList.toggle("active", node.id === ({ general: "panelGeneral", model: "panelModel", about: "panelAbout" })[tab.dataset.tab]));
   if (tab.dataset.tab === "about") void loadAboutVersion();
 }));
 byId("btnEmoji").addEventListener("click", event => { event.stopPropagation(); byId("emojiPopover").classList.toggle("show"); });

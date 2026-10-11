@@ -27,6 +27,18 @@ from profile_state import (empty_state as empty_profile_state, add_result as add
 from api_portrait_statistics import empty_statistics, valid_statistics
 
 
+def _valid_source_id(source_id):
+    """A local scope, or a stored API source id (hex32 with an optional stream suffix)."""
+    return (isinstance(source_id, str) and bool(source_id) and
+            (source_id == LOCAL_SOURCE_ID or
+             re.fullmatch(r"[0-9a-f]{32}(?::[^\s]+)?", source_id) is not None))
+
+
+def _source_scope(source_id):
+    """Match a source and its per-stream variants (`<id>` or `<id>:<stream>`)."""
+    return ("source_id=?", source_id) if ":" in source_id else ("source_id LIKE ?", source_id + ":%")
+
+
 def project_result_store(account, _workdir):
     """Keep the established account-hashed cache location, independent of snapshots."""
     directory = ROOT / ".local" / "real-client-data"
@@ -810,7 +822,7 @@ class ResultStore:
         """Clear one stopped analysis scope; preserve source databases and Advisor state."""
         if not all(isinstance(value, str) and value for value in (account, user, source_id)):
             raise ValueError("invalid analysis scope")
-        if source_id != LOCAL_SOURCE_ID and not re.fullmatch(r"[0-9a-f]{32}(?::[^\s]+)?", source_id):
+        if not _valid_source_id(source_id):
             raise ValueError("invalid analysis source")
         if subject is not None:
             if not isinstance(subject, str) or not user.endswith("@chatroom") and subject != user:
@@ -847,8 +859,7 @@ class ResultStore:
                 else:
                     conn.execute("INSERT OR IGNORE INTO portrait_resets_v1 VALUES (?,?,?)", (account, user, subject))
             else:
-                source_query = "source_id=?" if ":" in source_id else "source_id LIKE ?"
-                source_value = source_id if ":" in source_id else source_id + ":%"
+                source_query, source_value = _source_scope(source_id)
                 args = (account, user, source_value)
                 if subject is None:
                     counts["messageRows"] = conn.execute(
@@ -860,6 +871,33 @@ class ResultStore:
                 counts["portraitRows"] = conn.execute(query, args).rowcount
                 from api_portrait_ledger import clear_ledger
                 clear_ledger(conn, account=account, user=user, source_id=source_id, subject=subject)
+        return counts
+
+    def clear_message(self, account, user, source_id, message_id):
+        """Forget one message's saved analysis so the next run computes it again.
+
+        The message itself, the conversation and every other row stay untouched, and no
+        job is cancelled: the caller re-submits this single id (``target_ids``) once the
+        row is gone. Local scopes drop the fine and the legacy row for every version plus
+        their skip marks, so a message whose stored outcome was a skip is re-judged too.
+        """
+        if not all(isinstance(value, str) and value for value in (account, user, source_id, message_id)):
+            raise ValueError("invalid analysis target")
+        if not _valid_source_id(source_id):
+            raise ValueError("invalid analysis source")
+        counts = {"messageRows": 0}
+        with self.profile_lock, self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if source_id == LOCAL_SOURCE_ID:
+                for table in ("results_v2", "analysis_skips", "fine_results_v1", "fine_skips_v1"):
+                    counts["messageRows"] += conn.execute(
+                        f"DELETE FROM {table} WHERE account=? AND session=? AND id=?",
+                        (account, user, message_id)).rowcount
+            else:
+                source_query, source_value = _source_scope(source_id)
+                counts["messageRows"] = conn.execute(
+                    "DELETE FROM api_insights_v1 WHERE account=? AND session=? AND id=? AND " + source_query,
+                    (account, user, message_id, source_value)).rowcount
         return counts
 
     def skip_fine(self, account, user, version, message, reason):

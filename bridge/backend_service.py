@@ -2126,6 +2126,30 @@ class Backend:
                 self.analysis_scope_resets.discard(reset_scope)
                 self.request_condition.notify_all()
 
+    def forget_message_analysis(self, requested_account, user, source_id, message_id):
+        """Drop one message's saved analysis so the next run computes it again.
+
+        This is the "recompute this one" action behind the message context menu. It only
+        removes the stored row for that id and source; nothing else is invalidated, no job
+        is cancelled and no progress moves. The client then submits the single id through
+        the ordinary path for the active source (``/api/analyze`` with ``targetIds``, or
+        ``/api/model-insights``), which would otherwise skip an already-saved message.
+        """
+        _session_id(user)
+        if (not isinstance(source_id, str) or not isinstance(message_id, str) or
+                not 1 <= len(message_id) <= 200 or
+                any(ord(char) < 32 or ord(char) == 127 for char in message_id)):
+            raise ValueError("invalid analysis target")
+        account, workdir, store = self._scoped_identity()
+        if account != requested_account:
+            raise AccountChangedError()
+        known = {item["sourceId"] for item in self.analysis_cache_status()["sources"]}
+        if source_id != LOCAL_SOURCE_ID and source_id not in known:
+            raise ValueError("unknown analysis source")
+        self._assert_scope((account, workdir))
+        return {"account": account, "user": user, "sourceId": source_id, "messageId": message_id,
+                **store.clear_message(account, user, source_id, message_id)}
+
     def start_model_portrait(self, requested_account, user, member=None, refresh_axes=False):
         if member is not None and (not user.endswith("@chatroom") or
                                    not isinstance(member, str) or not member or len(member) > 256):

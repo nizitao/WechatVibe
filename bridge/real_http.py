@@ -258,6 +258,7 @@ def make_handler(backend, accounts=None, control_token=None):
                                  "/api/model-portrait", "/api/model-guidance",
                                  "/api/analysis-cache/clear",
                                  "/api/analysis-scope/clear",
+                                 "/api/analysis-target/forget",
                                  "/api/analysis-cache/resume", "/api/conversation-selection",
                                  "/api/data-root", "/api/data-root/clear",
                                  "/api/analysis-workers", "/api/api-workers",
@@ -401,6 +402,15 @@ def make_handler(backend, accounts=None, control_token=None):
                         if str(exc) in {"analysis-reset-in-progress", "analysis-reset-busy"}:
                             return self.send(409, {"error": str(exc), "message": "当前分析尚未结束，请稍后重置"})
                         raise
+                if endpoint == "/api/analysis-target/forget":
+                    # "Recompute this message": the saved row goes away first, then the
+                    # client submits this single id like any other hand-picked target.
+                    if set(request) != {"account", "user", "sourceId", "messageId"}:
+                        raise ValueError("invalid analysis target")
+                    result = backend.forget_message_analysis(
+                        user_value(request["account"]), user_value(request["user"]),
+                        user_value(request["sourceId"]), request_id_value(request["messageId"]))
+                    return self.send(200, {"forgotten": True, **result})
                 if endpoint in ("/api/analysis-cache/clear", "/api/analysis-cache/resume"):
                     if set(request) != {"account", "sourceId"}:
                         raise ValueError("invalid cache request")

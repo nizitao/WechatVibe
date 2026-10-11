@@ -82,7 +82,7 @@
 
 验证：`npm run typecheck` 干净；`npm run test:node` **595/595**；Python 侧除上游自带的 7 个 `test_advisor_*.py`（在纯净 `upstream/main` 上失败数完全相同，本机环境所致）外全部通过，含两个慢文件（`test_real_backend.py` 94s、`test-start-real-client.py` 79s）。
 
-### 五、潜台词与沟通建议并进助手（工作区未提交）
+### 五、潜台词与沟通建议并进助手（`b63fd99`，已推到 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)）
 
 画像页那张「潜台词与沟通建议」卡已移除 —— 连同场景选择、「开始分析」/「重算」、重算反馈对话框和设置里的「分析我自己的对话风格」开关（`analyzeSelfStyle`），`chatui/app.js` 里那一段渲染/轮询代码与 `.guidance-*` / `.feedback-modal-*` 样式一并删除。这份能力现在只从**助手**进入：
 
@@ -92,7 +92,7 @@
 
 回归：`bridge/test_api_guidance.py`（17 例）、`bridge/test_advisor_guidance_reference.py`（5 例）、`tests/api-persona-ui.test.cjs`（48 例）；`npm run typecheck`、`npm run test:node`（595/595）与除上游自带 `test_advisor_*.py` 外的 Python 全量都通过。
 
-### 六、链接不进分析（工作区未提交）
+### 六、链接不进分析（`c79ba16`，已推到 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)）
 
 聊天里的链接不再参与任何分析：逐条情绪 / 意图标签（本地 Laya 与 API）、沟通建议、API 画像、助手资料都一样 —— 送进模型的文本先去掉链接；一条消息若**只有链接**（或只有链接加标点、只是 `[链接]`/`[文件]` 这类微信占位），就不再作为分析目标，不产生结果也不消耗调用。界面显示的原文、已存结果与画像的来源指纹仍是原文，不受影响。
 
@@ -100,7 +100,26 @@
 
 回归：`bridge/test_message_input.py`（规则本身）、`bridge/test_real_backend.py`（本地链路跳过 + 送模型文本无链接）、`bridge/test_api_insights.py`（API 标签目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs`（前端判定与手选）。
 
-### 七、与上游的已知分歧
+### 七、右键单条重算（工作区未提交）
+
+在聊天里右键任意一条消息，弹出的小菜单里是「重新算」：只把**这一条**交给当前模型重新跑一遍，其它消息、分析进度和画像都不动。
+
+- **只看这一条**：已经算过的会重算，上次被跳过（比如当时是纯链接）的也会重新判定一次；相邻消息与其它结果保持原样。
+- **两种模型来源都支持**：本地 Laya 与 API 模型各走原有入口（`POST /api/analyze` 与 `/api/model-insights` 的 `targetIds`），所以 API 模式下重算一条只花这一条的调用。
+- **不能算的会说明原因**：自己发的、图片、只有链接（见上一节）、纯占位（`[链接]`）等消息，菜单里的按钮是灰的并写明原因；超出当前 80 条尾窗的消息提示「不在最近窗口中」；正在跑分析时提示稍后重试。
+- **实现上是先「忘掉」再「算」**：新增 `POST /api/analysis-target/forget` 只删除这一条在当前来源下的已存结果（`ResultStore.clear_message`）。因为两条分析链路都会主动跳过已有结果的消息 —— 少了这一步，重算会静默地什么都不做；这一点由前端测试按**事件顺序**钉住。
+
+回归：`bridge/test_message_recompute.py`（只删这一条：相邻消息 / 另一会话 / 另一来源三组对照 + HTTP 200/400 与坏入参）、`tests/message-context-menu.test.cjs`（菜单接线、禁用原因、请求体、先忘后提交的时序、视图变化后不提交、并发只发一次）。
+
+### 八、模型配置单开一栏（工作区未提交）
+
+设置弹窗原本只有「通用设置 / 关于」两栏，模型那一整组（模型来源、本地模型与设备、模型文件下载、本地并行数、API 配置与密钥、API 并行数、模型来源状态）和主题、缩放、会话管理、数据目录、账号、分析缓存挤在同一栏里。现在它们单独成栏，侧栏顺序为 **通用设置 / 模型配置 / 关于**。
+
+- 「通用设置」保留：主题外观、界面缩放、后台分析已添加的会话、会话管理、聊天记录路径、账号、分析缓存。
+- 从聊天标题栏的模型徽标点「管理配置」，会直接落在「模型配置」栏（不然会聚焦到一个隐藏面板里的输入框）。
+- 只是搬位置：行为、接口、本地/API 按 `hidden` 的切换规则都没变。
+
+### 九、与上游的已知分歧
 
 保留自用判定逻辑会带来两处可预期的不一致，下次升级上游时需要留意：
 
@@ -130,7 +149,7 @@ v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github
 | 分支 | 内容 |
 | --- | --- |
 | `main` | 跟随上游 v1.3.0 + 「自用改动」 |
-| `perf/optimize-tokenizer` | 本轮分支：手选消息 / 模型来源多配置 / MBTI 门槛修 + 分词优化，已合并上游 1.3.0（[PR #33](https://github.com/tswawa/WechatVibe/pull/33) 开放） |
+| `perf/optimize-tokenizer` | 本轮分支：手选消息 / 模型来源多配置 / MBTI 门槛修 / 链接不进分析 / 右键单条重算 + 分词优化，已合并上游 1.3.0（[PR #33](https://github.com/tswawa/WechatVibe/pull/33) 开放） |
 | `feat/selfuse-on-1.2.4` | 上一轮升级分支（自用改动搬到 1.2.4） |
 | `feat/selfuse-on-1.2.3` | 上一轮升级分支（已并入 `main`，历史） |
 | `feat/selfuse-on-1.2.2` | 更早的升级分支（历史） |

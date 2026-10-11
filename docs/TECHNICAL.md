@@ -384,6 +384,7 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | `/api/analysis-workers` | `{workers?:1..4, elastic?}` | 落盘 `analysis-workers.json` |
 | `/api/api-workers` | `{workers?:1..4}` | 落盘 `api-workers.json` |
 | `/api/analysis-cache/clear` / `/resume` | `{account,sourceId}` | 清/恢复某来源缓存 |
+| `/api/analysis-target/forget` | `{account,user,sourceId,messageId}` | 只忘掉这一条的已存结果（右键「重新算」的前半步）；不取消任务、不动 progress/画像 |
 | `/api/model-insights` | `{account,user,limit≤500,targetIds?,around?}` | 202 任务 |
 | `/api/model-portrait` | `{account,user,member?,refreshAxes?}` | 202 任务（先注册 job 再准备，全历史扫描可能数分钟） |
 | `/api/model-guidance` | `{account,user,member?,scenario,analyzeSelf,feedback}` | 202 任务 |
@@ -1166,6 +1167,7 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 
 - `chatui/app.js` 按功能簇定位（见 §4.3 报告中的模块划分）；画像/标签渲染都有 signature memo，改动数据结构需同步签名函数，否则不会重绘。
 - 渲染一律用 `element()` + `textContent`（**不要引入 innerHTML**）。
+- 设置弹窗是「侧栏分栏 + 面板」：`chatui/index.html` 的 `.settings-tab-btn[data-tab]`（通用设置 / **模型配置** / 关于）与同级 `.settings-panel#panel*`，`chatui/app.js` 末尾的 tab 监听把 `data-tab` 映射到面板 id（`{general, model, about}`）。**加一栏要三处一起改**：侧栏按钮、面板容器、映射表；从别处跳转到某一栏用 `document.querySelector('.settings-tab-btn[data-tab="…"]').click()`（如模型徽标的「管理配置」→ `model`，更新提示 → `about`）。模型来源、本地模型、API 配置与并行数都在「模型配置」栏内，靠 `hidden` 切换本地/API 两组，与栏本身无关。
 - 前端硬编码常量（好感度等级名、MBTI 门槛、12288 上下文、缓存限额）集中在各函数顶部，修改需同步后端常量。
 
 ### 12.10 修改更新流程
@@ -1251,6 +1253,8 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 
 手选消息的范围与守卫由 `tests/message-picking.test.cjs`（前端行为 + `scheduleRecent`/`ensureApiInsights`/`submitManualRecent` 三处抑制的接线）与 `bridge/test_real_backend.py` 的 `test_http_analyze_accepts_hand_picked_targets` + 三个 `test_selected_targets_*` / `test_selection_does_not_narrow_the_next_window_run` 钉住（后者已用「关掉守卫」验证过确实会失败）。
 
+右键单条重算（§12.16）由 `bridge/test_message_recompute.py`（只删这一条：相邻消息 / 另一会话 / 另一来源三组对照 + HTTP 200/400）与 `tests/message-context-menu.test.cjs`（菜单接线、禁用原因、`/api/analysis-target/forget` 的请求体、**先忘后提交**的时序、视图变化后不提交、并发只发一次）钉住。把 `clear_message` 改成只清一张表、或去掉 forget 调用，两处都会失败。
+
 链接不进分析（§6.11）由四处钉住：`bridge/test_message_input.py` 的 `LinkAndPlaceholderTests`（纯规则：只去协议/www、保留尾部标点、裸域名不动、占位与纯标点的边界、投影副本与 `to_wire`）、`bridge/test_real_backend.py:test_a_message_that_is_only_a_link_is_not_analysed`（本地：链路目标跳过 + 送给模型的文本无链接）、`bridge/test_api_insights.py` 的 `test_a_message_that_is_only_a_link_is_not_a_target_or_sent` 与 `test_guidance_is_insufficient_when_the_window_only_holds_a_link`（API 标签目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs` 的 `keeps a message that is only a link out of every analysis path`（前端判定 + 手选）。把 `has_analysis_content` 改回旧行为可确认这四处确实会失败。
 
 ---
@@ -1268,6 +1272,31 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 回归：`bridge/test_message_input.py`（纯规则）、`bridge/test_real_backend.py`（本地：目标跳过 + 送模型的文本无链接）、`bridge/test_api_insights.py`（API 标签的目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs`（前端判定 + 手选不提供链接消息）。把 `has_analysis_content` 改回旧行为，这几处都会失败 —— 可用来确认测试真的咬得住。
 
 两个刻意的边界：**纯标点仍算内容**（语气）；摘要/指纹类 digest 仍取**原文**，否则改一条链接不会被识别为来源变化。
+
+### 12.16 修改「右键单条重算」
+
+界面上：聊天区任意一条消息右键 → `#messageContextMenu`（`chatui/index.html`，`role="menu"`）中的「重新算」`#btnRecomputeMessage`；不能重算时同一菜单用 `#messageContextHint` 说明原因并禁用按钮。工具条与消息行都不变，弹层用视口坐标（`position: fixed`）并被夹在可视区内。
+
+```
+POST /api/analysis-target/forget {account,user,sourceId,messageId}
+ → real_http.do_POST → Backend.forget_message_analysis()
+     · _session_id / 长度与控制字符校验；_scoped_identity + _assert_scope 复核账号
+     · sourceId 必须是 local 或 analysis_cache_status() 里已知的来源
+ → ResultStore.clear_message()
+     · local：fine_results_v1 / fine_skips_v1 / results_v2 / analysis_skips 里**这一条**的全部版本
+     · API：api_insights_v1 里 `<sourceId>:%` 前缀下这一条
+ → 200 {forgotten:true, account,user,sourceId,messageId,messageRows}
+前端接着走既有路径（只带这一个 id）：
+ · 本地 analyzeRecent(…, targetIds=[id]) → POST /api/analyze {mode:"recent",limit,targetIds}
+ · API  submitApiInsightJob(work,[message]) → POST /api/model-insights {limit:1,targetIds:[id],around?}
+```
+
+- **为什么必须「先忘掉、再提交」**：两条分析链路都是增量的 —— `_run_selected_targets` / `_run_fine_recent` 看 `store.fine_known()`，`start_model_insights` 看 `store.api_insight_known()`，已有结果直接跳过。少了 forget 这一步，「重新算」会静默地什么都不做（`tests/message-context-menu.test.cjs` 用事件顺序钉住）。
+- **只碰这一条**：不取消 job、不动 `progress_v1` / `summary_v1` / 画像、不回退游标；连 skip 行一起删，所以「上次被跳过」的消息这次也会重新判定。
+- **前端判定与后端同源**：`messageMenuReason()` 复用 `pickableMessage`（API 侧含 `hasIntentContent` / `isIncompleteFragment`）与 `hasAnalyzableText`（§12.15），本地侧 `localRecomputable` 与本地标签行同一判定；`pickedWindow([message])` 再确认这条落在后端会解析的 80 条尾窗内，否则提示「这条消息不在最近窗口中」。历史视图下本地侧不提供（`/api/analyze` 只在最新尾窗解析 id），API 侧要求该条带 `message.historyCursor`。
+- **先更新界面再发请求**：`dropMessageResult()` 先丢掉前端缓存的这条结果（否则旧标签会一直挂着，看起来像没生效），本地侧随后由 `analyzeRecent` 的 pending 机制显示「分析中」。
+- **竞态**：请求期间 `chatState.generation` / 账号 / 会话 / 来源任一变化就放弃后续提交（那份结果已不属于当前视图）；`recomputeBusy` 保证同时只有一个 forget 请求。
+- **回归**：`bridge/test_message_recompute.py`（存储只删这一条 + HTTP 契约 200/400）、`tests/message-context-menu.test.cjs`（菜单接线、禁用原因、请求体、先忘后提交的时序、视图变化后不提交、并发只发一次）。把 `clear_message` 改成只清一张表、或去掉 forget 调用，两处测试都会失败。
 
 ## 14. 快速索引：按问题查文件
 
@@ -1302,3 +1331,4 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 | 打包白名单 | `scripts/stage-real-client.py` |
 | 分层约定（权威） | `docs/backend-architecture.md` |
 | 手选消息的分析范围 | `chatui/app.js`（`pickableMessage`/`pickedWindow`/`submitPickedMessages`）、`bridge/backend_service.py`（`_resolve_selected_targets`/`_run_selected_targets`）、`bridge/real_http.py`（`/api/analyze` 的 `targetIds`） |
+| 右键单条重算（忘掉一条结果再重算） | `chatui/app.js`（`messageMenuReason`/`recomputeMessage`/`forgetMessageAnalysis`）、`bridge/backend_service.py`（`forget_message_analysis`）、`bridge/result_store.py`（`clear_message`）、`bridge/real_http.py`（`/api/analysis-target/forget`） |

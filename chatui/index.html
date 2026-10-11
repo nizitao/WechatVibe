@@ -421,6 +421,10 @@
           <svg viewBox="0 0 24 24" style="width:16px;height:16px;fill:currentColor;"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
           <span>通用设置</span>
         </div>
+        <div class="settings-tab-btn" data-tab="model">
+          <svg viewBox="0 0 24 24" style="width:16px;height:16px;fill:currentColor;"><path d="M15 9H9v6h6V9zm-2 4h-2v-2h2v2zm8-2V9h-2V7c0-1.1-.9-2-2-2h-2V3h-2v2h-2V3H9v2H7c-1.1 0-2 .9-2 2v2H3v2h2v2H3v2h2v2c0 1.1.9 2 2 2h2v2h2v-2h2v2h2v-2h2c1.1 0 2-.9 2-2v-2h2v-2h-2v-2h2zm-4 6H7V7h10v10z"/></svg>
+          <span>模型配置</span>
+        </div>
         <div class="settings-tab-btn" data-tab="about">
           <svg viewBox="0 0 24 24" style="width:16px;height:16px;fill:currentColor;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
           <span>关于</span>
@@ -448,6 +452,90 @@
               <option value="1.5">150% (特大)</option>
             </select>
           </div>
+          <div class="settings-row settings-row-wide">
+            <span>后台分析已添加的会话</span>
+            <button type="button" class="settings-action-btn" id="btnToggleBackgroundAnalyze">已关闭</button>
+          </div>
+          <div class="settings-row">
+            <span>信息列表</span>
+            <button type="button" class="settings-action-btn" id="btnManageConversations">管理会话</button>
+          </div>
+          <section class="conversation-manager" id="conversationManager" hidden>
+            <div class="conversation-manager-head">
+              <strong id="conversationManagerCount">会话目录</strong>
+              <input type="search" id="conversationSearch" placeholder="搜索会话" aria-label="搜索会话">
+              <button type="button" class="settings-action-btn" id="btnAddAllConversations">全部添加</button>
+              <button type="button" class="settings-action-btn" id="btnRemoveSelectedConversations" disabled>移除所选</button>
+            </div>
+            <div class="conversation-manager-list" id="conversationManagerList"></div>
+            <div id="conversationManagerStatus" class="model-source-status" role="status"></div>
+          </section>
+          <div class="settings-row">
+            <span>聊天记录路径</span>
+            <span id="dataRootStatus" role="status">自动发现</span>
+          </div>
+          <div class="model-source-field">
+            <label for="inputDataRoot">数据目录</label>
+            <input id="inputDataRoot" type="text" placeholder="默认自动发现，可选择 xwechat_files 或账号目录" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="local-model-control">
+            <button type="button" class="settings-action-btn" id="btnBrowseDataRoot">选择目录</button>
+            <button type="button" class="settings-action-btn model-source-primary" id="btnSaveDataRoot">保存</button>
+            <button type="button" class="settings-action-btn" id="btnClearDataRoot">恢复自动</button>
+          </div>
+          <div class="settings-row">
+            <span>管理账号</span>
+            <div class="account-status-control">
+              <span id="accountCheckSummary" role="status">正在连接微信…</span>
+              <button type="button" class="settings-action-btn" id="btnManageAccounts">查看账号</button>
+            </div>
+          </div>
+          <section class="account-manager" id="accountManager" hidden>
+            <div class="account-validation" id="accountValidation">
+              <span id="accountCheckStatus" role="status" aria-live="polite">正在确认当前账号…</span>
+              <div class="account-validation-actions">
+                <button type="button" class="settings-action-btn" id="btnRetryAccountCheck" hidden>重试</button>
+              </div>
+            </div>
+            <div class="account-manager-head">
+              <span>已保存的微信账号</span>
+              <div class="account-manager-head-actions">
+                <button type="button" class="settings-action-btn" id="btnToggleAccountManagement" aria-pressed="false">管理</button>
+                <button type="button" class="settings-action-btn" id="btnRefreshAccounts">刷新</button>
+              </div>
+            </div>
+            <div class="account-list" id="accountList"></div>
+            <div class="account-manager-actions">
+              <span id="accountManagerStatus" role="status"></span>
+            </div>
+            <div class="account-delete-confirm" id="accountDeleteConfirm" hidden>
+              <p id="accountDeleteQuestion"></p>
+              <div class="account-confirm-actions">
+                <button type="button" class="settings-action-btn" id="btnCancelDeleteAccount">取消</button>
+                <button type="button" class="settings-danger-btn" id="btnConfirmDeleteAccount">确认清除</button>
+              </div>
+            </div>
+          </section>
+          <div class="settings-row">
+            <span>分析缓存</span>
+            <button type="button" class="settings-action-btn" id="btnManageAnalysisCache">查看缓存</button>
+          </div>
+          <section class="analysis-cache-manager" id="analysisCacheManager" hidden>
+            <div class="analysis-cache-list" id="analysisCacheList"></div>
+            <div id="analysisCacheStatus" role="status" aria-live="polite"></div>
+            <div class="analysis-cache-confirm" id="analysisCacheConfirm" hidden>
+              <p id="analysisCacheQuestion"></p>
+              <div class="account-confirm-actions">
+                <button type="button" class="settings-action-btn" id="btnCancelAnalysisCacheClear">取消</button>
+                <button type="button" class="settings-danger-btn" id="btnConfirmAnalysisCacheClear">确认清除</button>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- Panel 2: Model configuration -->
+        <div class="settings-panel" id="panelModel">
+          <div class="settings-title">模型配置</div>
           <div class="settings-row">
             <label for="selectModelSource">模型来源</label>
             <div class="model-source-choice">
@@ -572,92 +660,13 @@
             </div>
             <div id="apiModelTestStatus" class="model-source-status" role="status"></div>
           </section>
-          <div class="settings-row settings-row-wide">
-            <span>后台分析已添加的会话</span>
-            <button type="button" class="settings-action-btn" id="btnToggleBackgroundAnalyze">已关闭</button>
-          </div>
           <div class="model-source-status-row">
             <div id="modelSourceStatus" class="model-source-status" role="status"></div>
             <button type="button" class="settings-action-btn" id="btnReloadModelSource" hidden>重新读取</button>
           </div>
-          <div class="settings-row">
-            <span>信息列表</span>
-            <button type="button" class="settings-action-btn" id="btnManageConversations">管理会话</button>
-          </div>
-          <section class="conversation-manager" id="conversationManager" hidden>
-            <div class="conversation-manager-head">
-              <strong id="conversationManagerCount">会话目录</strong>
-              <input type="search" id="conversationSearch" placeholder="搜索会话" aria-label="搜索会话">
-              <button type="button" class="settings-action-btn" id="btnAddAllConversations">全部添加</button>
-              <button type="button" class="settings-action-btn" id="btnRemoveSelectedConversations" disabled>移除所选</button>
-            </div>
-            <div class="conversation-manager-list" id="conversationManagerList"></div>
-            <div id="conversationManagerStatus" class="model-source-status" role="status"></div>
-          </section>
-          <div class="settings-row">
-            <span>聊天记录路径</span>
-            <span id="dataRootStatus" role="status">自动发现</span>
-          </div>
-          <div class="model-source-field">
-            <label for="inputDataRoot">数据目录</label>
-            <input id="inputDataRoot" type="text" placeholder="默认自动发现，可选择 xwechat_files 或账号目录" autocomplete="off" spellcheck="false">
-          </div>
-          <div class="local-model-control">
-            <button type="button" class="settings-action-btn" id="btnBrowseDataRoot">选择目录</button>
-            <button type="button" class="settings-action-btn model-source-primary" id="btnSaveDataRoot">保存</button>
-            <button type="button" class="settings-action-btn" id="btnClearDataRoot">恢复自动</button>
-          </div>
-          <div class="settings-row">
-            <span>管理账号</span>
-            <div class="account-status-control">
-              <span id="accountCheckSummary" role="status">正在连接微信…</span>
-              <button type="button" class="settings-action-btn" id="btnManageAccounts">查看账号</button>
-            </div>
-          </div>
-          <section class="account-manager" id="accountManager" hidden>
-            <div class="account-validation" id="accountValidation">
-              <span id="accountCheckStatus" role="status" aria-live="polite">正在确认当前账号…</span>
-              <div class="account-validation-actions">
-                <button type="button" class="settings-action-btn" id="btnRetryAccountCheck" hidden>重试</button>
-              </div>
-            </div>
-            <div class="account-manager-head">
-              <span>已保存的微信账号</span>
-              <div class="account-manager-head-actions">
-                <button type="button" class="settings-action-btn" id="btnToggleAccountManagement" aria-pressed="false">管理</button>
-                <button type="button" class="settings-action-btn" id="btnRefreshAccounts">刷新</button>
-              </div>
-            </div>
-            <div class="account-list" id="accountList"></div>
-            <div class="account-manager-actions">
-              <span id="accountManagerStatus" role="status"></span>
-            </div>
-            <div class="account-delete-confirm" id="accountDeleteConfirm" hidden>
-              <p id="accountDeleteQuestion"></p>
-              <div class="account-confirm-actions">
-                <button type="button" class="settings-action-btn" id="btnCancelDeleteAccount">取消</button>
-                <button type="button" class="settings-danger-btn" id="btnConfirmDeleteAccount">确认清除</button>
-              </div>
-            </div>
-          </section>
-          <div class="settings-row">
-            <span>分析缓存</span>
-            <button type="button" class="settings-action-btn" id="btnManageAnalysisCache">查看缓存</button>
-          </div>
-          <section class="analysis-cache-manager" id="analysisCacheManager" hidden>
-            <div class="analysis-cache-list" id="analysisCacheList"></div>
-            <div id="analysisCacheStatus" role="status" aria-live="polite"></div>
-            <div class="analysis-cache-confirm" id="analysisCacheConfirm" hidden>
-              <p id="analysisCacheQuestion"></p>
-              <div class="account-confirm-actions">
-                <button type="button" class="settings-action-btn" id="btnCancelAnalysisCacheClear">取消</button>
-                <button type="button" class="settings-danger-btn" id="btnConfirmAnalysisCacheClear">确认清除</button>
-              </div>
-            </div>
-          </section>
         </div>
 
-        <!-- Panel 2: About -->
+        <!-- Panel 3: About -->
         <div class="settings-panel" id="panelAbout">
         <div class="settings-title about-title"><img src="/assets/wechatvibe-icon.png" alt="" class="about-brand-icon">关于 WechatVibe</div>
         <div class="about-card">
@@ -732,6 +741,11 @@
       <button type="button" class="settings-action-btn" id="btnConfirmAnalysisScopeReset">确认重置</button>
     </div>
   </div>
+</div>
+<!-- Per-message actions: right-clicking a chat record opens this menu. -->
+<div class="msg-context-menu" id="messageContextMenu" role="menu" aria-label="消息操作" hidden>
+  <button type="button" class="msg-context-item" id="btnRecomputeMessage" role="menuitem">重新算</button>
+  <div class="msg-context-hint" id="messageContextHint" role="status" hidden></div>
 </div>
 <script src="kaomoji.js"></script>
 <script src="view-state.js"></script>
