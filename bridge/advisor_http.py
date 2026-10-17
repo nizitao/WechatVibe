@@ -78,7 +78,7 @@ def post(service, path, request):
 def error_status(error):
     if error.code in {"agent-unknown", "thread-unknown", "run-unknown", "not-found"}:
         return 404
-    if error.code in {"run-active", "account-paused", "account-closed", "agent-disabled"}:
+    if error.code in {"run-active", "account-paused", "account-closed", "agent-disabled", "agent-changed"}:
         return 409
     if error.code in {"api-not-configured", "engine-unavailable"}:
         return 503

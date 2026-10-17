@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
 
-import { groundedIntent, groundedIntentWithContext, type GroundedIntentLabel, type IntentEvidenceKind } from "../electron/laya/grounded-intent";
+import { groundedIntent, groundedIntentWithContext, isEmbeddedQuestionStatement, type GroundedIntentLabel, type IntentEvidenceKind } from "../electron/laya/grounded-intent";
 
 const positive: Array<[string, GroundedIntentLabel, IntentEvidenceKind]> = [
   ["早上好！", "greet", "greeting_phrase"],
@@ -144,4 +144,83 @@ it("uses invitation context to ground a deferral without changing target-only ru
   assert.deepEqual(groundedIntentWithContext("木有", "你是不是生气了？"),
     { label: "deny", evidenceKind: "contextual_denial" });
   assert.equal(groundedIntentWithContext("木有", "今天吃什么？"), null);
+});
+
+it("grounds first-person corrections without mistaking a qualified denial for refusal", () => {
+  for (const message of ["我没有说不去，只是需要晚一点。", "我没说不参加，只是要晚到十分钟。",
+    "我不是生你的气，是觉得沟通有点累。", "我们并不是不愿意，而是时间不合适。"])
+    assert.deepEqual(groundedIntent(message), {label:"correct", evidenceKind:"explicit_correction"});
+  for (const message of ['他说：“我没有说不去，只是晚一点。”', "比如我没有说不去，只是晚一点。",
+    "如果我不是生你的气，是因为别的事呢？", "我并不是没有参加。", "让我再想想，我暂时没有把握。"])
+    assert.equal(groundedIntent(message), null, message);
+});
+
+it("grounds a complete negative answer only against the latest explicit proposition", () => {
+  const reply = "不是，我也很喜欢和熟悉的人一起出去。";
+  assert.deepEqual(groundedIntentWithContext(reply, "所以你总是喜欢一个人吗？"),
+    {label:"deny", evidenceKind:"contextual_denial"});
+  for (const context of ["今天吃什么？", "你喜欢独处吗？\n我们几点出发？", "他说你喜欢独处吗？",
+    "我正在研究是否调整方案。", "小王说你是不是喜欢独处", "听说你喜欢独处吗？", ""])
+    assert.equal(groundedIntentWithContext(reply, context), null, context);
+  assert.equal(groundedIntentWithContext('他说：“不是，我喜欢出去。”', "你喜欢独处吗？"), null);
+  assert.deepEqual(groundedIntentWithContext("我没有说改天，只是需要晚一点。", "明天一起去吗？"),
+    {label:"correct", evidenceKind:"explicit_correction"});
+});
+
+it("grounds actual reschedules and chat pauses, including transparent framing", () => {
+  for (const message of ["下午不太方便，我们改到周日上午吧。", "我们把会议改到下周一吧。",
+    "我的想法是：时间改到明天下午吧。", "改到周六上午吧。", "有效，我没有取消，只是把时间改到了明天。"])
+    assert.deepEqual(groundedIntent(message), {label:"plan",evidenceKind:"concrete_reschedule"}, message);
+  for (const message of ["我有点累了，想先休息，明天再接着说。", "先不聊了，明天再聊。",
+    "我先休息一下，晚点再聊。", "我的想法是：今天就聊到这里。"])
+    assert.deepEqual(groundedIntent(message), {label:"close_chat",evidenceKind:"conversation_pause"}, message);
+  for (const message of ["我没有把时间改到周五。", "时间没有改到明天。", "把字段改成明天。",
+    "会议改到明天的方案我不同意。", "如果会议改到周一，我就去。", "小王说，我们改到周二。",
+    "小王把会议改到周二了。", "他说我先休息一下，明天再聊。", "我先休息一下。", "我们没有说先不聊了。"])
+    assert.equal(groundedIntent(message), null, message);
+});
+
+it("an action request after its reason still outranks a question or courtesy", () => {
+  for (const message of ["有点多，可以帮我分担最后的整理吗？", "这个工具我弄不明白，能不能帮我看下？",
+    "我的想法是：给我一瓶无糖的，谢谢！", "你能不能帮我备份一下？"])
+    assert.deepEqual(groundedIntent(message), {label:"seek_help",evidenceKind:"action_request"}, message);
+  for (const message of ["小王问我，能不能帮我修一下。", "她说，给我一瓶无糖的。",
+    "我说的不是请你帮我修。", "没有让你帮我改。", '比如“请你帮我备份”。'])
+    assert.equal(groundedIntent(message), null, message);
+});
+
+it("preserves a condition of acceptance instead of reducing it to routine agreement", () => {
+  for (const message of ["愿意，只要提前确认交通和返程时间。", "可以，前提是把时间确认好。"])
+    assert.deepEqual(groundedIntent(message), {label:"agree",evidenceKind:"conditional_acceptance"}, message);
+  for (const message of ["不愿意，只要先确认时间。", "他说愿意，只要提前确认。", "如果可以，前提是时间合适。"])
+    assert.equal(groundedIntent(message), null, message);
+});
+
+it("advice and commitments survive narrative framing without grounding past actions", () => {
+  for (const message of ["先列出必须完成的事情，其余可以留到下次。",
+    "我的想法是：先列出必须完成的事情，其余可以留到下次。",
+    "暂时还说不准，最好问清楚，别替他下结论。", "可以，大家把想法写下来，我们再一起比较。"])
+    assert.deepEqual(groundedIntent(message), {label:"suggest_action",evidenceKind:"advice_marker"}, message);
+  for (const message of ["有一点，不过具体建议很有用，我会认真改。", "我负责查路线，晚点发安排。"])
+    assert.deepEqual(groundedIntent(message), {label:"plan",evidenceKind:"first_person_intention"}, message);
+  for (const message of ["小王说，先列出必须完成的事情。", "他建议，最好问清楚。",
+    "我昨天负责查路线。", "我已经改完了。"])
+    assert.notEqual(groundedIntent(message)?.label, "plan", message);
+});
+
+it("embedded questions stay statements while actual requests for answers remain available", () => {
+  for (const message of ["我在意实际能不能完成，也想听听大家的感受。", "我的想法是：我在意实际能不能完成。",
+    "我已经知道怎么备份。", "我们正在研究是否调整方案。"])
+    assert.equal(isEmbeddedQuestionStatement(message), true, message);
+  for (const message of ["你知道怎么备份吗？", "能不能帮我备份？", "这个周末有什么安排？", "我想知道怎么备份。"])
+    assert.equal(isEmbeddedQuestionStatement(message), false, message);
+});
+
+it("keeps the author's own action after a report without adopting an unquoted colon citation", () => {
+  for (const message of ["他说会议改到周三，但我建议先确认地点。", "小王说，会议改到周三。我建议先确认地点。",
+    '他说：“会议改到周三。”我建议先确认地点。'])
+    assert.deepEqual(groundedIntent(message), {label:"suggest_action",evidenceKind:"advice_marker"}, message);
+  assert.deepEqual(groundedIntent("他说我做得不够，不过我会认真改。"), {label:"plan",evidenceKind:"first_person_intention"});
+  for (const message of ["小王问我，我会不会帮他。", "他说：会议改到周三，但我建议先确认地点。"])
+    assert.equal(groundedIntent(message), null, message);
 });

@@ -59,6 +59,7 @@ function environment(ids) {
     addEventListener() {} };
   const window = { innerWidth: 1200, crypto: webcrypto, document,
     addEventListener: (name, handler) => { (listeners[name] ||= []).push(handler); },
+    dispatchEvent: event => { for (const handler of listeners[event.type] || []) handler(event); return true; },
     postMessage: data => { messages.push(json(data)); } };
   const context = vm.createContext({ window, document, localStorage: {
     getItem: key => storage.get(key) ?? null, setItem: (key, value) => {
@@ -67,6 +68,7 @@ function environment(ids) {
     removeItem: key => storage.delete(key) },
     setTimeout: handler => { const id = ++nextTimer; timers.set(id, handler); return id; },
     clearTimeout: id => timers.delete(id), URLSearchParams, Uint8Array, AbortController,
+    CustomEvent: class { constructor(type, options = {}) { this.type = type; this.detail = options.detail; } },
     alert() {}, confirm: () => true, fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }) });
   return { elements, listeners, storage, storageWrites, messages, timers, window, context,
     emit: event => (listeners.message || []).forEach(handler => handler(event)),
@@ -450,11 +452,11 @@ test("simple agent popover switches enabled template without management tabs or 
   await menu.children[1].dispatch("click"); await Promise.resolve();
   assert.equal(advisor.activeAgentId, "empathy"); assert.equal(menu.hidden, true);
 });
-test("original emoji button is restored and adviser has adjacent text command", () => {
+test("communication advice replaces the emoji entry while the adviser keeps its own command", () => {
   const appSource = readFileSync(path.join(root, "app.js"), "utf8");
-  const emojiHandler = appSource.split('byId("btnEmoji").addEventListener')[1].split("\n")[0];
-  assert.ok(emojiHandler.includes('byId("emojiPopover").classList.toggle("show")'));
-  assert.ok(!emojiHandler.includes("Advisor"));
+  assert.ok(!appSource.includes('byId("btnEmoji")'));
+  assert.ok(indexHtml.includes('id="btnToolbarGuidance"'));
+  assert.ok(indexHtml.indexOf('id="btnToolbarGuidance"') < indexHtml.indexOf('id="btnToggleIntent"'));
   assert.ok(indexHtml.includes('class="toolbar-text-btn" id="btnToolbarAdvisor"'));
   assert.ok(indexHtml.indexOf('id="btnToolbarAdvisor"') > indexHtml.indexOf('id="btnToolbarPersona"'));
   assert.ok(indexHtml.indexOf('id="btnToolbarAdvisor"') < indexHtml.indexOf('id="btnRetryAnalysis"'));
@@ -895,4 +897,51 @@ test("every assistant card can be deleted and repository omits engine and preset
   await advisor.deleteTemplate("advisor");
   assert.equal(advisor.catalog.agents.length, 0); assert.equal(advisor.activeAgentId, "");
   assert.equal(descendants(container, item => item.className === "advisor-repo-empty").length, 1);
+});
+
+test("reply context uses only the selected enabled assistant and reports catalog readiness", () => {
+  const env = host(), advisor = env.advisor;
+  advisor.activeAgentId = "advisor";
+  advisor.catalog = catalog();
+  assert.deepEqual(json(advisor.getReplyContext()), { ready: false, agentId: "", agentRevision: 0 });
+  ready(env);
+  assert.deepEqual(json(advisor.getReplyContext()), { ready: true, agentId: "advisor", agentRevision: 1 });
+  advisor.catalog.agents[0].enabled = false;
+  assert.deepEqual(json(advisor.getReplyContext()), { ready: true, agentId: "", agentRevision: 0 });
+});
+
+test("native assistant switches notify reply choices once and include the selected revision", () => {
+  const env = host(), advisor = ready(env), changes = [];
+  advisor.catalog.agents.push({ ...catalog().agents[0], id: "second", revision: 7 });
+  advisor.loadThread = async () => {};
+  env.window.addEventListener("advisor-selection-changed", event => changes.push(json(event.detail)));
+  advisor.syncTemplatesToFrame();
+  env.nativeEmit(request(env, "ADVISOR_SWITCH_TEMPLATE", { agentId: "second" }).data);
+  env.nativeEmit(request(env, "ADVISOR_SWITCH_TEMPLATE", { agentId: "second" }).data);
+  assert.deepEqual(changes, [
+    { ready: true, agentId: "advisor", agentRevision: 1 },
+    { ready: true, agentId: "second", agentRevision: 7 },
+  ]);
+});
+
+test("catalog edits, disabled fallbacks and deletion invalidate the reply context without extra model calls", async () => {
+  const env = host(), advisor = ready(env), changes = [], calls = [];
+  advisor.loadThread = async () => {};
+  env.window.addEventListener("advisor-selection-changed", event => changes.push(json(event.detail)));
+  advisor.syncTemplatesToFrame();
+  const changed = catalog(); changed.agents[0].revision = 2;
+  advisor.fetchJson = async url => { calls.push(url); return changed; };
+  await advisor.saveTemplate({ id: "advisor", name: "助手", prompt: "新的提示词", skillIds: [] });
+  const second = { ...changed.agents[0], id: "second", revision: 4 };
+  advisor.fetchJson = async url => { calls.push(url); return { ...catalog(), agents: [{ ...changed.agents[0], enabled: false }, second] }; };
+  await advisor.enableTemplate("advisor", false);
+  advisor.fetchJson = async url => { calls.push(url); return { ...catalog(), agents: [] }; };
+  await advisor.deleteTemplate("second");
+  assert.deepEqual(changes, [
+    { ready: true, agentId: "advisor", agentRevision: 1 },
+    { ready: true, agentId: "advisor", agentRevision: 2 },
+    { ready: true, agentId: "second", agentRevision: 4 },
+    { ready: true, agentId: "", agentRevision: 0 },
+  ]);
+  assert.deepEqual(calls, ["/api/advisor/templates", "/api/advisor/templates", "/api/advisor/templates"]);
 });

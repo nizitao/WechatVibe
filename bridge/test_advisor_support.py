@@ -7,9 +7,12 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
+from pathlib import Path
 
-from backend_contracts import LOCAL_SOURCE_ID, ModelSourceUnavailable
+from backend_contracts import AccountChangedError, LOCAL_SOURCE_ID, ModelSourceUnavailable
 from history_browser import encode_cursor
+from wechat_source import SourceBinding, WeChatSource
 
 
 def make_message(seq, shard="message__message_1.db", local_id=1, side="other",
@@ -42,6 +45,9 @@ class FakeSource:
         self.identity_hook = None
         self.page_hook = None
         self.page_delay = 0.0
+        self.lock = threading.RLock()
+        self.source_root = "C:/synthetic-source-root"
+        self.binding_generation = 0
 
     # -- fixtures ------------------------------------------------------------
     def add_messages(self, user, messages):
@@ -63,6 +69,43 @@ class FakeSource:
         if self.identity_hook is not None:
             return str(self.identity_hook()), self.workdir
         return self.account, self.workdir
+
+    def capture_binding(self, *, messages=True):
+        with self.lock:
+            verified = getattr(self, "verified_identity", None)
+            account, workdir = verified(messages=messages) if verified else self.identity()
+            return self._binding(account, workdir)
+
+    def _binding(self, account, workdir):
+        return SourceBinding(str(account), str(Path(workdir).resolve()), (self.source_root,),
+                             self.binding_generation + getattr(self, "advisor_binding_generation", 0))
+
+    binding_fingerprint = staticmethod(WeChatSource.binding_fingerprint)
+
+    def assert_binding(self, binding, *, messages=True, fresh=True):
+        with self.lock:
+            if fresh:
+                current = self.capture_binding(messages=messages)
+            else:
+                leased = getattr(self, "advisor_identity", None) or getattr(self, "verified_identity", None)
+                current = self._binding(*(leased(messages=messages) if leased else self.identity()))
+            if current != binding:
+                raise AccountChangedError()
+            return current.account, Path(current.workdir)
+
+    def invalidate_binding(self):
+        with self.lock:
+            self.binding_generation += 1
+
+    def switch_root(self, root):
+        with self.lock:
+            self.source_root = root
+            self.invalidate_binding()
+
+    @contextmanager
+    def binding_scope(self, binding):
+        self.assert_binding(binding)
+        yield
 
     def history_highwater(self, user):
         messages = sorted(self.users.get(user, []), key=lambda item: tuple(item["_sort"]))
@@ -107,12 +150,12 @@ class FakeModelStore:
         return {
             "selectedMode": "api",
             "sourceId": self.source_id,
-            "api": {"protocol": "chat_completions", "baseUrl": "http://127.0.0.1:9",
+            "api": {"id": self.source_id, "protocol": "chat_completions", "baseUrl": "http://127.0.0.1:9",
                     "model": "synthetic-model", "contextTokens": self.context_tokens,
                     "encryptedKey": "cipher-text"},
         }
 
-    def resolve_key(self, protocol, base_url, supplied_key):
+    def resolve_key(self, protocol, base_url, supplied_key, *, profile_id=None):
         return self.key
 
 

@@ -1,4 +1,6 @@
 # Keep chat UI text normalized in Git without changing binary or release inputs.
-chatui/*.html text
-chatui/*.css text
-chatui/*.js text
+# eol=lf is explicit: the repository, the working tree and the release inputs are all
+# LF, and without it git would rewrite these files as CRLF on Windows checkout.
+chatui/*.html text eol=lf
+chatui/*.css text eol=lf
+chatui/*.js text eol=lf

@@ -21,6 +21,65 @@ const REGISTRY_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnc
 const REG_EXE = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "reg.exe");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+function gateCommand(op, action, token) {
+  const saved = paths(op);
+  const roots = [op.installRoot, op.candidatePath, saved.backup, saved.failed];
+  const python = roots.map(root => path.join(root, "resources", "client", "runtime", "python", "python.exe"))
+    .find(file => fs.existsSync(file));
+  if (!python) fail("安装占用验证组件不可用");
+  const script = path.join(op.workDir, "helper", "installation_gate.py");
+  const args = [script, action, "--root", path.join(op.installRoot, "resources", "client"),
+    "--pid", String(process.pid), "--parent", String(op.parentPid)];
+  const env = { ...process.env, PYTHONDONTWRITEBYTECODE: "1", WECHATVIBE_UPDATE_CLAIM: token || "" };
+  try {
+    return JSON.parse(execFileSync(python, args, { windowsHide: true, encoding: "utf8", timeout: 20000,
+      maxBuffer: 65536, env }));
+  } catch (error) {
+    let result;
+    try { result = JSON.parse(String(error.stdout)); } catch (_) { /* safe generic error */ }
+    fail(result?.error || "无法确认其他窗口已退出，更新已停止");
+  }
+}
+function acquireInstallationClaim(op) { return gateCommand(op, "claim").token; }
+function releaseInstallationClaim(op, token) { gateCommand(op, "release", token); }
+
+async function withInstallationClaim(op, operationFile, overrides, operation, recovery = false) {
+  validateOperation(op, operationFile, { recovery });
+  const acquire = overrides.acquireInstallationClaim || acquireInstallationClaim;
+  const release = overrides.releaseInstallationClaim || releaseInstallationClaim;
+  const previousProfile = process.env.WECHATVIBE_PROFILE;
+  const previous = process.env.WECHATVIBE_UPDATE_CLAIM;
+  let token;
+  // Updates are an installation-wide operation initiated only by the default
+  // window. RunOnce must not inherit a profile from the reboot environment.
+  delete process.env.WECHATVIBE_PROFILE;
+  try {
+    token = await acquire(op);
+    process.env.WECHATVIBE_UPDATE_CLAIM = token;
+    return await operation(op, operationFile, overrides);
+  }
+  finally {
+    try { if (token !== undefined) await release(op, token); }
+    finally {
+      if (previous === undefined) delete process.env.WECHATVIBE_UPDATE_CLAIM;
+      else process.env.WECHATVIBE_UPDATE_CLAIM = previous;
+      if (previousProfile === undefined) delete process.env.WECHATVIBE_PROFILE;
+      else process.env.WECHATVIBE_PROFILE = previousProfile;
+    }
+  }
+}
+
+function checkPayloadCompatibility(op) {
+  const marker = path.join(op.installRoot, "resources", "client", ".local", "real-client-runtime", "payload-format.json");
+  if (!present(marker)) return;
+  const format = readJson(marker, 4096);
+  const candidate = readJson(path.join(op.candidatePath, "resources", "client", "package.json"), 65536);
+  if (format.schema !== 1 || format.payloadFormat !== "wv1:" ||
+      !Array.isArray(candidate.analysisPayloadFormats) || !candidate.analysisPayloadFormats.includes("wv1:")) {
+    fail("目标版本无法读取已加密的分析数据；请使用支持加密分析数据的版本");
+  }
+}
+
 function fail(message) { throw new Error(message); }
 function samePath(a, b) { return path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase(); }
 function present(file) { try { fs.lstatSync(file); return true; } catch (error) {
@@ -100,6 +159,7 @@ function version(value) {
 function validateOperation(op, operationFile, { recovery = false } = {}) {
   if (!op || typeof op !== "object" || Array.isArray(op) || op.schema !== 1 ||
       !["install", "rollback"].includes(op.action) ||
+      (op.profile !== undefined && op.profile !== null) ||
       !Number.isSafeInteger(op.parentPid) || op.parentPid <= 0 ||
       !Number.isSafeInteger(op.port) || op.port < 1 || op.port > 65535 ||
       !/^[a-f0-9]{64}$/.test(op.instanceId) ||
@@ -782,6 +842,9 @@ async function rollbackFiles(op, journal, deps, operationFile) {
   }
 }
 async function recoverOperation(op, operationFile, overrides = {}) {
+  return withInstallationClaim(op, operationFile, overrides, recoverOperationClaimed, true);
+}
+async function recoverOperationClaimed(op, operationFile, overrides = {}) {
   const deps = { portVacant, healthy, launchClient, launchFinalClient,
     waitForFinal, stopFinal: stopValidation, stopOwnedBridge,
     waitValidationStopped, waitFinalStopped, setRunOnce, clearRunOnce, runOnceAbsent,
@@ -821,6 +884,9 @@ async function recoverOperation(op, operationFile, overrides = {}) {
   return "rolled_back";
 }
 async function runOperation(op, operationFile, overrides = {}) {
+  return withInstallationClaim(op, operationFile, overrides, runOperationClaimed);
+}
+async function runOperationClaimed(op, operationFile, overrides = {}) {
   const deps = { waitParent, portVacant, healthy, launchClient, startBridge, copyData,
     launchValidation, waitForValidation, stopValidation,
     launchFinalClient, waitForFinal, stopFinal: stopValidation,
@@ -846,6 +912,7 @@ async function runOperation(op, operationFile, overrides = {}) {
   try {
     await waitVacant(op.port, deps.portVacant);
     validateCandidate(op.candidatePath, op.expectedVersion, op.action === "install");
+    checkPayloadCompatibility(op);
     if (present(paths(op).backup) || present(paths(op).failed)) fail("swap target already exists");
     const local = path.join(op.installRoot, "resources", "client", ".local");
     if (op.action === "install") {

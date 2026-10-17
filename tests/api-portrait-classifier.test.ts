@@ -7,7 +7,7 @@ import { classifyApiPortraitBatch, apiPortraitClassifierWireBudget,
   API_PORTRAIT_CLASSIFIER_TIMEOUT_MS,
   type ApiPortraitClassifierRequest } from "../electron/api-portrait-classifier";
 import { ANALYSIS_QUESTIONS } from "../electron/laya/options";
-import { API_PERSONALITY_QUESTIONS, personalityEvidenceFromAnswers } from "../electron/laya/personality";
+import { PERSONALITY_QUESTIONS, personalityEvidenceFromAnswers } from "../electron/laya/personality";
 import { STYLE_QUESTIONS, styleEvidenceFromAnswers } from "../electron/laya/style";
 import { EMOTION_BUCKETS, INTENT_FAMILIES, INTENT_GROUPS, INTENTS,
   emotionDetailQuestion, groupQuestion, leafQuestion, routeEmotion, routeIntent } from "../electron/laya/catalog";
@@ -28,7 +28,7 @@ const distribution = (name: string, values: Record<string, number> | number = 0)
   .map((label, index) => typeof values === "number" ? Number(index === values) : values[label] ?? 0);
 function ordinaryAnswers(): Record<string, number[]> {
   const answers: Record<string, number[]> = {};
-  for (const name of Object.keys({ ...ANALYSIS_QUESTIONS, ...API_PERSONALITY_QUESTIONS, ...STYLE_QUESTIONS }))
+  for (const name of Object.keys({ ...ANALYSIS_QUESTIONS, ...PERSONALITY_QUESTIONS, ...STYLE_QUESTIONS }))
     answers[name] = distribution(name);
   answers.relationship = distribution("relationship", 2);
   answers.emotion_detail_happy = distribution("emotion_detail_happy");
@@ -45,7 +45,7 @@ const fails = (code: string) => (error: unknown) => error instanceof ModelConnec
 
 /** Provider's simpler answer-supply protocol: no routing threshold or products. */
 function topTwoAnswers(full: Record<string, number[]>): Record<string, number[]> {
-  const result = Object.fromEntries(Object.keys({ ...ANALYSIS_QUESTIONS, ...API_PERSONALITY_QUESTIONS,
+  const result = Object.fromEntries(Object.keys({ ...ANALYSIS_QUESTIONS, ...PERSONALITY_QUESTIONS,
     ...STYLE_QUESTIONS }).map(name => [name, full[name]!]));
   const top = (values: number[]) => values.map((probability, index) => ({ probability, index }))
     .filter(value => value.probability > 0)
@@ -69,16 +69,14 @@ function topTwoAnswers(full: Record<string, number[]>): Record<string, number[]>
 const allChoiceAnswers = () => Object.fromEntries(Object.keys(API_PORTRAIT_CLASSIFIER_QUESTIONS)
   .map(name => [name, distribution(name)]));
 
-it("ships all 59 exact local questions in one API call and never generates a summary first", async () => {
-  // The API wording for MBTI differs from the local Laya questions on purpose: the
-  // option labels are identical, so the shared converter and evidence contract hold.
-  const expected = { ...ANALYSIS_QUESTIONS, ...API_PERSONALITY_QUESTIONS, ...STYLE_QUESTIONS };
+it("ships all 58 exact local questions in one API call and never generates a summary first", async () => {
+  const expected = { ...ANALYSIS_QUESTIONS, ...PERSONALITY_QUESTIONS, ...STYLE_QUESTIONS };
   for (const bucket of Object.keys(EMOTION_BUCKETS) as Array<keyof typeof EMOTION_BUCKETS>)
     expected[`emotion_detail_${bucket}`] = emotionDetailQuestion(bucket);
   for (const family of INTENT_FAMILIES) expected[`intent_group_${family.id}`] = groupQuestion(family.id);
   for (const group of INTENT_GROUPS) expected[`intent_detail_${group.id}`] = leafQuestion(group.id);
   assert.deepEqual(API_PORTRAIT_CLASSIFIER_QUESTIONS, expected);
-  assert.equal(Object.keys(expected).length, 59);
+  assert.equal(Object.keys(expected).length, 58);
   let calls = 0, sent: GenerationRequest | undefined;
   const batch = request(Array.from({ length: 100 }, (_, index) => `合成文本${index}`));
   const result = await classifyApiPortraitBatch(config, batch, fake(ordinaryAnswers(), value => {
@@ -124,7 +122,6 @@ it("reuses local routed weighting, relationship weights, style and personality c
   answers.intent_detail_conversation = distribution("intent_detail_conversation");
   answers.intent_detail_sharing = distribution("intent_detail_sharing");
   answers.relationship = [0.1, 0.5, 0.2, 0.1, 0.1];
-  answers.mbti_scope = [0.1, 0.9];
   answers.mbti_EI = [0.1, 0.2, 0.7];
   answers.mbti_SN = [0.2, 0.7, 0.1];
   answers.mbti_TF = [0.8, 0.1, 0.1];
@@ -161,12 +158,12 @@ it("reuses local routed weighting, relationship weights, style and personality c
   assert.equal(result.personalityEvidence!.TF.insufficient, 0.8);
 });
 
-it("retains local scope and insufficient choices instead of defaulting to a personality", async () => {
+it("scores axes independently without a self-report scope veto and keeps unknown axes empty", async () => {
   const answers = ordinaryAnswers();
   for (const axis of ["EI", "SN", "TF", "JP"]) answers[`mbti_${axis}`] = [0, 1, 0];
   let result = (await classifyApiPortraitBatch(config, request(), fake(answers))).result!;
-  assert.equal(result.personalityEvidence, null, "no recurring preference scope wins over confident axes");
-  answers.mbti_scope = [0, 1];
+  assert.deepEqual(result.personalityEvidence!.EI, { E: 1, I: 0, insufficient: 0 });
+  assert.equal(Object.hasOwn(API_PORTRAIT_CLASSIFIER_QUESTIONS, "mbti_scope"), false);
   for (const axis of ["EI", "SN", "TF", "JP"]) answers[`mbti_${axis}`] = [1, 0, 0];
   result = (await classifyApiPortraitBatch(config, request(), fake(answers))).result!;
   assert.equal(result.personalityEvidence, null, "all four insufficient answers stay unknown");
@@ -215,11 +212,8 @@ it("preserves TARGET/BACKGROUND and counts completed targets independently from 
 
 it("rejects a missing or all-zero base question and unusable JSON", async () => {
   for (const edit of [
-    (answer: Record<string, unknown>) => { delete answer.mbti_scope; },
-    (answer: Record<string, unknown>) => { answer.mbti_EI = [0, 0, 0]; },
-    (answer: Record<string, unknown>) => { answer.mbti_EI = { "not an option": 80 }; },
-    (answer: Record<string, unknown>) => { answer.mbti_EI = [0, true, 0]; },
-    (answer: Record<string, unknown>) => { answer.mbti_EI = [0, 1]; },
+    (answer: Record<string, unknown>) => { delete answer.relationship; },
+    (answer: Record<string, unknown>) => { answer.relationship = [0, 0, 0, 0, 0]; },
     (answer: Record<string, unknown>) => { answer.relationship = []; },
     (answer: Record<string, unknown>) => { answer.relationship = 1; },
   ]) {
@@ -239,7 +233,6 @@ it("rejects a missing or all-zero base question and unusable JSON", async () => 
 
 it("allows bounded decimal rounding but still applies local uncertainty comparisons", async () => {
   const answers = ordinaryAnswers();
-  answers.mbti_scope = [0, 1];
   answers.mbti_EI = [0.333, 0.333, 0.333];
   answers.mbti_SN = [0, 1, 0];
   const result = (await classifyApiPortraitBatch(config, request(), fake(answers))).result!;
@@ -322,7 +315,7 @@ it("covers stable broad/group ties and excludes zero-probability branches", asyn
   full.intent = distribution("intent", { "small talk": 1 });
   full.intent_group_small_talk = [1, 0, 0];
   supplied = topTwoAnswers(full);
-  assert.equal(Object.keys(supplied).length, 17);
+  assert.equal(Object.keys(supplied).length, 16);
   assert.equal(supplied.emotion_detail_affectionate, undefined);
   assert.equal(supplied.intent_group_share_news, undefined);
   assert.equal(supplied.intent_detail_conversation, undefined);
@@ -448,18 +441,41 @@ it("normalizes relative scores, and an exact-length array matches the same ratio
 
 it("accepts loose labels and numeric strings, and ignores negative or NaN weights", async () => {
   const arrays: Record<string, unknown> = ordinaryAnswers();
-  arrays.mbti_scope = [0, "4"];
   arrays.mbti_EI = ["0", -3, "80"];
   const maps: Record<string, unknown> = ordinaryAnswers();
-  maps.mbti_scope = { " No Enduring Preference Stated ": "0",
-    "SENDER STATES A RECURRING PERSONAL PREFERENCE": "4", extra: 9 };
-  maps.mbti_EI = { "no stated energy preference": "NaN",
+  maps.mbti_EI = { "insufficient energy preference evidence": "NaN",
     " outward interaction restores energy ": -3,
     "Inward Reflection Restores Energy": "80", bonus: null };
   const fromArrays = (await classifyApiPortraitBatch(config, request(), fake(arrays))).result!;
   const fromMaps = (await classifyApiPortraitBatch(config, request(), fake(maps))).result!;
   assert.deepEqual(fromArrays.personalityEvidence!.EI, { E: 0, I: 1, insufficient: 0 });
   assert.deepEqual(fromMaps.personalityEvidence, fromArrays.personalityEvidence);
+});
+
+it("preserves supported axes when another axis is omitted or unreadable", async () => {
+  for (const value of [undefined, [0, 0, 0], { "not an option": 80 }, [0, true, 0], [0, 1]]) {
+    const answers: Record<string, unknown> = ordinaryAnswers();
+    answers.mbti_SN = [0.1, 0.7, 0.2];
+    if (value === undefined) delete answers.mbti_EI;
+    else answers.mbti_EI = value;
+    const result = (await classifyApiPortraitBatch(config, request(), fake(answers))).result!;
+    assert.deepEqual(result.personalityEvidence!.EI, { E: 0, I: 0, insufficient: 1 });
+    assert.deepEqual(result.personalityEvidence!.SN, { S: 0.7, N: 0.2, insufficient: 0.1 });
+    assert.deepEqual(result.personalityEvidence!.TF, { T: 0, F: 0, insufficient: 1 });
+  }
+});
+
+it("allows grounded contextual preferences without converting routine acts into personality evidence", async () => {
+  let sent: GenerationRequest | undefined;
+  await classifyApiPortraitBatch(config, request(), fake(ordinaryAnswers(), value => { sent = value; }));
+  assert.match(sent!.system, /explicit long-term self-description is not required/);
+  for (const question of Object.values(PERSONALITY_QUESTIONS)) {
+    const instruction = toInternal(question).ins;
+    assert.match(instruction, /across distinct situations/);
+    assert.match(instruction, /Judge this axis independently/);
+    assert.match(instruction, /quotes, roleplay, other people's preferences/);
+    assert.match(instruction, /Repeated copies/);
+  }
 });
 
 it("skips a missing conditional branch and keeps the other scores in one call", async () => {

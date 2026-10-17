@@ -51,16 +51,18 @@ function installWithPython(python, script, archive, root) {
 }
 
 class ModelDownload {
-  constructor({ root, python, fetchImpl, enableFallback, onState }) {
+  constructor({ root, python, fetchImpl, enableFallback, onState, installImpl = installWithPython }) {
     this.root = path.resolve(root);
     this.python = python;
     this.fetchImpl = fetchImpl;
     this.enableFallback = enableFallback;
+    this.installImpl = installImpl;
     this.onState = onState || (() => {});
     this.asset = modelAsset(this.root);
     this.state = { phase: "idle", received: 0, total: this.asset.bytes };
     this.inFlight = null;
     this.abort = null;
+    this.cancelled = false;
   }
 
   publish(state) {
@@ -71,36 +73,81 @@ class ModelDownload {
   getState() { return { ...this.state }; }
 
   async downloadOnce(archive) {
-    this.abort = new AbortController();
-    const timer = setTimeout(() => this.abort.abort(), 30 * 60 * 1000);
+    const controller = new AbortController();
+    this.abort = controller;
+    const timer = setTimeout(() => controller.abort(), 30 * 60 * 1000);
     try {
-      const response = await this.fetchImpl(this.asset.url, {
-        headers: { Accept: "application/octet-stream", "User-Agent": "WechatVibe-model" },
-        signal: this.abort.signal,
-      });
-      if (!response.ok || !response.body) throw new Error("model download unavailable");
-      const reported = Number(response.headers.get("content-length"));
-      if (reported && reported !== this.asset.bytes) throw new Error("model download size changed");
-      const hash = crypto.createHash("sha256");
       let received = 0;
-      let lastReport = 0;
-      const progress = new Transform({ transform: (chunk, _encoding, done) => {
-        received += chunk.length;
-        if (received > this.asset.bytes) return done(new Error("model download exceeded pinned size"));
-        hash.update(chunk);
-        if (Date.now() - lastReport > 250) {
-          lastReport = Date.now();
-          this.publish({ phase: "downloading", received, total: this.asset.bytes });
+      if (fs.existsSync(archive)) {
+        const stat = fs.lstatSync(archive);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 ||
+            path.resolve(fs.realpathSync.native(archive)).toLowerCase() !== path.resolve(archive).toLowerCase()) {
+          throw new Error("model download path is unsafe");
         }
-        done(null, chunk);
-      } });
-      await pipeline(Readable.fromWeb(response.body), progress,
-        fs.createWriteStream(archive, { flags: "wx" }));
-      if (received !== this.asset.bytes || hash.digest("hex") !== this.asset.sha256) {
+        received = stat.size;
+        if (received > this.asset.bytes) {
+          fs.unlinkSync(archive);
+          received = 0;
+        }
+      }
+      let hash = crypto.createHash("sha256");
+      if (received) {
+        for await (const chunk of fs.createReadStream(archive)) {
+          if (this.cancelled) throw new Error("model download cancelled");
+          hash.update(chunk);
+        }
+      }
+      this.publish({ phase: "downloading", received, total: this.asset.bytes });
+      if (received < this.asset.bytes) {
+        const response = await this.fetchImpl(this.asset.url, {
+          headers: { Accept: "application/octet-stream", "Accept-Encoding": "identity",
+            "User-Agent": "WechatVibe-model", ...(received ? { Range: `bytes=${received}-` } : {}) },
+          signal: controller.signal,
+        });
+        if (!response.ok || !response.body) throw new Error("model download unavailable");
+        if (response.status === 206) {
+          const range = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(response.headers.get("content-range") || "");
+          if (!range || Number(range[1]) !== received || Number(range[2]) !== this.asset.bytes - 1 ||
+              Number(range[3]) !== this.asset.bytes) {
+            await response.body.cancel();
+            throw new Error("model download range changed");
+          }
+        } else if (response.status === 200) {
+          // Some proxies ignore Range. Replace the partial file, never append a full body.
+          received = 0;
+          hash = crypto.createHash("sha256");
+        } else {
+          await response.body.cancel();
+          throw new Error("model download response invalid");
+        }
+        const reported = response.headers.get("content-length");
+        if (reported !== null && Number(reported) !== this.asset.bytes - received) {
+          await response.body.cancel();
+          throw new Error("model download size changed");
+        }
+        let lastReport = 0;
+        const progress = new Transform({ transform: (chunk, _encoding, done) => {
+          received += chunk.length;
+          if (received > this.asset.bytes) return done(new Error("model download exceeded pinned size"));
+          hash.update(chunk);
+          if (Date.now() - lastReport > 250) {
+            lastReport = Date.now();
+            this.publish({ phase: "downloading", received, total: this.asset.bytes });
+          }
+          done(null, chunk);
+        } });
+        await pipeline(Readable.fromWeb(response.body), progress,
+          fs.createWriteStream(archive, { flags: received ? "a" : "w" }),
+          { signal: controller.signal });
+      }
+      if (received !== this.asset.bytes) throw new Error("model download incomplete; retry to resume");
+      if (hash.digest("hex") !== this.asset.sha256) {
+        fs.unlinkSync(archive);
         throw new Error("model download checksum mismatch");
       }
+      if (this.cancelled) throw new Error("model download cancelled");
       this.publish({ phase: "installing", received, total: this.asset.bytes });
-      await installWithPython(this.python, path.join(this.root, "bridge", "model_install.py"),
+      await this.installImpl(this.python, path.join(this.root, "bridge", "model_install.py"),
         archive, this.root);
       this.publish({ phase: "ready", received, total: this.asset.bytes });
     } finally {
@@ -111,30 +158,31 @@ class ModelDownload {
 
   async start() {
     if (this.inFlight) return this.inFlight;
+    this.cancelled = false;
     this.inFlight = (async () => {
       let archive;
       try {
         const local = ownedDirectory(this.root, ".local");
         const downloads = ownedDirectory(local, "model-downloads");
-        archive = path.join(downloads, ".laya-" + crypto.randomUUID() + ".zip");
+        const profile = crypto.createHash("sha256").update(process.env.WECHATVIBE_PROFILE || "default").digest("hex").slice(0, 16);
+        archive = path.join(downloads, `.laya-${this.asset.sha256}-${profile}.zip.part`);
         this.publish({ phase: "downloading", received: 0, total: this.asset.bytes });
         try { await this.downloadOnce(archive); }
         catch (error) {
-          if (fs.existsSync(archive)) fs.unlinkSync(archive);
-          if (this.state.phase !== "downloading" || !this.enableFallback ||
+          if (this.cancelled || this.state.phase !== "downloading" || !this.enableFallback ||
               !await this.enableFallback()) throw error;
           await this.downloadOnce(archive);
         }
         return this.getState();
       } catch (error) {
         const stage = this.state.phase;
-        this.publish({ phase: "failed", received: 0, total: this.asset.bytes,
+        this.publish({ phase: "failed", received: this.state.received, total: this.asset.bytes,
           stage,
           error: error instanceof Error ? error.message : "模型下载失败" });
         return this.getState();
       } finally {
         this.inFlight = null;
-        if (archive && fs.existsSync(archive)) {
+        if (this.state.phase === "ready" && archive && fs.existsSync(archive)) {
           try { fs.unlinkSync(archive); } catch (_) { /* Keep the failure state. */ }
         }
       }
@@ -142,7 +190,7 @@ class ModelDownload {
     return this.inFlight;
   }
 
-  cancel() { this.abort?.abort(); }
+  cancel() { this.cancelled = true; this.abort?.abort(); }
 }
 
 module.exports = { ModelDownload, modelAsset, ownedDirectory };

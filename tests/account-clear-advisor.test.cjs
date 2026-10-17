@@ -7,7 +7,8 @@ const vm = require('node:vm');
 
 const source = readFileSync(path.join(__dirname, '../chatui/app.js'), 'utf8');
 const start = source.indexOf('async function deleteManagedAccount()');
-const end = source.indexOf('\nasync function copyDraft(', start);
+const end = source.indexOf('\nasync function copyText(', start);
+assert.ok(start >= 0 && end > start, 'account-clear controller source boundaries must be present');
 
 test('current-account deletion clears Advisor using resolved account identity, not its public hash', async () => {
   const account = 'synthetic-current-account';

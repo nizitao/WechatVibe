@@ -50,6 +50,8 @@ function versionAt(root) {
 function deps(extra = {}) {
   const calls = [];
   return { calls, implementations: {
+    acquireInstallationClaim: async () => "synthetic-installation-claim",
+    releaseInstallationClaim: async () => {},
     waitParent: async () => calls.push("waitParent"),
     portVacant: async () => { calls.push("portVacant"); return true; },
     healthy: async () => { calls.push("healthy"); return true; },
@@ -119,6 +121,48 @@ function cleanup(parent) {
   fs.rmSync(absolute, { recursive: true, force: true });
 }
 async function main() {
+  {
+    const f = fixture();
+    try {
+      const d = deps({ acquireInstallationClaim: async () => { throw new Error("synthetic peer window is alive"); } });
+      await assert.rejects(runOperation(f.op, f.file, d.implementations), /peer window/);
+      assert.equal(versionAt(f.op.installRoot), OLD);
+      assert.equal(d.calls.length, 0, "peer rejection must happen before waiting, copying, or starting any client");
+    } finally { cleanup(f.parent); }
+  }
+  {
+    const f = fixture();
+    try {
+      put(path.join(f.op.installRoot, "resources", "client", ".local", "real-client-runtime", "payload-format.json"),
+        JSON.stringify({ schema: 1, payloadFormat: "wv1:" }));
+      let released = 0;
+      const d = deps({ copyData: () => { throw new Error("must not copy incompatible encrypted data"); },
+        releaseInstallationClaim: async () => { released++; } });
+      await assert.rejects(runOperation(f.op, f.file, d.implementations), /目标版本无法读取/);
+      assert.equal(versionAt(f.op.installRoot), OLD);
+      assert.equal(released, 1);
+      assert.equal(fs.existsSync(path.join(f.op.candidatePath, "resources", "client", ".local")), false);
+    } finally { cleanup(f.parent); }
+  }
+  {
+    const f = fixture();
+    try {
+      put(path.join(f.op.installRoot, "resources", "client", ".local", "real-client-runtime", "payload-format.json"),
+        JSON.stringify({ schema: 1, payloadFormat: "wv1:" }));
+      put(path.join(f.op.candidatePath, "resources", "client", "package.json"),
+        JSON.stringify({ name: "wechatvibe-runtime", version: NEW, analysisPayloadFormats: ["wv1:"] }));
+      let released = 0;
+      const d = deps({ copyData: (source, destination) => {
+        assert.equal(process.env.WECHATVIBE_UPDATE_CLAIM, "synthetic-installation-claim");
+        copyData(source, destination);
+      }, releaseInstallationClaim: async () => {
+        assert.equal(versionAt(f.op.installRoot), NEW);
+        released++;
+      } });
+      assert.equal(await runOperation(f.op, f.file, d.implementations), "succeeded");
+      assert.equal(released, 1);
+    } finally { cleanup(f.parent); }
+  }
   {
     const op = { workDir: path.join(os.tmpdir(), ".wechatvibe-update-fixture") };
     const name = "WechatVibeUpdate-.wechatvibe-update-fixture";
@@ -389,7 +433,22 @@ async function main() {
       let journal = JSON.parse(fs.readFileSync(path.join(f.op.workDir, "journal.json")));
       assert.equal(journal.phase, "rolled_back");
       assert.equal(journal.restoreGuiStarted, false);
-      assert.equal(await recoverOperation(f.op, f.file, deps().implementations), "rolled_back");
+      const priorProfile = process.env.WECHATVIBE_PROFILE;
+      process.env.WECHATVIBE_PROFILE = "synthetic-dirty-reboot-environment";
+      try {
+        const recovery = deps({ acquireInstallationClaim: async () => {
+          assert.equal(process.env.WECHATVIBE_PROFILE, undefined);
+          return "synthetic-installation-claim";
+        }, launchClient: async () => {
+          assert.equal(process.env.WECHATVIBE_PROFILE, undefined, "RunOnce recovery restarts only the default window");
+          return { pid: 77777 };
+        } });
+        assert.equal(await recoverOperation(f.op, f.file, recovery.implementations), "rolled_back");
+        assert.equal(process.env.WECHATVIBE_PROFILE, "synthetic-dirty-reboot-environment");
+      } finally {
+        if (priorProfile === undefined) delete process.env.WECHATVIBE_PROFILE;
+        else process.env.WECHATVIBE_PROFILE = priorProfile;
+      }
       journal = JSON.parse(fs.readFileSync(path.join(f.op.workDir, "journal.json")));
       assert.equal(journal.restoreGuiStarted, true);
     } finally { cleanup(f.parent); }

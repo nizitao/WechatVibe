@@ -5,7 +5,6 @@ import os
 import tempfile
 import threading
 import unittest
-from contextlib import nullcontext
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
@@ -13,6 +12,7 @@ from unittest.mock import patch
 from data_root_source import CUSTOM_ROOT_ENV, DataRootSource
 from real_backend import Backend
 from real_http import make_handler
+from model_source import ModelSourceStore
 
 
 class DataRootHttpTests(unittest.TestCase):
@@ -23,10 +23,13 @@ class DataRootHttpTests(unittest.TestCase):
         env = patch.dict(os.environ, {CUSTOM_ROOT_ENV: ""})
         env.start()
         self.addCleanup(env.stop)
-        backend = object.__new__(Backend)
-        backend.data_root_store = DataRootSource(self.root)
-        backend.request_lease = nullcontext
-        backend.source = None
+        # A complete service includes the source-cancellation coordinator even
+        # when no account is ready. No source/analyzer methods are available.
+        backend = Backend(None, analyzer=object(),
+                          data_root_store=DataRootSource(self.root),
+                          model_source_store=ModelSourceStore(self.root / "model-source.json",
+                                                              root=self.root))
+        self.addCleanup(backend.shutdown)
         self.backend = backend
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(backend))
         thread = threading.Thread(target=self.server.serve_forever, daemon=True)

@@ -78,6 +78,7 @@ class ApiSourceGuardTests(unittest.TestCase):
                     call()
                 except ModelSourceUnavailable as exc:  # pragma: no cover - the point of the test
                     self.fail(f"{name} stayed closed after the user chose an API source: {exc}")
+        self.assertTrue(self.backend.api_tasks.wait_for_idle(3))
         grew = {name: count for name, count in self.provider_counters().items()
                 if count != before.get(name, 0)}
         self.assertTrue(grew, "an accepted entry point should have reached the provider")

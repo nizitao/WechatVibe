@@ -398,6 +398,103 @@ class LiveKeyPreparationTests(unittest.TestCase):
             self.assertNotIn(key.hex(), public)
         self.assertIsNone(factory.preparation_status("other-synthetic-account"))
 
+    def test_a_transient_identity_failure_retries_long_before_a_full_backoff(self):
+        """Churn during an account change must not cost the full retry delay.
+
+        While WeChat is switching accounts, the ownership query behind
+        `active_account_snapshot` can raise before any memory is read. Retrying that after the
+        full backoff turned a few seconds of churn into a minute or more of "preparing".
+        """
+        factory = LiveWeChatFactory(retry_seconds=30)
+        flaky = patch("live_source.active_account_snapshot",
+                      side_effect=OSError(234, "file ownership changed repeatedly"))
+        with flaky, redirect_stderr(self.log):
+            with self.assertRaisesRegex(RuntimeError, "preparation pending"):
+                factory(db_dir=str(self.db_dir), account=self.account, selection=self.selection)
+        status = factory.preparation_status(self.account)
+        self.assertEqual(status["state"], "failed")
+        self.assertIn(status["reason"], live_source.TRANSIENT_PREPARATION_REASONS)
+        self.assertLessEqual(status["retryAfterSeconds"],
+                             live_source.TRANSIENT_RETRY_SECONDS + 1)
+
+    def test_a_scan_limit_keeps_the_full_retry_delay(self):
+        """A failure a retry cannot fix must keep the long backoff, not hammer the scan."""
+        def byte_limited(_pid, _pages, metrics):
+            metrics.update({"anchors": 0, "scan_bytes": live_source.CONFIG_SCAN_PASS_BYTES,
+                            "limit_hit": "byte_limit"})
+            return {}
+        factory = LiveWeChatFactory(retry_seconds=30)
+        with patch("live_source._scan_config_cipher_keys", side_effect=byte_limited), \
+                redirect_stderr(self.log):
+            with self.assertRaisesRegex(RuntimeError, "preparation pending"):
+                factory(db_dir=str(self.db_dir), account=self.account, selection=self.selection)
+        status = factory.preparation_status(self.account)
+        self.assertEqual(status["reason"], "scan_limit")
+        self.assertGreater(status["retryAfterSeconds"], live_source.TRANSIENT_RETRY_SECONDS)
+
+    def test_transient_retry_is_bounded_then_recovers_without_restarting(self):
+        factory = LiveWeChatFactory(retry_seconds=30, transient_retry_seconds=2)
+        with patch("live_source.time.monotonic", return_value=100.0) as clock, \
+                patch("live_source._scan_config_cipher_keys", return_value=self.keys) as scan, \
+                redirect_stderr(self.log):
+            with patch("live_source.active_account_snapshot", side_effect=OSError("synthetic churn")):
+                with self.assertRaisesRegex(RuntimeError, "preparation pending"):
+                    factory(db_dir=str(self.db_dir), account=self.account, selection=self.selection)
+            for _ in range(12):
+                with self.assertRaisesRegex(RuntimeError, "preparation pending"):
+                    factory(db_dir=str(self.db_dir), account=self.account, selection=self.selection)
+            self.assertEqual(scan.call_count, 0, "status polling must not hammer the scanner")
+            clock.return_value = 102.01
+            with self.assertRaisesRegex(RuntimeError, "preparation pending"):
+                factory(db_dir=str(self.db_dir), account=self.account, selection=self.selection)
+            reader = factory(db_dir=str(self.db_dir), account=self.account, selection=self.selection)
+            self.assertTrue(reader.messages_ready)
+            self.assertEqual(scan.call_count, 1)
+            self.assertEqual(factory.preparation_status(self.account)["reason"], "ready")
+
+
+    def prepare_with_locator(self, found, locator):
+        factory = LiveWeChatFactory(retry_seconds=30, locator=locator)
+        with patch("live_source._scan_config_cipher_keys", return_value=found), \
+                redirect_stderr(self.log):
+            with self.assertRaisesRegex(RuntimeError, "preparation pending"):
+                factory(db_dir=str(self.db_dir), account=self.account,
+                        selection=self.selection)
+        return factory
+
+    def other_selection(self):
+        return ActiveSelection((self.location.parent / "another-account").resolve(),
+                               ((54321, 100.0),))
+
+    def test_scan_follows_an_injected_locator_that_stops_matching(self):
+        """A pinned scan must be judged by its own locator, never by the shared snapshot.
+
+        The patched `active_account_snapshot` in this fixture still returns `self.selection`,
+        so a scan that ignored the injected locator would succeed here and this test would
+        fail. That inversion is the point: it guards the pinned instance against the
+        permanent `account_changed` deadlock where every request 503s forever.
+        """
+        factory = self.prepare_with_locator(self.keys, lambda: self.other_selection())
+        self.assertIn("result=account_changed", self.log.getvalue())
+        for slot in factory.slots.values():
+            self.assertFalse(slot.keys)
+
+    def test_scan_follows_an_injected_locator_that_keeps_matching(self):
+        factory = self.prepare_with_locator(self.keys, lambda: self.selection)
+        reader = factory(db_dir=str(self.db_dir), account=self.account,
+                         selection=self.selection)
+        self.assertIsInstance(reader, VolatileKeyWeChatDB)
+        self.assertEqual(reader._keys, self.keys)
+
+    def test_scan_treats_a_raising_locator_as_changed(self):
+        def failing():
+            raise RuntimeError("locator unavailable")
+
+        factory = self.prepare_with_locator(self.keys, failing)
+        self.assertIn("result=account_changed", self.log.getvalue())
+        for slot in factory.slots.values():
+            self.assertFalse(slot.keys)
+
 
 if __name__ == "__main__":
     unittest.main()

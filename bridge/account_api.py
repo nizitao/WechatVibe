@@ -10,16 +10,24 @@ from pathlib import Path
 
 from account_store import AccountConflict, AccountStore, account_id, _check_root, _regular
 from snapshot_cache import try_forget_account, wait_forget_account
+from account_leases import AccountLeaseRegistry
 
 
 class AccountAPI:
-    def __init__(self, backend, data_dir, snapshot_root=None, stable_keys_dir=None):
+    def __init__(self, backend, data_dir, snapshot_root=None, stable_keys_dir=None,
+                 runtime_dir=None):
         self.backend = backend
         self.store = AccountStore(data_dir, snapshot_root, stable_keys_dir)
+        self.account_leases = getattr(backend.source, "account_leases", None)
+        if self.account_leases is None:
+            self.account_leases = AccountLeaseRegistry(lease_root=self.store.snapshot_root / ".wechatvibe-leases")
         self.lock = threading.RLock()
         self.registered = {}
         self.deleting = False
-        self.runtime_dir = Path(data_dir).resolve().parent / "real-client-runtime"
+        # A second instance must not see the first one's recovery marker, so a profiled
+        # bridge passes its own directory here.
+        self.runtime_dir = (Path(runtime_dir).resolve() if runtime_dir is not None
+                            else Path(data_dir).resolve().parent / "real-client-runtime")
         self.no_recovery_marker = self.runtime_dir / "no-auto-recovery.json"
 
     def _mark_no_recovery(self):
@@ -86,6 +94,13 @@ class AccountAPI:
             return self.store.list(self._live_account())
 
     def delete(self, identifier):
+        # The lease spans every guard, writer drain and deletion. Checking once
+        # and releasing before deletion would permit another profile to start.
+        account = self.store.resolve(identifier)["account"]
+        with self.account_leases.hold(account):
+            return self._delete_owned(identifier)
+
+    def _delete_owned(self, identifier):
         source = self.backend.source
         with self.lock:
             if self.deleting:

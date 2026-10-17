@@ -75,6 +75,7 @@ REQUIRED_FILES = extractor.REQUIRED_FILES
 ALLOWED_PUBLIC_KEY = ("resources", "client", "scripts", "update-signing.pub")
 ASAR_SCRIPTS = (
     "scripts/desktop-main.cjs",
+    "scripts/runtime-paths.cjs",
     "scripts/real-client-shell.cjs",
     "scripts/real-client-preload.cjs",
     "scripts/real-client-recovery.cjs",

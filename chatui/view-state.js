@@ -17,7 +17,9 @@
         requestedConversations: new Set(),
         selectionLoadedAccount: null,
         conversationSelectionBusy: false,
+        conversationSelectionGeneration: 0,
         sessionCache: new Map(),
+        // Unsent composer input is account/conversation scoped and memory-only.
         historyState: null,
         historyRequest: 0,
         historyController: null,
@@ -66,9 +68,13 @@
         requestedRecentSignatures: new Set(),
         recentPending: false,
         intentActionState: "idle",
+        intentRequestScope: null,
         intentFeedbackTimer: null,
         manualRecentAwaitingPost: false,
         manualRecentJobId: null,
+        // Remembered across a deferred start so a user click still reports back
+        // once the first analysis snapshot or the Laya model becomes ready.
+        manualRecentUserInitiated: false,
         manualRecentDeferred: false,
         recentNetworkFailed: false,
         selectedAnalysisTimer: null,
@@ -96,6 +102,7 @@
         analysisNetworkFailed: false,
         activeMember: "",
         profilePending: false,
+        localProfilePollTimer: null,
         groupMembers: [],
         renderedProfileKey: null,
         renderedProfileSignature: null,

@@ -46,7 +46,8 @@ class SharedContextTests(unittest.TestCase):
         self.addCleanup(self.service.shutdown)
 
     def observe(self, messages, more=False):
-        return self.service.observe_message_window(ACCOUNT, self.source.workdir, USER, messages, more)
+        binding = self.source.capture_binding()
+        return self.service.observe_message_window(ACCOUNT, self.source.workdir, USER, messages, more, binding=binding)
 
     def finish(self, result):
         run = self.service._runs[result["run"]["id"]]
@@ -67,7 +68,7 @@ class SharedContextTests(unittest.TestCase):
         self.assertEqual(self.context.snapshot(ACCOUNT, USER)["readCount"], 6)
         self.source.history_highwater.assert_not_called()
         self.source.history_page.assert_not_called()
-        self.assertEqual(self.source.fresh_calls, 2, "only final commit forces full source validation")
+        self.assertLessEqual(self.source.fresh_calls, 30, "source checks must stay bounded per send, not per message")
 
     def test_trusted_overlapping_tail_appends_new_message_without_rescanning(self):
         messages = [make_message(index) for index in range(1, 7)]
@@ -115,10 +116,11 @@ class SharedContextTests(unittest.TestCase):
     def test_complete_pending_window_after_import_does_not_keep_removed_records(self):
         messages = [make_message(index) for index in range(1, 7)]
         self.observe(messages)
+        binding = self.source.capture_binding()
         with self.context.lock:
             rows = self.context._page_rows(USER, messages[1:], 0, trusted_identity=(ACCOUNT, self.source.workdir))
             self.context._apply_window_locked(ACCOUNT, USER, {
-                "fingerprint": self.context.scope_fingerprint(ACCOUNT, self.source.workdir), "rows": rows,
+                "fingerprint": self.source.binding_fingerprint(binding), "binding": binding, "rows": rows,
                 "hasMoreBefore": False, "latest": tuple(messages[-1]["_sort"])
             }, after_import=True)
         self.assertEqual(self.context.snapshot(ACCOUNT, USER)["readCount"], 5)

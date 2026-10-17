@@ -125,8 +125,24 @@ it("every grounded label has a generic Chinese display label", () => {
   assert.equal(Object.prototype.hasOwnProperty.call(GROUNDED_INTENT_LABELS, "喊老板"), false);
 });
 
-it("generic-v9 offers bounded, readable candidate menus instead of the same four defaults", () => {
-  assert.equal(GENERAL_LABEL_SCHEMA, "generic-v9");
+it("offers negation and clarification candidates before filling routine defaults", () => {
+  for (const [message, expected] of [
+    ["不是，我也很喜欢和熟悉的人一起出去。", ["否认", "澄清"]],
+    ["我没有说不去，只是需要晚一点。", ["纠正或异议", "澄清"]],
+    ["我不是生你的气，是觉得沟通有点累。", ["纠正或异议", "澄清"]],
+    ["那是小李的想法，我其实愿意参加。", ["澄清"]],
+  ] as const) {
+    const criteria = generalIntentQuestion(message).question.criteria;
+    for (const label of expected) assert.ok(criteria.includes(label), `${message}: ${label}`);
+    assert.ok(criteria.length <= 10);
+  }
+  for (const message of ['他说：“不是，我喜欢出去。”', "如果我没有说不去，只是晚一点呢？", "这不是我喜欢的颜色。"])
+    assert.ok(!generalIntentQuestion(message).question.criteria.includes("否认"), message);
+  assert.ok(!generalIntentQuestion("让我再想想，我暂时没有把握。").question.criteria.includes("拒绝"));
+});
+
+it("generic-v11 offers bounded, readable candidate menus instead of the same four defaults", () => {
+  assert.equal(GENERAL_LABEL_SCHEMA, "generic-v11");
   assert.ok(INTENTS.length >= 35 && INTENTS.length <= 50);
   const cases: Array<[string, string[]]> = [
     ["截图", ["展示内容"]],
@@ -209,4 +225,23 @@ it("common colloquial acts enter the candidate menu without forcing a plan or bo
   assert.ok(labels("周六电影，还是算了。").includes("拒绝"));
   assert.ok(!labels("周六电影，还是照常去吧。").includes("拒绝"));
   assert.ok(!labels("他说还是算了。").includes("拒绝"));
+});
+
+it("action candidates survive framing and do not mistake a statement for a question", () => {
+  for (const [text, expected] of [
+    ["下午不太方便，我们改到周日上午吧。", "计划"],
+    ["我有点累了，想先休息，明天再接着说。", "告别"],
+    ["有点多，可以帮我分担最后的整理吗？", "求助"],
+    ["我的想法是：先列出必须完成的事情，其余可以留到下次。", "建议或指令"],
+    ["慢点来，不着急。", "关心"],
+  ]) {
+    const criteria = generalIntentQuestion(text, "这次有什么安排？").question.criteria;
+    assert.ok(criteria.includes(expected), `${text}: ${expected}`);
+    assert.ok(criteria.length >= 8 && criteria.length <= 10);
+  }
+  for (const text of ["我在意实际能不能完成，也想听听大家的感受。", "我的想法是：我在意实际能不能完成。"])
+    assert.ok(!generalIntentQuestion(text).question.criteria.includes("提问"), text);
+  const suggestion = generalIntentQuestion("我的想法是：先列出必须完成的事情，其余可以留到下次。",
+    "这次有什么安排？").question.criteria;
+  assert.ok(!suggestion.includes("拒绝"));
 });

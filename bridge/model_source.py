@@ -62,7 +62,7 @@ def connection_values(request, require_model=False):
     """Validate user-controlled endpoint fields before handing them to an SDK."""
     if not isinstance(request, dict):
         raise ValueError("invalid model source request")
-    allowed = {"protocol", "baseUrl", "apiKey", "model", "contextTokens"} if require_model else {"protocol", "baseUrl", "apiKey"}
+    allowed = {"protocol", "baseUrl", "apiKey", "model", "contextTokens", "profileId"} if require_model else {"protocol", "baseUrl", "apiKey", "profileId"}
     required = {"protocol", "baseUrl", "model"} if require_model else {"protocol", "baseUrl"}
     if not required <= request.keys() or not request.keys() <= allowed:
         raise ValueError("invalid model source request")
@@ -92,6 +92,10 @@ def connection_values(request, require_model=False):
             raise ValueError("invalid apiKey")
         supplied_key = supplied_key or None
     result = {"protocol": protocol, "baseUrl": base_url, "apiKey": supplied_key}
+    if "profileId" in request:
+        if not _is_hex32(request["profileId"]):
+            raise ValueError("invalid profileId")
+        result["profileId"] = request["profileId"]
     if require_model:
         result["model"] = _text(request["model"], "model", MAX_MODEL_ID).strip()
         if not result["model"]:
@@ -223,6 +227,20 @@ class ModelSourceStore:
         else:
             source_ids = _MISSING
         profiles = self._decode_profiles(raw, raw["version"])
+        if raw["version"] == 1:
+            # Preserve valid historical cache identities. Legacy duplicate identities
+            # are ambiguous: the active endpoint owns its ID, other collisions are
+            # ignored rather than making a readable configuration unusable.
+            active = profiles[0]
+            current = _source_fingerprint(active["protocol"], active["baseUrl"], active["model"])
+            source_ids = {current: source_id}
+            legacy_ids = raw.get("sourceIds")
+            if isinstance(legacy_ids, dict):
+                for fingerprint, value in legacy_ids.items():
+                    if (isinstance(fingerprint, str) and len(fingerprint) == 64 and
+                            not set(fingerprint) - _HEX and _is_hex32(value) and
+                            fingerprint not in source_ids and value not in source_ids.values()):
+                        source_ids[fingerprint] = value
         saved = {"profiles": profiles, "sourceId": source_id, "selectedMode": selected_mode}
         if source_ids is not _MISSING:
             saved["sourceIds"] = source_ids
@@ -251,8 +269,25 @@ class ModelSourceStore:
         """Intent for startup restore; never proof that the worker switched."""
         with self.lock:
             saved = self._read()
-        return saved or {"selectedMode": "local", "api": None, "profiles": [],
-                         "sourceId": LOCAL_SOURCE_ID}
+            if saved:
+                api = saved["api"]
+                return {**saved, "profileId": saved["sourceId"],
+                        "sourceId": self._source_ids(saved).get(_source_fingerprint(
+                            api["protocol"], api["baseUrl"], api["model"]), api["id"])
+                        if api else LOCAL_SOURCE_ID}
+        return {"selectedMode": "local", "api": None, "profiles": [],
+                "profileId": None, "sourceId": LOCAL_SOURCE_ID}
+
+    def profile_source_id(self, profile_id):
+        """Inference cache identity, independent of the editable profile's stable ID."""
+        with self.lock:
+            saved = self._read()
+            profile = next((item for item in (saved["profiles"] if saved else [])
+                            if item["id"] == profile_id), None)
+            if profile is None:
+                raise ValueError("invalid profileId")
+            fingerprint = _source_fingerprint(profile["protocol"], profile["baseUrl"], profile["model"])
+            return self._source_ids(saved).get(fingerprint, profile["id"])
 
     @staticmethod
     def _public_profile(profile):
@@ -272,7 +307,7 @@ class ModelSourceStore:
                          "contextTokens": active["contextTokens"],
                          "hasKey": bool(active["encryptedKey"])} if active else None),
                 "profiles": [self._public_profile(item) for item in profiles],
-                "label": active["name"] if active else LOCAL_SOURCE_LABEL,
+                "label": active["name"] if mode == "api" and active else LOCAL_SOURCE_LABEL,
                 "sourceId": source_id, "status": status}
 
     def profile(self, profile_id):
@@ -292,19 +327,33 @@ class ModelSourceStore:
             saved = self._read()
             if not saved:
                 return None
-            profile_id = self._source_ids(saved).get(
-                _source_fingerprint(protocol, base_url, model))
-        return self.profile(profile_id) if profile_id else None
+            candidates = ([saved["api"]] if saved["api"] else []) + saved["profiles"]
+            found = next((item for item in candidates if
+                          (item["protocol"], item["baseUrl"], item["model"]) ==
+                          (protocol, base_url, model)), None)
+            return dict(found) if found else None
 
-    def resolve_key(self, protocol, base_url, supplied_key):
-        """A blank field can reuse a key only for a profile on its original
-        protocol and host/path; the active profile wins when several match."""
+    def resolve_key(self, protocol, base_url, supplied_key, *, profile_id=_MISSING):
+        """Explicit profile edits only reuse that profile's own key at the same endpoint.
+
+        Passing None denotes a new profile. Omitted profile_id retains the legacy
+        connection-only API; it is never used by profile creation/editing routes.
+        """
         if supplied_key is not None:
             return supplied_key
         with self.lock:
             saved = self._read()
             if not saved:
                 return None
+            if profile_id is not _MISSING:
+                if profile_id is None:
+                    return None
+                target = next((item for item in saved["profiles"] if item["id"] == profile_id), None)
+                if target is None:
+                    raise ValueError("invalid profileId")
+                if (target["protocol"], target["baseUrl"]) != (protocol, base_url):
+                    return None
+                return self._decrypted_key(target["encryptedKey"]) if target["encryptedKey"] else None
             active = saved["api"]
             ordered = ([active] if active else []) + [item for item in saved["profiles"]
                                                        if item is not active]
@@ -351,11 +400,12 @@ class ModelSourceStore:
         else:
             profiles[index].update(fields)
             profile_id = profiles[index]["id"]
-        # A profile owns exactly one fingerprint, so editing its endpoint or model must
-        # not leave the previous identity in the map.
-        source_ids = {fingerprint: value for fingerprint, value in source_ids.items()
-                      if value != profile_id}
-        source_ids[_source_fingerprint(protocol, base_url, model)] = profile_id
+        # Cache identity belongs to the actual inference endpoint/model, not the
+        # profile row. Retain old identities so m1 -> m2 -> m1 restores m1's cache.
+        fingerprint = _source_fingerprint(protocol, base_url, model)
+        if fingerprint not in source_ids:
+            source_ids[fingerprint] = (profile_id if profile_id not in source_ids.values()
+                                       else uuid.uuid4().hex)
         return profiles, profile_id, source_ids
 
     def _write_document(self, profiles, source_id, selected_mode, source_ids):
@@ -371,20 +421,25 @@ class ModelSourceStore:
         with self.lock:
             saved = self._read()
             source_ids = self._source_ids(saved)
-            known = {item["id"] for item in (saved["profiles"] if saved else [])}
             fingerprint = _source_fingerprint(protocol, base_url, model)
+            existing = self.profile_for_endpoint(protocol, base_url, model)
+            profile_id = existing["id"] if existing else None
             mapped = source_ids.get(fingerprint)
-            profile_id = mapped if mapped in known else source_id
+            if source_id is not None and (not _is_hex32(source_id) or
+                    source_id in source_ids.values() and mapped != source_id):
+                raise ValueError("invalid sourceId")
             if profile_id is not None:
                 if not _is_hex32(profile_id):
                     raise ValueError("invalid sourceId")
-                if profile_id in source_ids.values() and mapped != profile_id:
-                    raise ValueError("duplicate sourceId")
             profiles, profile_id, source_ids = self._upsert_profile(
                 saved, profile_id, profile_name(None, model), protocol, base_url, model,
                 key, context_tokens)
+            if source_id is not None:
+                if mapped is not None and mapped != source_id:
+                    raise ValueError("invalid sourceId")
+                source_ids[fingerprint] = source_id
             self._write_document(profiles, profile_id, "api", source_ids)
-            return profile_id
+            return source_ids[fingerprint]
 
     def save_profile(self, profile_id, name, protocol, base_url, model, key, context_tokens):
         """Create or update one profile. The active selection never changes here."""
@@ -417,8 +472,7 @@ class ModelSourceStore:
             if not saved or len(profiles) == len(saved["profiles"]):
                 raise ValueError("invalid profileId")
             was_active = saved["sourceId"] == profile_id
-            source_ids = {fingerprint: value for fingerprint, value
-                          in self._source_ids(saved).items() if value != profile_id}
+            source_ids = self._source_ids(saved)
             self._write_document(profiles, saved["sourceId"],
                                  "local" if was_active else saved["selectedMode"], source_ids)
             return was_active
@@ -456,6 +510,27 @@ class ModelSourceStore:
         self._check_path(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._check_path(self.path)
+        previous = self._read_json(self.path)
+        if isinstance(previous, dict) and previous.get("version") == 1:
+            backup = self.path.with_name(self.path.name + ".before-profiles-v2.bak")
+            self._check_path(backup)
+            pending_backup = backup.with_name(backup.name + "." + uuid.uuid4().hex + ".tmp")
+            try:
+                with pending_backup.open("x", encoding="utf-8") as stream:
+                    json.dump(previous, stream, ensure_ascii=False, separators=(",", ":"))
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                # Publish only a complete durable backup, without replacing one
+                # produced by an earlier migration or another process.
+                os.link(pending_backup, backup)
+            except FileExistsError:
+                if self._read_json(backup) != previous:
+                    raise ModelSourceUnavailable("model settings migration backup differs") from None
+            except OSError as exc:
+                raise ModelSourceUnavailable("model settings migration backup unavailable") from exc
+            finally:
+                pending_backup.unlink(missing_ok=True)
         temporary = self.path.with_name(self.path.name + "." + uuid.uuid4().hex + ".tmp")
         try:
             with temporary.open("x", encoding="utf-8") as stream:

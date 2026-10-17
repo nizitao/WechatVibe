@@ -20,7 +20,7 @@ import json
 import os
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 from advisor_contracts import (
     COMPACT_CHUNK_CHARS, COMPRESSION_VERSION, MAX_SUMMARY_CHARS,
@@ -61,9 +61,10 @@ def _friendly_error(exc):
 
 
 class _Import:
-    def __init__(self, cancel, thread):
+    def __init__(self, cancel, thread, binding):
         self.cancel = cancel
         self.thread = thread
+        self.binding = binding
 
 
 class ContextProjection:
@@ -99,50 +100,63 @@ class ContextProjection:
         return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
 
     def source_scope(self, account, fresh=False):
-        identity = self._identity(fresh=fresh)
-        if identity[0] != account:
+        binding = self.capture_binding(account)
+        return self.source.binding_fingerprint(binding)
+
+    def capture_binding(self, account):
+        binding = self.source.capture_binding(messages=True)
+        if str(binding.account) != account:
             raise AccountChangedError()
-        return self.scope_fingerprint(*identity)
+        return binding
 
-    def _binding_key(self, fingerprint):
-        return fingerprint, getattr(self.source, "advisor_binding_generation", 0)
+    def _binding_key(self, fingerprint, binding):
+        return fingerprint, binding
 
-    def _check_identity(self, account, expected=None):
-        current = self.source_scope(account)
+    def _check_identity(self, account, expected=None, binding=None, fresh=False):
+        if binding is None:
+            binding = self.capture_binding(account)
+        self.source.assert_binding(binding, messages=True, fresh=fresh)
+        if str(binding.account) != account:
+            raise AccountChangedError()
+        current = self.source.binding_fingerprint(binding)
         if expected is not None and current != expected:
             raise AccountChangedError()
         return current
 
-    def _check_open(self, account, cancel=None, expected=None):
+    def _check_open(self, account, cancel=None, expected=None, binding=None, fresh=False):
         if self._closed or account in self._paused or (cancel is not None and cancel.is_set()):
             raise AdvisorError("stopping", "已停止")
-        return self._check_identity(account, expected)
+        return self._check_identity(account, expected, binding, fresh=fresh)
 
-    def highwater(self, account, user):
+    def highwater(self, account, user, binding=None):
         """Read a fixed source highwater with identity checks on both sides."""
-        self._check_identity(account)
+        binding = binding or self.capture_binding(account)
+        self._check_identity(account, binding=binding)
         try:
             highwater = self.source.history_highwater(user)
         finally:
-            self._check_identity(account)
+            self._check_identity(account, binding=binding)
         return highwater
 
     # -- public API ----------------------------------------------------------
-    def observe_window(self, account, workdir, user, messages, has_more_before):
+    def observe_window(self, account, workdir, user, messages, has_more_before, binding):
         """Accept only the backend's already-verified decoded latest message window."""
         if type(has_more_before) is not bool or not isinstance(messages, (list, tuple)):
             raise AdvisorError("invalid-request", "会话窗口结构无效")
         scope = (account, os.path.normcase(os.path.realpath(str(workdir))))
-        fingerprint = self.scope_fingerprint(*scope)
+        if scope[1] != os.path.normcase(os.path.realpath(str(binding.workdir))):
+            raise AccountChangedError()
+        fingerprint = self._check_identity(account, binding=binding)
         rows = self._page_rows(user, messages, 0, trusted_identity=scope)
         positions = [_decode_position(row["sort_key"]) for row in rows]
         if (len({row["msg_id"] for row in rows}) != len(rows) or
                 any(previous >= current for previous, current in zip(positions, positions[1:]))):
             raise AdvisorError("context-error", "会话窗口顺序无效")
-        observation = {"fingerprint": fingerprint, "rows": rows, "hasMoreBefore": has_more_before,
+        observation = {"fingerprint": fingerprint, "binding": binding, "rows": rows, "hasMoreBefore": has_more_before,
                        "latest": positions[-1] if positions else None}
         key = (account, user)
-        with self.lock:
+        with self.lock, self.source.lock:
+            self._check_identity(account, fingerprint, binding, fresh=True)
             if self._closed or account in self._paused:
                 return False
             database = self.stores.account(account)
@@ -150,12 +164,14 @@ class ContextProjection:
             if entry is not None and entry.thread.is_alive():
                 self._pending_windows[key] = observation
                 self._observed.pop(key, None)
-                if database.context(user)["source_id"] != fingerprint:
+                if entry.binding != binding:
                     entry.cancel.set()
                 return True
             return self._apply_window_locked(account, user, observation)
 
     def _apply_window_locked(self, account, user, observation, after_import=False):
+        binding = observation["binding"]
+        self._check_identity(account, observation["fingerprint"], binding)
         key = (account, user)
         database = self.stores.account(account)
         row = database.context(user)
@@ -178,7 +194,7 @@ class ContextProjection:
                          (newest is None or _decode_position(row["highwater"]) is not None and
                           newest <= _decode_position(row["highwater"])))
         if older_pending:
-            self._observed[key] = self._binding_key(fingerprint)
+            self._observed[key] = self._binding_key(fingerprint, binding)
             self._pending_windows.pop(key, None)
             return True
         rollback = row is not None and previous is not None and (newest is None or newest < previous)
@@ -187,7 +203,7 @@ class ContextProjection:
             database.context_append_page(user, rows, _encode_position(newest), _encode_position(newest))
             current = database.context(user)
             database.context_finish(user, current["read_count"])
-            self._observed[key] = self._binding_key(fingerprint)
+            self._observed[key] = self._binding_key(fingerprint, binding)
             self._pending_windows.pop(key, None)
             self.condition.notify_all()
             return True
@@ -200,7 +216,7 @@ class ContextProjection:
                 database.context_append_page(user, delta, _encode_position(highwater), _encode_position(highwater))
                 current = database.context(user)
                 database.context_finish(user, current["read_count"])
-            self._observed[key] = self._binding_key(fingerprint)
+            self._observed[key] = self._binding_key(fingerprint, binding)
             self._pending_windows.pop(key, None)
             self.condition.notify_all()
             return True
@@ -211,7 +227,7 @@ class ContextProjection:
             reset = scope_changed or changed_facts or rollback or prefix_unknown
             ceiling = newest or _decode_position(row["highwater"])
             database.context_begin(user, _encode_position(ceiling), fingerprint, reset=reset)
-            self._start_worker(account, user)
+            self._start_worker(account, user, binding)
         return True
 
     def invalidate_window(self, account, user):
@@ -219,8 +235,10 @@ class ContextProjection:
             self._observed.pop((account, user), None)
             self._pending_windows.pop((account, user), None)
 
-    def prepare(self, account, user, cancel=None, expected_scope=None):
+    def prepare(self, account, user, cancel=None, expected_scope=None, binding=None):
         """Start or continue the shared import; never calls a generative model."""
+        binding = binding or self.capture_binding(account)
+        fingerprint = self._check_open(account, cancel, expected_scope, binding)
         with self.lock:
             if self._closed or account in self._paused or (cancel is not None and cancel.is_set()):
                 raise AdvisorError("stopping", "已停止")
@@ -230,24 +248,29 @@ class ContextProjection:
             worker = self._imports.get(key)
             running = worker is not None and worker.thread.is_alive()
             if running:
+                if worker.binding != binding:
+                    worker.cancel.set()
+                    raise AccountChangedError()
                 return public_context(row)
             if (row is not None and row["state"] == "ready" and
-                    self._observed.get(key) == self._binding_key(row["source_id"]) and
+                    self._observed.get(key) == self._binding_key(row["source_id"], binding) and
                     (expected_scope is None or expected_scope == row["source_id"])):
                 return public_context(row)
         # Source discovery may block; never hold the projection lock while it runs.
-        fingerprint = self._check_open(account, cancel, expected_scope)
         with self.lock:
             pending = self._pending_windows.get(key)
-        current = (pending["latest"] if pending is not None and pending["fingerprint"] == fingerprint and
-                   pending["latest"] is not None else self.highwater(account, user))
-        self._check_open(account, cancel, fingerprint)
-        with self.lock:
+        current = (pending["latest"] if pending is not None and pending["binding"] == binding and
+                   pending["latest"] is not None else self.highwater(account, user, binding))
+        with self.lock, self.source.lock:
+            self._check_open(account, cancel, fingerprint, binding, fresh=True)
             if self._closed or account in self._paused or (cancel is not None and cancel.is_set()):
                 raise AdvisorError("stopping", "已停止")
             row = database.context(user)
             worker = self._imports.get(key)
             if worker is not None and worker.thread.is_alive():
+                if worker.binding != binding:
+                    worker.cancel.set()
+                    raise AccountChangedError()
                 return public_context(row)
             previous = _decode_position(row["highwater"]) if row else None
             reset = bool(row and (row["source_id"] != fingerprint or
@@ -259,20 +282,20 @@ class ContextProjection:
                 if current is None:
                     row = database.context_finish(user, 0)
                     return public_context(row)
-                self._start_worker(account, user)
+                self._start_worker(account, user, binding)
                 return public_context(database.context(user))
             if row["state"] == "error":
                 row = database.context_begin(user, _encode_position(current), fingerprint)
-                self._start_worker(account, user)
+                self._start_worker(account, user, binding)
                 return public_context(database.context(user))
             if row["state"] == "ready":
                 if _encode_position(current) != row["highwater"]:
                     row = database.context_begin(user, _encode_position(current), fingerprint)
-                    self._start_worker(account, user)
+                    self._start_worker(account, user, binding)
                 return public_context(database.context(user))
             # reading: resume a worker that did not survive a restart
             if not running:
-                self._start_worker(account, user)
+                self._start_worker(account, user, binding)
             return public_context(database.context(user))
 
     def wait_ready(self, account, user, cancel, check, expected_scope=None, expected_epoch=None):
@@ -356,20 +379,20 @@ class ContextProjection:
             self._pending_windows.clear()
 
     # -- import worker -------------------------------------------------------
-    def _start_worker(self, account, user):
+    def _start_worker(self, account, user, binding):
         key = (account, user)
         worker = self._imports.get(key)
         if worker is not None and worker.thread.is_alive():
             return worker
         cancel = threading.Event()
-        thread = threading.Thread(target=self._import_worker, args=(account, user, cancel),
+        thread = threading.Thread(target=self._import_worker, args=(account, user, cancel, binding),
                                   name="advisor-context-import", daemon=True)
-        entry = _Import(cancel, thread)
+        entry = _Import(cancel, thread, binding)
         self._imports[key] = entry
         thread.start()
         return entry
 
-    def _import_worker(self, account, user, cancel):
+    def _import_worker(self, account, user, cancel, binding):
         key = (account, user)
         database = self.stores.account(account)
         try:
@@ -380,17 +403,18 @@ class ContextProjection:
                 highwater = _decode_position(row["highwater"])
                 expected = row["source_id"]
                 if highwater is None:
-                    with self.lock:
-                        self._check_open(account, cancel, expected)
+                    with self.lock, self.source.lock:
+                        self._check_open(account, cancel, expected, binding, fresh=True)
                         database.context_finish(user, row["read_count"])
                     return
                 after = _decode_position(row["cursor"]) or _decode_position(row["last_sort"])
-                self._check_open(account, cancel, expected)
+                self._check_open(account, cancel, expected, binding)
                 try:
-                    page, next_after = self.source.history_page(
-                        user, highwater, after, page_size=IMPORT_PAGE_SIZE)
+                    with self.source.binding_scope(binding):
+                        page, next_after = self.source.history_page(
+                            user, highwater, after, page_size=IMPORT_PAGE_SIZE)
                 finally:
-                    self._check_identity(account, expected)
+                    self._check_identity(account, expected, binding)
                 if cancel.is_set():
                     return
                 if page:
@@ -403,7 +427,7 @@ class ContextProjection:
                 with self.lock:
                     source_lock = getattr(self.source, "lock", None)
                     with source_lock if source_lock is not None else nullcontext():
-                        self._check_open(account, cancel, expected)
+                        self._check_open(account, cancel, expected, binding, fresh=True)
                         database.context_append_page(user, rows, _encode_position(next_after),
                                                      last_sort)
                         if next_after is None:
@@ -430,7 +454,11 @@ class ContextProjection:
                 if (pending is not None and not cancel.is_set() and not self._closed and account not in self._paused and
                         current is not None and current["state"] == "ready" and
                         current["source_id"] == pending["fingerprint"]):
-                    self._apply_window_locked(account, user, pending, after_import=True)
+                    try:
+                        with self.source.lock:
+                            self._apply_window_locked(account, user, pending, after_import=True)
+                    except (AccountChangedError, AccountUnavailableError, MessagesUnavailableError):
+                        self._pending_windows.pop(key, None)
                 self.condition.notify_all()
 
     def _page_rows(self, user, page, read_count, trusted_identity=None):
@@ -488,12 +516,31 @@ class ContextProjection:
 
     # -- model input assembly ------------------------------------------------
     def build_model_context(self, account, user, upto_seq, budget_chars, compactor, model_fp,
-                            check=None, compact_budget=None, cancel=None, commit_guard=None):
+                            check=None, compact_budget=None, cancel=None, commit_guard=None, binding=None):
         """Assemble the model's WeChat context, compacting only when it cannot fit."""
+        binding = binding or self.capture_binding(account)
+        original_check, original_guard = check, commit_guard
+
+        def check():
+            self._check_open(account, cancel, binding=binding)
+            if original_check:
+                original_check()
+
+        @contextmanager
+        def commit_guard():
+            with original_guard() if original_guard is not None else nullcontext():
+                with self.lock, self.source.lock:
+                    self.source.assert_binding(binding)
+                    check()
+                    yield
+
         database = self.stores.account(account)
         segments = []
         if check:
             check()
+        context = database.context(user)
+        if context is not None and context["source_id"] != self.source.binding_fingerprint(binding):
+            raise AccountChangedError()
         if budget_chars <= 64:
             if database.context_messages(user, upto_seq):
                 raise AdvisorError("context-too-long", "模型窗口没有足够空间容纳聊天资料")

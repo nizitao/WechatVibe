@@ -242,6 +242,7 @@ def _tail_evidence(conn, scope, legacy_max, subject, minimum):
 class BatchStateStore:
     def __init__(self, result_store):
         self.path = Path(result_store.path)
+        self.cipher = result_store.cipher
         if not self.path.is_file():
             raise ValueError("batch state requires an existing account result store")
         with closing(sqlite3.connect(self.path, timeout=15)) as conn, conn:
@@ -431,7 +432,7 @@ class BatchStateStore:
             return None
         seq, shard, local, offset, context, state, complete = row
         # Up to three full messages are stored verbatim in context_json.
-        context = default_cipher().loads(context)
+        context = self.cipher.loads(context)
         return {"cursor": (seq, shard, local) if seq is not None else None,
                 "charOffset": offset, "context": context, "state": json.loads(state),
                 "complete": bool(complete)}
@@ -461,7 +462,7 @@ class BatchStateStore:
             conn.execute("UPDATE batch_progress_v1 SET cursor_seq=?,cursor_shard=?,cursor_local=?,"
                          "char_offset=?,context_json=?,complete=0 WHERE account=? AND session=? "
                          "AND base_version=? AND subject=? AND batch_version=?",
-                         (*cursor, char_offset, default_cipher().dumps(context), *scope))
+                         (*cursor, char_offset, self.cipher.dumps(context), *scope))
 
     def quoted_backfill_pending(self, account, session, base_version, subject, cursor):
         if cursor is None:
@@ -600,7 +601,7 @@ class BatchStateStore:
                          "batch_version,cursor_seq,cursor_shard,cursor_local,char_offset,context_json,state_json,"
                          "legacy_max_rowid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                          (*scope, *(position or (None, None, None)), 0,
-                          default_cipher().dumps(previous), json.dumps(snapshot, ensure_ascii=False),
+                          self.cipher.dumps(previous), json.dumps(snapshot, ensure_ascii=False),
                           legacy_max))
         return self.load(account, session, base_version, subject)
 
@@ -804,7 +805,7 @@ class BatchStateStore:
                 conn.execute("UPDATE batch_progress_v1 SET cursor_seq=?,cursor_shard=?,cursor_local=?,"
                              "char_offset=?,context_json=?,state_json=? WHERE account=? AND session=? "
                              "AND base_version=? AND subject=? AND batch_version=?",
-                             (*position, char_offset, default_cipher().dumps(context),
+                             (*position, char_offset, self.cipher.dumps(context),
                               json.dumps(state, ensure_ascii=False), *scope))
             else:
                 conn.execute("UPDATE batch_progress_v1 SET state_json=? WHERE account=? AND session=? "

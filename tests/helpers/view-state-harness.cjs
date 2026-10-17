@@ -14,7 +14,12 @@ const VIEW_STATE_SOURCE = readFileSync(path.join(__dirname, "..", "..", "chatui/
 // declarations are redeclarable, so a slice that also carries them is harmless.
 const APP_SOURCE = readFileSync(path.join(__dirname, "..", "..", "chatui/app.js"), "utf8");
 const GATE_SOURCE = (() => {
-  const start = APP_SOURCE.indexOf("function conversationAnalysisRequested(");
+  // The gate decides what may be analysed, so it also carries the link/placeholder filter
+  // (`hasAnalyzableText` and friends). Those helpers sit above the gate, so the slice starts
+  // at the deepest anchor that exists.
+  const gate = APP_SOURCE.indexOf("function conversationAnalysisRequested(");
+  const helpers = APP_SOURCE.indexOf("const MESSAGE_LINK_PATTERN");
+  const start = helpers >= 0 && gate >= 0 ? Math.min(gate, helpers) : Math.max(gate, helpers);
   const end = APP_SOURCE.indexOf("/** Analyse exactly the given conversations", start);
   if (start < 0 || end <= start) throw new Error("app.js is missing the analysis request gate");
   return APP_SOURCE.slice(start, end);
@@ -22,7 +27,7 @@ const GATE_SOURCE = (() => {
 
 const DOMAIN_FIELDS = {
   chat: ["sessions", "selectedConversations", "requestedConversations", "selectionLoadedAccount",
-    "conversationSelectionBusy",
+    "conversationSelectionBusy", "conversationSelectionGeneration",
     "sessionCache", "historyState", "historyRequest", "historyController", "historySearchRequest",
     "historySearchController", "historySearchPending", "historySearchPage", "historySearchPageStarts",
     "historySearchQuery", "self", "sessionSignature", "sessionRequest", "sessionLoading",
@@ -32,7 +37,7 @@ const DOMAIN_FIELDS = {
     "messageRefreshQueued", "emptyMessagePolls",
     "conversationMood", "followLatest", "lastChatScrollTop"],
   labels: ["results", "currentRecentJob", "inlineIntentPending", "inlineIntentJobId", "recentFailed",
-    "requestedRecentSignatures", "recentPending", "intentActionState", "intentFeedbackTimer",
+    "requestedRecentSignatures", "recentPending", "intentActionState", "intentRequestScope", "intentFeedbackTimer",
     "manualRecentAwaitingPost", "manualRecentJobId", "manualRecentDeferred", "recentNetworkFailed",
     "selectedAnalysisTimer", "catalogReady", "intentDisplayAliases", "emotionDisplayAliases",
     "catalogLabelRevision", "messageLabels", "apiInsightCache", "apiInsightWork",
@@ -84,6 +89,10 @@ function installStatusSinks(context) {
     context.text = (id, value) => { context.byId(id).textContent = String(value ?? ""); };
   }
   if (typeof context.setStripStatus !== "function") context.setStripStatus = () => {};
+  // Portrait/settings tests isolate their own domain; guidance and picking have
+  // separate behavior tests and are stubbed only when their source is not loaded.
+  for (const name of ["syncGuidanceMode", "cancelGuidancePoll", "clearGuidanceView", "loadGuidance", "renderPickBar", "syncPickControls", "cancelMessageRegeneration", "cancelRecentIntentWork", "cancelLocalProfilePoll"])
+    if (typeof context[name] !== "function") context[name] = () => {};
 }
 
 // Install the real ViewState into an existing vm context and alias old names.

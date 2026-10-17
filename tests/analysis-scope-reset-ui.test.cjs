@@ -23,7 +23,7 @@ function harness({ mode = "local", member = "", postImpl } = {}) {
     text: (id, value) => { byId(id).textContent = value; }, toast() {}, saveStoredProfiles() {},
     apiInsightKey: (...values) => JSON.stringify(values), sessionCacheKey: (...values) => JSON.stringify(values),
     cancelApiPortraitPoll() {}, clearProfileView() {}, clearApiPortraitView() {},
-    cancelApiInsightWork() {}, clearInlineIntentPending() {},
+    cancelApiInsightWork() {}, clearInlineIntentPending() {}, clearGuidanceView() {}, cancelMessageRegeneration() {},
     renderMessages: values => messages.push(values), retryAnalysis: () => retries.push("retry"),
     loadProfile: (...args) => loads.push(args),
     chatState: { currentAccount: "account-a", currentUser: "room@chatroom", selectedConversations: new Set(["room@chatroom"]),

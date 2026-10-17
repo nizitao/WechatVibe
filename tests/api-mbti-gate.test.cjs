@@ -19,8 +19,9 @@ function body(signature) {
 }
 
 it("gates the API MBTI card on the observation count, not the analysed-text count", () => {
-  assert.match(app, /const eligible = Number\(profile\.apiMbtiEvidenceCount\) \|\| 0;/u);
+  assert.match(app, /const eligible = apiObservationCount\(profile\.apiMbtiEvidenceCount\);/u);
   // The analysed-text count must not decide whether the axes are shown.
+  assert.doesNotMatch(app, /const eligible = apiObservationCount\(profile\.apiTargetTexts\);/u);
   assert.doesNotMatch(app, /const eligible = Number\(profile\.apiTargetTexts\) \|\| 0;/u);
 });
 
@@ -31,13 +32,13 @@ it("reads the backend gate count from available", () => {
   const get = store.slice(store.indexOf("def api_portrait_get("), store.indexOf("def api_portrait_begin("));
   assert.ok(get.indexOf('resume["portraitEvidence"]') < get.indexOf('available["mbtiEvidenceCount"]'));
   assert.match(get, /"available": available/u);
-  assert.match(app, /apiMbtiEvidenceCount: Number\(data\.available\?\.mbtiEvidenceCount\) \|\| 0/u);
+  assert.match(app, /apiMbtiEvidenceCount: apiObservationCount\(available\.mbtiEvidenceCount\)/u);
 });
 
 it("reports the real per-axis evidence count", () => {
   // It was hardcoded to 1, so every API axis said "1 条证据".
   assert.doesNotMatch(app, /evidenceCount: 1 \}/u);
-  assert.match(app, /evidenceCount: Number\(basis\?\.evidenceCount\) \|\| 0/u);
+  assert.match(app, /evidenceCount: apiObservationCount\(basis\?\.evidenceCount\)/u);
   assert.match(app, /const basis = profile\.apiMbtiBasis\?\.\[axis\.key\]/u);
 });
 
@@ -51,5 +52,5 @@ it("explains the lock instead of asking for more messages", () => {
 
 it("does not report a stalled run as preparing for ever", () => {
   assert.match(app, /API \u753b\u50cf\u672a\u5f00\u59cb[\s\S]{0,40}请重新分析/u);
-  assert.match(app, /Number\(progress\?\.processedTargetTexts\) === 0/u);
+  assert.match(app, /progress\.processedTargetTexts === 0/u);
 });

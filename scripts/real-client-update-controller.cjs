@@ -5,6 +5,7 @@ const { randomUUID } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const { checkForUpdates, downloadAndStageUpdate } = require("./real-client-update.cjs");
+const { PROFILE_ENV, profileName, runtimeDir } = require("./runtime-paths.cjs");
 
 const BUSY = new Set(["downloading", "verifying", "extracting", "installing", "restarting"]);
 const WORK_PREFIX = ".wechatvibe-update-";
@@ -67,6 +68,9 @@ function copyHelper(root, workDir) {
   const script = path.join(helperDir, "real-client-update-helper.cjs");
   fs.copyFileSync(sourceNode, node);
   fs.copyFileSync(sourceScript, script);
+  for (const name of ["installation_gate.py", "process_lock.py"]) {
+    fs.copyFileSync(path.join(root, "bridge", name), path.join(helperDir, name));
+  }
   return { node, script };
 }
 
@@ -83,6 +87,7 @@ function spawnHelper(helper, operationFile, workDir) {
 
 function createUpdateController({ app, root, port, instanceId, onState, pauseRecovery,
   resumeRecovery, quit, checkImpl = checkForUpdates, stageImpl = downloadAndStageUpdate }) {
+  const instanceProfile = profileName(process.env[PROFILE_ENV]);
   const requestedInstallRoot = path.resolve(root, "..", "..");
   // Staging uses real paths. Resolve ancestor aliases before comparing or
   // handing paths to the helper; keep the install directory itself subject
@@ -106,6 +111,7 @@ function createUpdateController({ app, root, port, instanceId, onState, pauseRec
   }
 
   async function check() {
+    if (instanceProfile) return notify("profile-managed");
     if (busy || BUSY.has(state.phase)) return getState();
     busy = true;
     try {
@@ -118,17 +124,34 @@ function createUpdateController({ app, root, port, instanceId, onState, pauseRec
   }
 
   async function handoff(action, candidatePath, workDir, expectedVersion) {
+    if (instanceProfile) throw new Error("请关闭其他窗口后，从默认窗口更新此安装");
     if (!app.isPackaged || process.platform !== "win32" || !directChild(workDir, parent) ||
         !samePath(path.dirname(candidatePath), workDir) ||
         !fs.existsSync(path.join(candidatePath, "WechatVibe.exe"))) {
       throw new Error("更新包或安装位置不可用");
     }
     const python = path.join(root, "runtime", "python", "python.exe");
+    await new Promise((resolve, reject) => execFile(python,
+      [path.join(root, "bridge", "installation_gate.py"), "check", "--root", root, "--pid", String(process.pid)],
+      { cwd: root, windowsHide: true, env: process.env, timeout: 15000, maxBuffer: 65536 },
+      (error, output) => {
+        let result;
+        try { result = JSON.parse(output); } catch (_) { /* fail closed */ }
+        if (error || result?.available !== true) reject(new Error(result?.error || "无法确认其他窗口已退出"));
+        else resolve();
+      }));
+    const payloadMarker = path.join(root, ".local", "real-client-runtime", "payload-format.json");
+    if (fs.existsSync(payloadMarker)) {
+      const candidate = JSON.parse(fs.readFileSync(path.join(candidatePath, "resources", "client", "package.json"), "utf8"));
+      if (!candidate.analysisPayloadFormats?.includes("wv1:")) {
+        throw new Error("目标版本无法读取已加密的分析数据，请选择支持加密分析数据的版本");
+      }
+    }
     const helper = copyHelper(root, workDir);
     const operationFile = path.join(workDir, `${action}-${randomUUID()}.json`);
     const operation = { schema: 1, action, installRoot, candidatePath, workDir,
       expectedVersion, previousVersion: currentVersion, parentPid: process.pid,
-      port, instanceId };
+      port, instanceId, profile: null };
     fs.writeFileSync(operationFile, JSON.stringify(operation), { flag: "wx" });
     let stopped = false;
     try {
@@ -138,7 +161,8 @@ function createUpdateController({ app, root, port, instanceId, onState, pauseRec
         throw new Error("本地分析服务未能安全退出");
       }
       stopped = true;
-      if (fs.existsSync(path.join(root, ".local", "real-client-runtime", "no-auto-recovery.json"))) {
+      if (fs.existsSync(path.join(runtimeDir(root, profileName(process.env[PROFILE_ENV])),
+                                  "no-auto-recovery.json"))) {
         const error = new Error("当前账号已清除，更新已取消");
         error.accountCleared = true;
         throw error;
@@ -159,6 +183,7 @@ function createUpdateController({ app, root, port, instanceId, onState, pauseRec
   }
 
   async function begin() {
+    if (instanceProfile) return notify("profile-managed");
     if (busy) return getState();
     if (state.phase !== "available" && state.phase !== "ready") return getState();
     busy = true;
@@ -181,6 +206,7 @@ function createUpdateController({ app, root, port, instanceId, onState, pauseRec
   }
 
   async function rollback() {
+    if (instanceProfile) return notify("profile-managed");
     if (busy) return getState();
     const candidate = readRollback(parent, installRoot, currentVersion);
     if (!candidate) return notify("failed", { error: "没有可用的回退版本" });

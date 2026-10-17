@@ -23,14 +23,18 @@ from pathlib import Path
 from contextlib import contextmanager
 
 from advisor_contracts import (
-    GUIDANCE_SKILL_ID, HISTORY_BUDGET_PERCENT, TERMINAL_RUN_STATES, AdvisorError, char_budget,
+    GUIDANCE_SKILL_ID, HISTORY_BUDGET_PERCENT, MAX_SKILL_CONTENT, MAX_USER_MESSAGE,
+    TERMINAL_RUN_STATES, AdvisorError, char_budget,
     model_fingerprint, normalize_event, public_run, safety_margin,
     terminal_event, valid_identifier, valid_request_id, valid_scope_value,
     valid_user_message,
 )
 from advisor_context import ContextProjection
 from advisor_store import AdvisorStoreRoot
-from backend_contracts import AccountChangedError, LOCAL_SOURCE_ID, ModelSourceUnavailable
+from backend_contracts import (
+    AccountChangedError, AccountUnavailableError, MessagesUnavailableError,
+    LOCAL_SOURCE_ID, ModelSourceUnavailable,
+)
 from guidance_contracts import GUIDANCE_MISSING_NOTE, guidance_material
 
 MAX_EVENT_BATCH = 500
@@ -42,7 +46,7 @@ STREAM_SCOPE_CHECK_SECONDS = 1.0
 class _Run:
     __slots__ = ("id", "thread_id", "account", "user", "agent_id", "message", "message_id",
                  "state", "error", "text", "events", "next_seq", "cancel", "worker",
-                 "database", "source_scope", "config_stamp", "template_stamp", "context_epoch",
+                 "database", "source_scope", "binding", "config_stamp", "template_stamp", "context_epoch",
                  "phase", "last_scope_check", "last_status", "request_id")
 
     def __init__(self, row, message, account, user, agent_id):
@@ -63,6 +67,7 @@ class _Run:
         self.worker = None
         self.database = None
         self.source_scope = None
+        self.binding = None
         self.config_stamp = None
         self.template_stamp = None
         self.context_epoch = None
@@ -181,7 +186,7 @@ class AdvisorService:
         api = selected.get("api") if selected else None
         if not isinstance(api, dict):
             return None
-        values = [selected.get("sourceId"), api.get("protocol"), api.get("baseUrl"),
+        values = [selected.get("sourceId"), api.get("id") or selected.get("profileId"), api.get("protocol"), api.get("baseUrl"),
                   api.get("model"), api.get("contextTokens"), api.get("encryptedKey")]
         return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf-8")).hexdigest()
 
@@ -197,8 +202,9 @@ class AdvisorService:
             raise AdvisorError("api-not-configured", "尚未配置生成模型，请先保存 API 模型设置")
         api = selected["api"]
         try:
-            key = self.model_source_store.resolve_key(api.get("protocol"), api.get("baseUrl"), None)
-        except ModelSourceUnavailable as exc:
+            key = self.model_source_store.resolve_key(api.get("protocol"), api.get("baseUrl"), None,
+                                                       profile_id=api.get("id") or selected.get("profileId"))
+        except (ModelSourceUnavailable, ValueError) as exc:
             raise AdvisorError("api-not-configured", "模型设置不可用，请重新保存 API 配置") from exc
         if not key and api.get("protocol") != "ollama":
             raise AdvisorError("api-not-configured", "API 密钥不可用，请重新保存模型设置")
@@ -262,6 +268,68 @@ class AdvisorService:
                 "skills": skills,
                 "permissions": {"readOnly": True},
                 "engine": self._engine_state()}
+
+    @staticmethod
+    def _reply_settings_stamp(agent, skills):
+        identity = ["advisor-reply-settings-v1", agent["id"], agent["revision"], agent["prompt"],
+                    [[skill["id"], skill["content"], (skill.get("package") or {}).get("digest")]
+                     for skill in skills]]
+        return hashlib.sha256(json.dumps(identity, ensure_ascii=False,
+                                         separators=(",", ":")).encode("utf-8")).hexdigest()
+
+    def _reply_settings_identity(self, agent_id, expected_revision):
+        if not valid_identifier(agent_id) or type(expected_revision) is not int or expected_revision < 1:
+            raise AdvisorError("invalid-request", "助手选择不正确")
+        agent = self.stores.config.agent(agent_id)
+        if agent is None:
+            raise AdvisorError("agent-unknown", "所选助手已不存在")
+        if not agent["enabled"]:
+            raise AdvisorError("agent-disabled", "所选助手已停用")
+        if agent["revision"] != expected_revision:
+            raise AdvisorError("agent-changed", "助手设置已变更，请重新生成")
+        return agent, self._skill_payloads(agent)
+
+    def reply_identity(self, agent_id, expected_revision):
+        """Read one atomic catalog identity without compiling package references."""
+        with self.stores.config.lock:
+            agent, skills = self._reply_settings_identity(agent_id, expected_revision)
+            return {"agentId": agent["id"], "agentRevision": agent["revision"],
+                    "stamp": self._reply_settings_stamp(agent, skills)}
+
+    def reply_settings(self, agent_id, expected_revision, question="", context_tokens=32768):
+        """Compile approved template text without opening account data or an Agent run."""
+        if (not isinstance(question, str) or len(question) > MAX_USER_MESSAGE or "\0" in question or
+                type(context_tokens) is not int or not 4096 <= context_tokens <= 1000000):
+            raise AdvisorError("invalid-request", "候选回复输入不正确")
+        with self.stores.config.lock:
+            agent, skills = self._reply_settings_identity(agent_id, expected_revision)
+            stamp = self._reply_settings_stamp(agent, skills)
+        budget = char_budget(context_tokens)
+        available = max(0, budget - safety_margin(budget) - 512)
+        base_cost = len(agent["prompt"])
+        for skill in skills:
+            package = skill.get("package")
+            base_cost += len(skill["id"]) + 128 + len(skill["content"])
+            if package is not None:
+                base_cost += len(package["compatibility"].get("hostInstructions", "")) + 2
+        if base_cost > available:
+            raise AdvisorError("context-too-long", "所选助手的提示词和技能超出模型窗口，请调大上下文或精简技能")
+        loaded = self._runtime_skills(skills, question, available - base_cost)
+        payload = [{"id": skill["id"], "content": skill["content"]} for skill in loaded]
+        if (any(len(skill["content"]) > MAX_SKILL_CONTENT for skill in payload) or
+                len(agent["prompt"]) + sum(len(skill["id"]) + len(skill["content"]) + 128
+                                           for skill in payload) > available):
+            raise AdvisorError("context-too-long", "所选助手的技能超出模型窗口，请调大上下文或精简技能")
+        return {"agentId": agent["id"], "agentRevision": agent["revision"], "stamp": stamp,
+                "prompt": agent["prompt"], "skills": payload}
+
+    def assert_reply_settings(self, snapshot):
+        """Reject retries and writes after the chosen template or any Skill changed."""
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("stamp"), str):
+            raise AdvisorError("invalid-request", "助手设置快照不正确")
+        current = self.reply_identity(snapshot.get("agentId"), snapshot.get("agentRevision"))
+        if current["stamp"] != snapshot["stamp"]:
+            raise AdvisorError("agent-changed", "助手设置已变更，请重新生成")
 
     def save_template(self, request):
         if not isinstance(request, dict):
@@ -349,17 +417,18 @@ class AdvisorService:
         user = valid_scope_value(user, "user")
         return {"context": self._context_status(self.context.prepare(account, user))}
 
-    def observe_message_window(self, account, workdir, user, messages, has_more_before):
+    def observe_message_window(self, account, workdir, user, messages, has_more_before, binding=None):
         account = valid_scope_value(account, "account")
         user = valid_scope_value(user, "user")
         with self.condition:
             if self._closing or account in self._paused or account in self._cleared:
                 return False
         try:
-            observed = self.context.scope_fingerprint(account, workdir)
-            if self.context.source_scope(account) != observed:
+            # The producer must capture before decoding these rows. Capturing here
+            # would relabel a late window with the newly selected source.
+            if binding is None:
                 raise AccountChangedError()
-            return self.context.observe_window(account, workdir, user, messages, has_more_before)
+            return self.context.observe_window(account, workdir, user, messages, has_more_before, binding)
         except Exception:
             self.context.invalidate_window(account, user)
             return False
@@ -390,7 +459,9 @@ class AdvisorService:
 
     # ------------------------------------------------------------------ runs
     def start(self, account, user, agent_id, thread_id, message, request_id=None):
-        account, source_scope = self._require_scope(account, with_fingerprint=True)
+        account = valid_scope_value(account, "account")
+        binding = self.context.capture_binding(account)
+        source_scope = self.source.binding_fingerprint(binding)
         user = valid_scope_value(user, "user")
         message = valid_user_message(message)
         request_id = valid_request_id(request_id)
@@ -413,7 +484,8 @@ class AdvisorService:
             raise AdvisorError("engine-unavailable", "顾问引擎未安装，请检查安装文件")
         source_id = selected.get("sourceId") or LOCAL_SOURCE_ID
         database = self.stores.account(account)
-        with self.condition:
+        with self.condition, self.source.lock:
+            self.source.assert_binding(binding)
             if self._closing or account in self._paused:
                 raise AdvisorError("account-paused", "账号正在清理中")
             existing = database.scoped_request(user, agent_id, request_id, message)
@@ -446,6 +518,7 @@ class AdvisorService:
             run.message_id = message_row["id"]
             run.database = database
             run.source_scope = source_scope
+            run.binding = binding
             run.config_stamp = self._config_stamp(selected)
             run.template_stamp = self._template_stamp(agent, self._skill_payloads(agent))
             self._runs[run.id] = run
@@ -564,6 +637,11 @@ class AdvisorService:
             for run in list(self._runs.values()):
                 if run.state != "running":
                     continue
+                try:
+                    self.source.assert_binding(run.binding, fresh=False)
+                except (AccountChangedError, AccountUnavailableError, MessagesUnavailableError):
+                    self._invalidate_run_locked(run)
+                    continue
                 current = self.stores.config.agent(run.agent_id)
                 stale = current is None or not current["enabled"] or current_config != run.config_stamp
                 if not stale:
@@ -571,7 +649,31 @@ class AdvisorService:
                 if stale:
                     self._stop_run_locked(run)
 
+    def _invalidate_run_locked(self, run, text="配置或账号已变化，生成已停止"):
+        """A stale source may stop memory state, but must never save late content."""
+        run.cancel.set()
+        run.state = "stopped"
+        self._active_by_thread.pop(run.thread_id, None)
+        run.append_event_locked(terminal_event(run.next_seq, "done", state="stopped", text=text))
+        self.condition.notify_all()
+
     def _stop_run_locked(self, run):
+        # Cancellation must stay responsive while a history read owns the source.
+        # Without that lock we may stop memory, but cannot safely save a partial.
+        if not self.source.lock.acquire(blocking=False):
+            self._invalidate_run_locked(run, "已停止")
+            return
+        try:
+            try:
+                self.source.assert_binding(run.binding)
+            except (AccountChangedError, AccountUnavailableError, MessagesUnavailableError):
+                self._invalidate_run_locked(run)
+                return
+            self._save_stopped_run_locked(run)
+        finally:
+            self.source.lock.release()
+
+    def _save_stopped_run_locked(self, run):
         database = run.database
         partial = run.text
         run.cancel.set()
@@ -608,24 +710,21 @@ class AdvisorService:
             if not thorough:
                 return
         try:
-            source_scope = self.context.source_scope(run.account, fresh=fresh)
+            self.source.assert_binding(run.binding, fresh=fresh)
             current = self.stores.config.agent(run.agent_id)
             context = run.database.context(run.user)
-            if (source_scope != run.source_scope or
-                    self._config_stamp(self._engine_selection()) != run.config_stamp or
+            if (self._config_stamp(self._engine_selection()) != run.config_stamp or
                     (run.context_epoch is not None and (context is None or context["epoch"] != run.context_epoch)) or
                     current is None or not current["enabled"] or
                     self._template_stamp(current, self._skill_payloads(current)) != run.template_stamp):
                 raise AccountChangedError()
-        except (AccountChangedError, AdvisorError, ModelSourceUnavailable):
+        except (AccountChangedError, AccountUnavailableError, MessagesUnavailableError,
+                AdvisorError, ModelSourceUnavailable):
             with self.condition:
                 if run.state != "running":
                     raise AdvisorError("stopping", "已停止")
                 # A stale callback can invalidate memory, but cannot write any account data.
-                run.cancel.set()
-                run.state = "stopped"
-                self._active_by_thread.pop(run.thread_id, None)
-                run.append_event_locked(terminal_event(run.next_seq, "done", state="stopped", text="配置或账号已变化，生成已停止"))
+                self._invalidate_run_locked(run)
                 raise AdvisorError("stopping", "配置或账号已变化，生成已停止")
         with self.condition:
             self._check_run(run, thorough=False)
@@ -633,24 +732,33 @@ class AdvisorService:
 
     @contextmanager
     def _cache_commit_guard(self, run):
-        with self.condition:
-            self._check_run(run, thorough=False)
+        with self.condition, self.context.lock, self.source.lock:
+            self._check_run(run, fresh=True)
             context = run.database.context(run.user)
-            if context is None or context["epoch"] != run.context_epoch:
+            if run.context_epoch is not None and (context is None or context["epoch"] != run.context_epoch):
                 raise AdvisorError("stopping", "聊天数据来源已经变化")
             yield
 
     def _run_worker(self, run, agent):
         try:
+            with self.source.binding_scope(run.binding):
+                self._run_worker_bound(run, agent)
+        except (AccountChangedError, AccountUnavailableError, MessagesUnavailableError):
+            with self.condition:
+                if run.state == "running":
+                    self._invalidate_run_locked(run)
+
+    def _run_worker_bound(self, run, agent):
+        try:
             database = run.database
             self._check_run(run)
-            self.context.prepare(run.account, run.user, run.cancel, run.source_scope)
+            self.context.prepare(run.account, run.user, run.cancel, run.source_scope, binding=run.binding)
             self._check_run(run)
             with self.condition:
                 self._check_run(run, thorough=False)
                 run.context_epoch = database.context(run.user)["epoch"]
             snapshot = self.context.wait_ready(run.account, run.user, run.cancel,
-                                               lambda: self._check_run(run, thorough=False),
+                                               lambda: self._check_run(run),
                                                run.source_scope, run.context_epoch)
             if snapshot["sourceFingerprint"] != run.source_scope:
                 raise AdvisorError("context-error", "聊天数据来源已经变化")
@@ -692,7 +800,7 @@ class AdvisorService:
                 run.account, run.user, snapshot["readCount"], context_budget, compactor,
                 config["modelFp"], check=lambda: self._check_run(run),
                 compact_budget=max(64, budget - margin - 512), cancel=run.cancel,
-                commit_guard=lambda: self._cache_commit_guard(run))
+                commit_guard=lambda: self._cache_commit_guard(run), binding=run.binding)
             if guidance_text:
                 context_text = (context_text.rstrip() + "\n\n" + guidance_text) if context_text else guidance_text
             request = {
@@ -709,7 +817,7 @@ class AdvisorService:
                 "contextFileText": context_text,
                 "message": run.message,
             }
-            self._check_run(run)
+            self._check_run(run, fresh=True)
             if prompt_cost + len(run.message) + len(context_text) + margin > budget:
                 raise AdvisorError("context-too-long", "当前输入超出模型窗口，请缩短消息或更换模型")
             result = runtime.respond(config, request, lambda event: self._on_event(run, event),
@@ -796,7 +904,7 @@ class AdvisorService:
         announced = threading.Event()
 
         def compact(text, range_key, level):
-            self._check_run(run)
+            self._check_run(run, fresh=True)
             if not announced.is_set():
                 announced.set()
                 with self.condition:
@@ -850,8 +958,7 @@ class AdvisorService:
     def _finish_locked(self, run, text, session):
         if run.state != "running":
             return
-        self._check_run(run, fresh=True)
-        with self.condition:
+        with self._cache_commit_guard(run):
             if run.state != "running":
                 return
             self._check_run(run, thorough=False)
@@ -883,8 +990,7 @@ class AdvisorService:
     def _fail_locked(self, run, message, code):
         if run.state != "running":
             return
-        self._check_run(run)
-        with self.condition:
+        with self._cache_commit_guard(run):
             if run.state != "running":
                 return
             self._check_run(run, thorough=False)

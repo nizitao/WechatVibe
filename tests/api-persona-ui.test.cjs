@@ -63,15 +63,14 @@ function mbtiBasis(evidenceCount = 2) {
 function payload(sourceId, summary, identity = { username: "friend", name: "合成联系人",
   avatar: "", avatarCandidates: [], isGroup: false, members: [] }) {
   return { account: "acct", sourceId, subject: identity.username, identity,
-    portrait: portrait(summary), mbtiBasis: mbtiBasis(),
-    available: { messageCount: 9, textCount: 8,
-      // `mbtiEvidenceCount` is the observation ledger the MBTI gate counts
-      // (`api-portrait.ts`: `evidence.targetCount < 100` withholds every axis);
-      // `targetTextCount` is the analysed-text count, which only drives progress.
-      targetTextCount: 5, mbtiEvidenceCount: 5, totalChars: 120 },
-    inventoryReady: true, inventoryStatus: "ready",
+    portrait: portrait(summary), mbtiBasis: mbtiBasis(), available: { messageCount: 9, textCount: 8,
+      targetTextCount: 5, mbtiEvidenceCount: 5, totalChars: 120 }, inventoryReady: true, inventoryStatus: "ready",
     progress: { processed: 8, total: 8, complete: true },
     job: { id: null, status: "done" } };
+}
+function mbtiBasis(evidenceCount = 2) {
+  return Object.fromEntries(["EI", "SN", "TF", "JP"].map(axis =>
+    [axis, { status: "supported", kind: "pattern", reason: `${axis} 合成依据`, evidenceCount }]));
 }
 function apiPortraitPayload(user, sourceId = "api-a") {
   return {
@@ -138,6 +137,7 @@ function personaHarness(apiImpl, storage) {
   });
   seed(context, {
     sessions: new Map([["friend", { name: "合成联系人", isGroup: false }]]),
+    requestedConversations: new Set(["friend", "A", "B"]),
     currentAccount: "acct", currentUser: "friend", activeMember: "",
     view: "persona", modelSourceResolved: true,
     modelSourceSnapshot: { mode: "api", sourceId: "api-a", api: { model: "synthetic", contextTokens: 16384 } },
@@ -518,6 +518,22 @@ it("uses exact native MBTI boundaries and backend preferences without changing t
   assert.equal(byId("heroMbti").textContent, "?SFP");
 });
 
+it("shows sparse axis progress without assigning personality letters in local and native API cards", () => {
+  const { ui, byId } = personaHarness(async () => {});
+  const axes = Object.fromEntries(["EI", "SN", "TF", "JP"].map(key =>
+    [key, { leftShare: null, rightShare: null, evidenceCount: 0, preference: null }]));
+  axes.SN = { leftShare: .8, rightShare: .2, evidenceCount: 1, preference: null };
+  for (const source of [{}, { apiSource: true, apiNativeProfile: true }]) {
+    ui.renderMbti({ isGroup: false, ...source,
+      mbtiInference: { eligibleMessages: 120, minMessages: 100, axes, type: null } });
+    assert.equal(byId("heroMbti").textContent, "????");
+    const content = textOf(byId("mbtiScalesList"));
+    assert.match(content, /S 80% · N 20%/);
+    assert.match(content, /E\/I · 尚无足够证据/);
+    assert.doesNotMatch(content, /E 50%/);
+  }
+});
+
 it("shows the Laya locked MBTI card for an API portrait below the evidence threshold", () => {
   const { ui, byId } = personaHarness(async () => payload("api-a", "样本较少"));
   ui.renderApiPortrait(payload("api-a", "样本较少"));
@@ -569,19 +585,19 @@ it("uses the local MBTI margin, including float boundaries and explicit undecide
   assert.equal(byId("heroMbti").textContent, "?S?P");
 });
 
-it("gates the API MBTI unlock on the observation ledger, not the analysed-text count", () => {
-  // api-portrait.ts withholds all four axes until the observation ledger reaches 100
-  // (`evidence.targetCount < 100`). Counting the 100 analysed texts instead reported the card
-  // unlocked with every axis blank and no explanation.
+it("gates legacy API MBTI on the observation ledger, not the analysed-text count", () => {
   const { ui, byId } = personaHarness(async () => payload("api-a", "进行中"));
   const data = payload("api-a", "进行中");
   data.available.targetTextCount = 100;
   data.available.mbtiEvidenceCount = 30;
-  data.progress = { processed: 30, total: 100, complete: false };
+  data.progress = { processed: 100, processedTargetTexts: 100, total: 100, complete: false };
   ui.renderApiPortrait(data);
   assert.equal(byId("heroMbti").textContent, "30/100 条");
   assert.equal(byId("mbtiScaleBadge").textContent, "未解锁");
   assert.match(textOf(byId("mbtiScalesList")), /人格推测未解锁/);
+  assert.match(textOf(byId("mbtiScalesList")), /尚未完成.*需继续聊天观察/);
+  assert.doesNotMatch(textOf(byId("mbtiScalesList")), /观察阶段未运行/,
+    "a partially observed run must not claim that no observations exist");
 });
 
 it("uses exact processed target counts for the single-chat progress denominator", () => {
@@ -596,6 +612,115 @@ it("uses exact processed target counts for the single-chat progress denominator"
   assert.equal(byId("stripMsgCount").textContent, "1385 条");
   assert.equal(byId("stripConfidence").textContent, "407 / 1385 条文本");
   assert.equal(byId("heroMbti").textContent, "EN?J");
+});
+
+it("keeps legacy MBTI locked when the validated observation count is absent or malformed", () => {
+  for (const count of [undefined, null, -1, "120", true, 1.5, Infinity]) {
+    const data = payload("api-a", "已处理但尚无有效观察账本");
+    data.available.targetTextCount = 2126;
+    data.available.mbtiEvidenceCount = count;
+    data.progress = { processed: 2126, processedTargetTexts: 2126, total: 2126, complete: true };
+    const { ui, byId } = personaHarness(async () => data);
+    ui.renderApiPortrait(data);
+    assert.equal(byId("heroMbti").textContent, "0/100 条", `count=${String(count)}`);
+    assert.match(textOf(byId("mbtiScalesList")), /需完成聊天观察/);
+  }
+});
+
+it("rerenders and persists legacy MBTI when only the observed count changes", () => {
+  const data = payload("api-a", "同一份画像");
+  data.available.targetTextCount = 120;
+  data.available.mbtiEvidenceCount = 30;
+  const { ui, context, byId } = personaHarness(async () => data);
+  ui.renderApiPortrait(data);
+  assert.equal(byId("heroMbti").textContent, "30/100 条");
+  data.available.mbtiEvidenceCount = 120;
+  ui.renderApiPortrait(data);
+  assert.equal(byId("heroMbti").textContent, "EN?J");
+  const key = JSON.stringify(["acct", "friend", "", "api-a"]);
+  assert.equal(context.storedProfileSnapshots.get(key).profile.apiMbtiEvidenceCount, 120);
+  assert.equal(context.storedProfileSnapshots.get(key).profile.apiMbtiBasis.EI.evidenceCount, 2);
+  data.available.mbtiEvidenceCount = 0;
+  ui.renderApiPortrait(data);
+  assert.equal(byId("heroMbti").textContent, "0/100 条", "a rejected ledger cannot keep a cached unlock");
+});
+
+it("uses each legacy axis observation count instead of inventing one supporting observation", () => {
+  const data = payload("api-a", "不同维度的合成观察");
+  data.available.mbtiEvidenceCount = 120;
+  data.mbtiBasis.EI.evidenceCount = 0;
+  data.mbtiBasis.TF.evidenceCount = "5";
+  data.mbtiBasis.JP.evidenceCount = 11;
+  const { ui, context, byId } = personaHarness(async () => data);
+  ui.renderApiPortrait(data);
+  assert.equal(byId("heroMbti").textContent, "?N?J");
+  const rows = byId("mbtiScalesList").children;
+  assert.match(textOf(rows[0]), /尚无足够证据/);
+  assert.match(textOf(rows[1]), /S 40% · N 60%/);
+  assert.match(textOf(rows[2]), /尚无足够证据/);
+  const cached = context.storedProfileSnapshots.get(JSON.stringify(["acct", "friend", "", "api-a"])).profile;
+  assert.equal(cached.apiMbtiBasis.JP.evidenceCount, 11);
+  delete data.mbtiBasis;
+  ui.renderApiPortrait(data);
+  assert.equal(byId("heroMbti").textContent, "待判断");
+  assert.match(textOf(byId("mbtiScalesList")), /模型依据未通过校验|尚无足够证据/);
+});
+
+it("restores the validated legacy observation count and axis counts before a cold-start read", () => {
+  const values = new Map();
+  const storage = { getItem: key => values.get(key) || null,
+    setItem: (key, value) => values.set(key, value), removeItem: key => values.delete(key) };
+  const data = payload("api-a", "已保存的观察");
+  data.available.targetTextCount = 2126;
+  data.available.mbtiEvidenceCount = 120;
+  data.mbtiBasis.JP.evidenceCount = 0;
+  const first = personaHarness(async () => data, storage);
+  first.ui.renderApiPortrait(data);
+  assert.equal(first.byId("heroMbti").textContent, "EN??");
+  const cold = personaHarness(() => new Promise(() => {}), storage);
+  cold.ui.loadProfile();
+  assert.equal(cold.byId("heroMbti").textContent, "EN??");
+  assert.match(textOf(cold.byId("mbtiSources")), /120 条目标文本/);
+  assert.match(textOf(cold.byId("mbtiScalesList").children[3]), /尚无足够证据/);
+});
+
+it("refreshes legacy lock guidance on completion while preserving native lock rules", () => {
+  const data = payload("api-a", "观察尚不足");
+  data.progress.complete = false;
+  data.job = { status: "running", phase: "observing" };
+  const { ui, byId } = personaHarness(async () => data);
+  ui.renderApiPortrait(data);
+  assert.match(textOf(byId("mbtiScalesList")), /尚未完成/);
+  data.progress.complete = true;
+  data.job = { status: "done" };
+  ui.renderApiPortrait(data);
+  assert.match(textOf(byId("mbtiScalesList")), /需完成聊天观察.*当前 5\/100/);
+  assert.doesNotMatch(textOf(byId("mbtiScalesList")), /尚未完成/);
+  const native = nativePayload();
+  native.nativeProfile.mbtiInference.eligibleMessages = 30;
+  native.available.mbtiEvidenceCount = 999;
+  ui.renderApiPortrait(native);
+  assert.equal(byId("heroMbti").textContent, "30/100 条");
+  assert.match(textOf(byId("mbtiScalesList")), /需积累 100 条该人物有效文本/);
+  assert.doesNotMatch(textOf(byId("mbtiScalesList")), /需完成聊天观察/);
+});
+
+it("distinguishes queued work from an interrupted legacy run that never observed any text", () => {
+  const data = payload("api-a", "等待画像");
+  data.available.mbtiEvidenceCount = 0;
+  data.progress = { processed: 0, processedTargetTexts: 0, total: 8, complete: false };
+  const { ui, context, byId } = personaHarness(async () => data);
+  context.apiPortraitBusy = true;
+  data.job = { status: "idle" };
+  ui.renderApiPortrait(data);
+  assert.equal(byId("apiPortraitStatus").textContent, "API 画像未开始（观察阶段未运行），请重新分析");
+  data.job = { status: "queued" };
+  ui.renderApiPortrait(data);
+  assert.equal(byId("apiPortraitStatus").textContent, "API 画像已排队，等待执行");
+  assert.equal(byId("stripStatusText").textContent, "已排队，等待 API 分析");
+  data.job = { status: "running", phase: "observing" };
+  ui.renderApiPortrait(data);
+  assert.equal(byId("apiPortraitStatus").textContent, "正在提取聊天观察");
 });
 
 it("uses the shared MBTI evidence state without an API-only unlock action", () => {

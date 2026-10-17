@@ -92,6 +92,22 @@ class AnalysisOverviewTests(unittest.TestCase):
         self.assertEqual(data["totals"]["conversations"], 1)
         self.assertNotIn("note", data["totals"])
 
+    def test_selection_change_refreshes_text_totals_immediately(self):
+        self.assertEqual(self.backend.analysis_overview()["textTotal"], 10)
+        self.selection.set_selected("wxid_real_a_abcd", "wxid_b", True)
+        self.assertEqual(self.backend.analysis_overview()["textTotal"], 20)
+        self.selection.set_selected("wxid_real_a_abcd", "wxid_a", False)
+        self.assertEqual(self.backend.analysis_overview()["textTotal"], 10)
+
+    def test_performance_filters_account_and_counts_unique_conversations(self):
+        self.backend.performance.update({
+            ("wxid_real_a_abcd", "wxid_a", "old"): {"analyzeMs": 10},
+            ("wxid_real_a_abcd", "wxid_a", "new"): {"analyzeMs": 20},
+            ("wxid_other", "wxid_b", "new"): {"analyzeMs": 100},
+        })
+        result = self.backend.analysis_performance()
+        self.assertEqual(result["totals"], {"analyzeMs": 30, "conversations": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

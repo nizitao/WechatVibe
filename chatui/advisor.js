@@ -83,6 +83,17 @@
       save("advisor_threads_v1", this.threadCache);
     },
     getEnabledTemplates() { return this.catalogReady ? this.catalog.agents.filter(agent => agent.enabled) : []; },
+    getReplyContext() {
+      const agent = this.getEnabledTemplates().find(item => item.id === this.activeAgentId);
+      return { ready: this.catalogReady, agentId: agent?.id || "",
+        agentRevision: Number.isSafeInteger(agent?.revision) && agent.revision > 0 ? agent.revision : 0 };
+    },
+    notifyReplyContext() {
+      const context = this.getReplyContext(), key = JSON.stringify(context);
+      if (key === this.replyContextKey) return;
+      this.replyContextKey = key;
+      window.dispatchEvent(new CustomEvent("advisor-selection-changed", { detail: context }));
+    },
     async fetchJson(url, options = {}) {
       try {
         const response = await fetch(url, options);
@@ -155,6 +166,7 @@
       }
       this.postToFrame("ADVISOR_SET_TEMPLATES", { enabledTemplates: enabled, activeAgentId: this.activeAgentId,
         catalogReady: this.catalogReady, engineState: this.catalogReady ? this.catalog.engine.state : "unknown" });
+      this.notifyReplyContext();
       if (previous !== this.activeAgentId) void this.loadThread();
     },
     async loadCatalog() {

@@ -23,6 +23,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import message_input
+from account_pin_source import AccountPinError, UNRESOLVED, conflicting_instance
 from api_pool import ApiAnalyzerPool, MAX_API_WORKERS
 from api_tasks import ApiTaskCoordinator
 from api_portrait_statistics import (append_batch, profile_from_statistics,
@@ -43,15 +44,15 @@ from backend_contracts import (
 )
 from conversation_selection import ConversationSelectionStore, _session_id
 from data_root_source import DataRootSource
-from guidance_contracts import (GUIDANCE_CONTEXT_CHARACTERS, GUIDANCE_FEEDBACK_MAX,
+from guidance_contracts import (GUIDANCE_CONTEXT_CHARACTERS, GUIDANCE_DRAFT_MAX, GUIDANCE_FEEDBACK_MAX,
                                 GUIDANCE_PORTRAIT_CONTEXT_MAX, GUIDANCE_REVISION,
                                 GUIDANCE_SCENARIOS, GUIDANCE_SUMMARY_CONTEXT_MAX,
                                 GUIDANCE_WINDOW_MESSAGES, MAX_SUBTEXTS, guidance_scope,
-                                normalize_guidance)
+                                REPLY_OPTIONS_REVISION, normalize_guidance, normalize_reply_options)
 from history_browser import browse as browse_history, saved_results as saved_history_results, search as search_history
 from message_results import validate_fine_result, validate_portrait_result
 from model_source import (LOCAL_SOURCE_ID, ModelSourceStore, ModelSourceUnavailable,
-                            connection_values, profile_name)
+                          connection_values, profile_name)
 from node_analysis import NodeAnalysis
 from profile_signals import keywords_from_counts, summary_from_aggregate
 from profile_state import empty_state as empty_profile_state, traits_from_state
@@ -112,9 +113,11 @@ def save_worker_settings(workers, elastic):
 
 class Backend:
     def __init__(self, source, analyzer=None, store_factory=None, model_source_store=None,
-                  selection_store=None, data_root_store=None):
+                  selection_store=None, data_root_store=None, account_pin_store=None):
         self.source = source
         self.data_root_store = data_root_store or DataRootSource(ROOT)
+        # Synthetic backends do not enumerate live accounts merely to read health.
+        self.account_pin_store = account_pin_store
         # One local model process per analysis worker; worker threads resolve their own
         # through the analyzer property, so several conversations can be inferred at once.
         self._analyzer_ctx = threading.local()
@@ -147,7 +150,8 @@ class Backend:
         # Message-label turns run one per analyzer, so N conversations can be in flight
         # at once. Slot 0 is always the current api_analyzer, which keeps the injected
         # test doubles working; extras are separate API-only processes.
-        self.api_pool = ApiAnalyzerPool(lambda: self.api_analyzer)
+        self.api_pool = ApiAnalyzerPool(lambda: self.api_analyzer,
+                                       settings_path=self.model_source_store.path.parent / "api-workers.json")
         # API chat insights have their own source-scoped cache. The local Laya
         # portrait/affinity worker keeps its existing analysis version.
         # One ApiTaskCoordinator owns the lock/condition, the three registries and
@@ -158,12 +162,14 @@ class Backend:
         self.api_lock = self.api_tasks.lock
         self.api_condition = self.api_tasks.condition
         self.api_jobs = self.api_tasks.insight_jobs
+        self.api_insight_writers = {}
         self.api_portrait_jobs = self.api_tasks.portrait_jobs
         self.api_guidance_jobs = self.api_tasks.guidance_jobs
         self.api_portrait_inventory_jobs = self.api_tasks.inventory_jobs
         self.model_source_revision = 0
         self.active_model_source_mode = "local"
         self.active_model_source_id = LOCAL_SOURCE_ID
+        self.active_model_profile_id = None
         self.active_api_config = None
         if analyzer is None or model_source_store is not None:
             try:
@@ -171,6 +177,7 @@ class Backend:
                 if selected["selectedMode"] == "api" and selected["api"]:
                     self.active_model_source_mode = "api"
                     self.active_model_source_id = selected["sourceId"]
+                    self.active_model_profile_id = selected["profileId"]
                     self.active_api_config = {key: selected["api"][key]
                                               for key in ("protocol", "baseUrl", "model", "contextTokens")}
             except ModelSourceUnavailable:
@@ -182,12 +189,16 @@ class Backend:
         self.stores = {}
         self.text_totals = {}
         self.jobs = {}
+        self.message_jobs = OrderedDict()
+        self.message_jobs_lock = threading.RLock()
         self.jobs_lock = threading.Lock()
         self.request_condition = threading.Condition()
         self.active_requests = 0
         self.closing = False
         self.cache_clear_in_progress = set()
         self.analysis_scope_resets = set()
+        self.analysis_epochs = {}
+        self.analysis_source_epochs = {}
         self.analysis_cache_scope = None
         self.analysis_cache_scope_lock = threading.Lock()
         self.api_portrait_ledgers = {}
@@ -243,20 +254,23 @@ class Backend:
         except Exception:  # noqa: BLE001 - same reason
             return None
 
-    def _observe_advisor_window(self, account, workdir, user, messages, has_more_before):
+    def _observe_advisor_window(self, account, workdir, user, messages, has_more_before, binding=None):
         advisor = getattr(self, "_advisor", None)
         if advisor is None or self.closing or type(has_more_before) is not bool:
             return
         try:
-            advisor.observe_message_window(account, workdir, user, messages, has_more_before)
+            advisor.observe_message_window(account, workdir, user, messages, has_more_before, binding=binding)
         except Exception:
             # Assistant preparation must not break the existing chat display.
             return
 
-    def _invalidate_advisor_source(self):
-        invalidate = getattr(self.source, "invalidate_advisor_identity", None)
+    def _invalidate_advisor_source(self, *, binding=True):
+        invalidate = getattr(self.source, "invalidate_binding" if binding else "invalidate_advisor_identity", None)
         if callable(invalidate):
             invalidate()
+        with self.api_condition:
+            self._cancel_api_source_work_locked()
+            self.api_portrait_inventory_pieces = None
         advisor = getattr(self, "_advisor", None)
         if advisor is not None:
             advisor.cancel_stale_runs()
@@ -449,6 +463,7 @@ class Backend:
             close_probe = getattr(self.api_probe_analyzer, "close", None)
             if callable(close_probe):
                 close_probe()
+        self.api_pool.close_extras()
         if self.api_portrait_analyzer not in (self.analyzer, self.api_analyzer,
                                               self.api_probe_analyzer):
             close_portrait = getattr(self.api_portrait_analyzer, "close", None)
@@ -601,6 +616,21 @@ class Backend:
             if (account, user, source_id) in self.analysis_scope_resets:
                 raise RuntimeError("analysis-reset-in-progress")
 
+    def _analysis_epoch(self, account, user, source_id):
+        with self.request_condition:
+            self._check_analysis_reset(account, user, source_id)
+            key = (account, user, source_id)
+            return key, (self.analysis_epochs.get(key, 0),
+                         self.analysis_source_epochs.get((account, source_id), 0))
+
+    def _assert_analysis_epoch(self, captured):
+        key, epoch = captured
+        with self.request_condition:
+            self._check_analysis_reset(*key)
+            if (self.analysis_epochs.get(key, 0),
+                    self.analysis_source_epochs.get((key[0], key[2]), 0)) != epoch:
+                raise RuntimeError("analysis-reset-in-progress")
+
     def _scoped_identity(self):
         if self.closing:
             raise AccountUnavailableError()
@@ -632,6 +662,18 @@ class Backend:
     def _assert_scope(self, scope):
         if self.closing:
             raise AccountChangedError()
+        context = getattr(self, "_analyzer_ctx", None)
+        task_scope = getattr(context, "task_scope", None)
+        job = getattr(context, "task_job", None)
+        if job is not None and job.get("_cancelledByReset"):
+            raise RuntimeError("analysis-reset-in-progress")
+        if job is not None and job.get("_cancelledByModelSource"):
+            raise ModelSourceUnavailable("model source changed")
+        if len(scope) == 2 and task_scope is not None and task_scope[:2] == scope:
+            scope = task_scope
+        if len(scope) > 2:
+            self.source.assert_binding(scope[2])
+            return
         verified = getattr(self.source, "verified_identity", None)
         if callable(verified):
             account, workdir = verified(messages=True)
@@ -642,6 +684,43 @@ class Backend:
             account, workdir = self.source.identity()
         if (str(account), str(Path(workdir).resolve())) != scope:
             raise AccountChangedError()
+
+    def _capture_scope(self, account, workdir):
+        """Capture before input reads, then carry this exact binding into queued work."""
+        scope = (str(account), str(Path(workdir).resolve()))
+        capture = getattr(self.source, "capture_binding", None)
+        if callable(capture):
+            binding = capture()
+            if (binding.account, binding.workdir) != scope:
+                raise AccountChangedError()
+            return (*scope, binding)
+        # Fixed injected legacy adapters have no mutable source selection.
+        self._assert_scope(scope)
+        return scope
+
+    @contextmanager
+    def _source_scope(self, scope, job=None):
+        context = self._analyzer_ctx
+        previous = (getattr(context, "task_scope", None), getattr(context, "task_job", None))
+        context.task_scope, context.task_job = scope, job
+        try:
+            legacy = getattr(self.source, "request_scope", None)
+            binding = (self.source.binding_scope(scope[2]) if len(scope) > 2 else
+                       legacy() if callable(legacy) else nullcontext())
+            with binding:
+                self._assert_scope(scope)
+                yield
+        finally:
+            context.task_scope, context.task_job = previous
+
+    @contextmanager
+    def _scope_commit(self, scope):
+        """Explicit source selection and a checked cache commit share the source lock."""
+        source_lock = getattr(self.source, "lock", None)
+        with source_lock if source_lock is not None else nullcontext():
+            if scope is not None:
+                self._assert_scope(scope)
+            yield
 
     def _stored_progress(self, account, user, version, store):
         progress = store.progress(account, user, version)
@@ -673,6 +752,10 @@ class Backend:
         preparation = self.preparation_status(account)
         if preparation is not None and state != "ready":
             data["preparation"] = preparation
+        if self.account_pin_store is not None:
+            # A failed reader probe cannot distinguish logged out from keys still preparing.
+            resolved = account if state == "ready" else UNRESOLVED
+            data["accountPin"] = self.account_pin_store.status(include_live=False, resolved=resolved)
         return {"ok": state not in ("error", "account-unavailable") and model["state"] not in ("error", "missing"), "data": data,
                 "model": {"state": model["state"],
                           **({"provider": model["provider"]} if model.get("provider") in ("cpu", "webgpu") else {}),
@@ -712,13 +795,21 @@ class Backend:
         return self.data_root_store.status()
 
     def configure_data_root(self, value):
-        result = self.data_root_store.select(value)
-        self._invalidate_advisor_source()
+        with self._scope_commit(None):
+            result = self.data_root_store.select(value)
+            invalidate = getattr(self.source, "invalidate_binding", None)
+            if callable(invalidate):
+                invalidate()
+        self._invalidate_advisor_source(binding=False)
         return result
 
     def clear_data_root(self):
-        result = self.data_root_store.clear()
-        self._invalidate_advisor_source()
+        with self._scope_commit(None):
+            result = self.data_root_store.clear()
+            invalidate = getattr(self.source, "invalidate_binding", None)
+            if callable(invalidate):
+                invalidate()
+        self._invalidate_advisor_source(binding=False)
         return result
 
     def model_source(self):
@@ -726,12 +817,37 @@ class Backend:
             return self.model_source_store.public(self.active_model_source_mode,
                                                   self.active_model_source_id, "active")
 
+    def account_pin_status(self):
+        return self.account_pin_store.status()
+
+    def configure_account_pin(self, value):
+        from instance_identity import profile_name
+        if conflicting_instance(value, ROOT, profile_name()) is not None:
+            raise AccountPinError("这个账号正被另一个实例使用，请先在那边点「恢复自动」")
+        with self._scope_commit(None):
+            result = self.account_pin_store.select(value)
+            invalidate = getattr(self.source, "invalidate_binding", None)
+            if callable(invalidate):
+                invalidate()
+        self._invalidate_advisor_source(binding=False)
+        return result
+
+    def clear_account_pin(self):
+        with self._scope_commit(None):
+            result = self.account_pin_store.clear()
+            invalidate = getattr(self.source, "invalidate_binding", None)
+            if callable(invalidate):
+                invalidate()
+        self._invalidate_advisor_source(binding=False)
+        return result
+
     def model_source_list(self, request):
         values = connection_values(request)
         key = self.model_source_store.resolve_key(values["protocol"], values["baseUrl"],
-                                                  values["apiKey"])
+                                                  values["apiKey"], profile_id=values.get("profileId"))
         try:
-            reply = self.api_probe_analyzer.model_list(values["protocol"], values["baseUrl"], key)
+            with self.api_pool.dedicated("probe", cancelled=lambda: self.closing):
+                reply = self.api_probe_analyzer.model_list(values["protocol"], values["baseUrl"], key)
         except Exception as exc:
             raise model_source_failure(exc, "model list unavailable") from exc
         if not isinstance(reply, dict) or type(reply.get("supported")) is not bool or not isinstance(
@@ -764,10 +880,11 @@ class Backend:
     def model_source_test(self, request):
         values = connection_values(request, require_model=True)
         key = self.model_source_store.resolve_key(values["protocol"], values["baseUrl"],
-                                                  values["apiKey"])
+                                                  values["apiKey"], profile_id=values.get("profileId"))
         try:
-            reply = self.api_probe_analyzer.model_test(values["protocol"], values["baseUrl"], key,
-                                             values["model"])
+            with self.api_pool.dedicated("probe", cancelled=lambda: self.closing):
+                reply = self.api_probe_analyzer.model_test(values["protocol"], values["baseUrl"], key,
+                                                         values["model"])
         except Exception as exc:
             raise model_source_failure(exc, "model connection failed") from exc
         latency = reply.get("latencyMs") if isinstance(reply, dict) else None
@@ -796,10 +913,7 @@ class Backend:
         """Stop old-source model calls; saved portraits, cursors and the source-independent
         inventory stay intact. Only insight/portrait jobs are cancelled."""
         self.api_tasks.invalidate_models()
-        # Every pooled analyzer holds provider turns of its own; cancelling only the
-        # primary would leave the extras running against the old source.
-        self.api_pool.invalidate()
-        seen = set()
+        seen = self.api_pool.invalidate()
         for analyzer in (self.api_analyzer, self.api_portrait_analyzer,
                          self.api_probe_analyzer):
             if analyzer is self.analyzer or id(analyzer) in seen:
@@ -808,48 +922,6 @@ class Backend:
             cancel = getattr(analyzer, "cancel", None)
             if callable(cancel):
                 cancel()
-
-    def _profile_id(self, value):
-        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
-            raise ValueError("invalid model source request")
-        return value
-
-    def _commit_api_source_locked(self, source_id, config, previous_context):
-        """Publish a probed configuration as the active source."""
-        changed_source = (self.active_model_source_mode != "api" or
-                          self.active_model_source_id != source_id or
-                          self.active_api_config != config)
-        self.active_model_source_mode = "api"
-        self.active_model_source_id = source_id
-        self.active_api_config = config
-        if changed_source:
-            self._cancel_api_source_work_locked()
-        if previous_context != config["contextTokens"]:
-            self.api_tasks.drop_portrait_error(source_id)
-        self.model_source_revision += 1
-        # The assistant keeps provider runs of its own, so a source or budget change has to
-        # invalidate them exactly like it invalidates insights and portraits. Upstream had
-        # this in `model_source_activate`; every publishing path here goes through this
-        # method (`model_source_activate`, `_activate_saved_profile`,
-        # `model_source_profile_save`), so one call covers them all.
-        advisor = getattr(self, "_advisor", None)
-        if advisor is not None:
-            advisor.cancel_stale_runs()
-
-    def _activate_saved_profile(self, profile_id):
-        """Switch to a stored profile. It was probed before it was saved, so no
-        network round trip is needed and the switch stays instant."""
-        self._profile_id(profile_id)
-        with self.api_lock:
-            profile = self.model_source_store.profile(profile_id)
-            if profile is None:
-                raise ValueError("invalid model source request")
-            config = {field: profile[field] for field in
-                      ("protocol", "baseUrl", "model", "contextTokens")}
-            previous_context = (self.active_api_config or {}).get("contextTokens")
-            self.model_source_store.select_profile(profile_id)
-            self._commit_api_source_locked(profile_id, config, previous_context)
-            return self.model_source()
 
     def model_source_activate(self, request):
         if request == {"mode": "local"}:
@@ -881,8 +953,6 @@ class Backend:
         name = profile_name(request.get("name"), values["model"])
         profile_id = self._profile_id(request["profileId"]) if "profileId" in request else None
         with self.api_lock:
-            key = self.model_source_store.resolve_key(values["protocol"], values["baseUrl"],
-                                                      values["apiKey"])
             revision = self.model_source_revision
             # Activating a connection that a stored profile already covers updates that
             # profile in place instead of piling up duplicates.
@@ -891,14 +961,19 @@ class Backend:
                           values["protocol"], values["baseUrl"], values["model"]))
             if profile_id is None and target is not None:
                 profile_id = target["id"]
+            key = self.model_source_store.resolve_key(values["protocol"], values["baseUrl"],
+                                                      values["apiKey"], profile_id=profile_id)
+            key_to_save, credentials_changed = self._profile_key_update(target, values, key)
             reuse_validated = (values["apiKey"] is None and key is not None and
                                target is not None and target["encryptedKey"] and
                                (target["protocol"], target["baseUrl"], target["model"]) ==
                                (values["protocol"], values["baseUrl"], values["model"]))
         if not reuse_validated:
             try:
-                tested = self.api_probe_analyzer.model_test(values["protocol"], values["baseUrl"], key,
-                                                  values["model"])
+                with self.api_pool.dedicated("probe", cancelled=lambda: self.closing,
+                        validate=lambda: self._assert_model_revision(revision)):
+                    tested = self.api_probe_analyzer.model_test(values["protocol"], values["baseUrl"], key,
+                                                              values["model"])
             except Exception as exc:
                 raise model_source_failure(exc, "model connection failed") from exc
             if not isinstance(tested, dict) or tested.get("ok") is not True:
@@ -908,13 +983,100 @@ class Backend:
                 raise ModelSourceUnavailable("model source changed during connection test")
             previous_context = (self.active_api_config or {}).get("contextTokens")
             source_id = self.model_source_store.save_profile(
-                profile_id, name, values["protocol"], values["baseUrl"], values["model"], key,
+                profile_id, name, values["protocol"], values["baseUrl"], values["model"], key_to_save,
                 values["contextTokens"])
             self.model_source_store.select_profile(source_id)
             self._commit_api_source_locked(
                 source_id, {field: values[field] for field in
                             ("protocol", "baseUrl", "model", "contextTokens")},
-                previous_context)
+                previous_context, credentials_changed=credentials_changed)
+            return self.model_source()
+
+    def model_source_clear_key(self, request):
+        if not isinstance(request, dict) or not request.keys() <= {"profileId"}:
+            raise ValueError("invalid model source request")
+        profile_id = self._profile_id(request["profileId"]) if "profileId" in request else None
+        with self.api_lock:
+            was_api = self.active_model_source_mode == "api"
+            reverted = self.model_source_store.clear_key(profile_id)
+            if reverted or profile_id is None:
+                if was_api:
+                    self.active_model_source_mode = "local"
+                    self.active_model_source_id = LOCAL_SOURCE_ID
+                    self.active_api_config = None
+                self.model_source_revision += 1
+                if was_api:
+                    self._cancel_api_source_work_locked()
+            return self.model_source()
+
+    def _profile_id(self, value):
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+            raise ValueError("invalid model source request")
+        return value
+
+    def _profile_key_update(self, profile, values, resolved_key):
+        """Retain identical protected bytes; a replaced key retires captured old keys.
+
+        The comparison is transient and never changes the inference/cache identity.
+        Keeping the ciphertext also avoids treating a name-only edit as a different
+        Advisor configuration when DPAPI produces a new wrapper for the same key.
+        """
+        if profile is not None and (profile["protocol"], profile["baseUrl"]) == (
+                values["protocol"], values["baseUrl"]):
+            if values["apiKey"] is None:
+                return None, False
+            try:
+                previous_key = self.model_source_store.resolve_key(
+                    profile["protocol"], profile["baseUrl"], None, profile_id=profile["id"])
+            except ModelSourceUnavailable:
+                # A newly validated key can replace an unreadable old credential.
+                # Do not make repairing that profile depend on decrypting it.
+                return resolved_key, True
+            if previous_key == resolved_key:
+                return None, False
+        return resolved_key, True
+
+    def _commit_api_source_locked(self, source_id, config, previous_context, *, credentials_changed=False):
+        """Publish a probed configuration as the active source."""
+        previous_profile = self.active_model_profile_id
+        self.active_model_profile_id = source_id
+        source_id = self.model_source_store.profile_source_id(source_id)
+        changed_source = (credentials_changed or self.active_model_source_mode != "api" or
+                          previous_profile != self.active_model_profile_id or
+                          self.active_model_source_id != source_id or
+                          self.active_api_config != config)
+        self.active_model_source_mode = "api"
+        self.active_model_source_id = source_id
+        self.active_api_config = config
+        if changed_source:
+            # A standalone local re-run has no resumable background cursor. Give it
+            # a terminal cancellation, including when the source switches back later.
+            with self._scope_commit(None):
+                with self.message_jobs_lock:
+                    for entry in self.message_jobs.values():
+                        if entry[2] == LOCAL_SOURCE_ID and entry[4].get("status") in ("queued", "running"):
+                            entry[4].update(status="cancelled", _cancelledByModelSource=True)
+            self._cancel_api_source_work_locked()
+        if previous_context != config["contextTokens"]:
+            self.api_tasks.drop_portrait_error(source_id)
+        self.model_source_revision += 1
+        advisor = getattr(self, "_advisor", None)
+        if advisor is not None:
+            advisor.cancel_stale_runs()
+
+    def _activate_saved_profile(self, profile_id):
+        """Switch to a stored profile. It was probed before it was saved, so no
+        network round trip is needed and the switch stays instant."""
+        self._profile_id(profile_id)
+        with self.api_lock:
+            profile = self.model_source_store.profile(profile_id)
+            if profile is None:
+                raise ValueError("invalid model source request")
+            config = {field: profile[field] for field in
+                      ("protocol", "baseUrl", "model", "contextTokens")}
+            previous_context = (self.active_api_config or {}).get("contextTokens")
+            self.model_source_store.select_profile(profile_id)
+            self._commit_api_source_locked(profile_id, config, previous_context)
             return self.model_source()
 
     def model_source_profile_save(self, request):
@@ -930,23 +1092,26 @@ class Backend:
         profile_id = self._profile_id(request["profileId"]) if "profileId" in request else None
         with self.api_lock:
             key = self.model_source_store.resolve_key(values["protocol"], values["baseUrl"],
-                                                      values["apiKey"])
+                                                      values["apiKey"], profile_id=profile_id)
             revision = self.model_source_revision
             existing = self.model_source_store.profile(profile_id) if profile_id else None
             if profile_id is not None and existing is None:
                 raise ValueError("invalid model source request")
+            key_to_save, credentials_changed = self._profile_key_update(existing, values, key)
             # Editing the profile the conversation already runs on must not leave the
             # worker pointing at the previous values.
             active = (self.active_model_source_mode == "api" and
-                      self.active_model_source_id == profile_id)
+                      self.active_model_profile_id == profile_id)
             reuse_validated = (values["apiKey"] is None and key is not None and
                                existing is not None and existing["encryptedKey"] and
                                (existing["protocol"], existing["baseUrl"], existing["model"]) ==
                                (values["protocol"], values["baseUrl"], values["model"]))
         if not reuse_validated:
             try:
-                tested = self.api_probe_analyzer.model_test(values["protocol"], values["baseUrl"], key,
-                                                  values["model"])
+                with self.api_pool.dedicated("probe", cancelled=lambda: self.closing,
+                        validate=lambda: self._assert_model_revision(revision)):
+                    tested = self.api_probe_analyzer.model_test(values["protocol"], values["baseUrl"], key,
+                                                              values["model"])
             except Exception as exc:
                 raise model_source_failure(exc, "model connection failed") from exc
             if not isinstance(tested, dict) or tested.get("ok") is not True:
@@ -956,13 +1121,15 @@ class Backend:
                 raise ModelSourceUnavailable("model source changed during connection test")
             previous_context = (self.active_api_config or {}).get("contextTokens") if active else None
             source_id = self.model_source_store.save_profile(
-                profile_id, name, values["protocol"], values["baseUrl"], values["model"], key,
+                profile_id, name, values["protocol"], values["baseUrl"], values["model"], key_to_save,
                 values["contextTokens"])
             if active:
                 self._commit_api_source_locked(
                     source_id, {field: values[field] for field in
                                 ("protocol", "baseUrl", "model", "contextTokens")},
-                    previous_context)
+                    previous_context, credentials_changed=credentials_changed)
+            else:
+                self.model_source_revision += 1
             return {**self.model_source(), "profile": source_id}
 
     def model_source_profile_delete(self, request):
@@ -980,27 +1147,361 @@ class Backend:
                 self._cancel_api_source_work_locked()
             return self.model_source()
 
-    def model_source_clear_key(self, request):
-        if not isinstance(request, dict) or not request.keys() <= {"profileId"}:
-            raise ValueError("invalid model source request")
-        profile_id = self._profile_id(request["profileId"]) if "profileId" in request else None
+    def _api_source_snapshot(self):
+        """The single gate every provider turn passes: no user-chosen API source, no call.
+
+        Returning the source id, a copy of the config and the resolved key from one critical
+        section keeps the "which endpoint is live" decision atomic, and leaves one place to
+        audit when a new API entry point is added.
+
+        `model_source_list` and `model_source_test` deliberately do NOT come through here: an
+        endpoint has to be probed before it can be activated, so those two run while the
+        active source is still local, and only ever on an explicit click.
+        """
         with self.api_lock:
-            was_api = self.active_model_source_mode == "api"
-            reverted = self.model_source_store.clear_key(profile_id)
-            if reverted or profile_id is None:
-                if was_api:
-                    self.active_model_source_mode = "local"
-                    self.active_model_source_id = LOCAL_SOURCE_ID
-                    self.active_api_config = None
-                self.model_source_revision += 1
-                # The assistant's provider runs hold the key that just went away. Clearing a
-                # *non-active* profile leaves the live source alone, so the runs stay valid.
-                advisor = getattr(self, "_advisor", None)
-                if advisor is not None:
-                    advisor.cancel_stale_runs()
-                if was_api:
-                    self._cancel_api_source_work_locked()
-            return self.model_source()
+            if self.active_model_source_mode != "api" or not self.active_api_config:
+                raise ModelSourceUnavailable("API model is not active")
+            config = dict(self.active_api_config)
+            return (self.active_model_source_id, config,
+                    self.model_source_store.resolve_key(config["protocol"],
+                                                        config["baseUrl"], None,
+                                                        profile_id=self.active_model_profile_id))
+
+    def _assert_model_revision(self, revision):
+        if self.closing or self.model_source_revision != revision:
+            raise ModelSourceUnavailable("model source changed during connection test")
+
+    def _api_subject_summary(self, store, account, user, source_id, subject):
+        """A short saved description of one subject, or "" when nothing is stored yet.
+
+        Guidance reads the same portrait summary the message labels use, so the advice
+        and the portrait card can never describe the same person differently.
+        """
+        saved = store.api_portrait_get(account, user, api_portrait_scope(source_id), subject)
+        if not saved:
+            return ""
+        statistics = (saved.get("resume") or {}).get("portraitStatistics")
+        if valid_statistics(statistics):
+            derived = profile_from_statistics(statistics, statistics["classifierVersion"],
+                                              is_group=user.endswith("@chatroom"), subject=subject)
+            return (derived["summary"] or "")[:GUIDANCE_SUMMARY_CONTEXT_MAX]
+        return (saved["portrait"]["summary"] or "")[:GUIDANCE_SUMMARY_CONTEXT_MAX]
+
+    @staticmethod
+    def _guidance_job_snapshot(job):
+        # Input identity is only for in-flight deduplication, never UI output.
+        return {key: value for key, value in job.items() if not key.startswith("_")}
+
+    def guidance(self, user, member=None, reply_options=False, agent_id=None, agent_revision=None):
+        if type(reply_options) is not bool:
+            raise ValueError("invalid reply options flag")
+        if not reply_options and (agent_id is not None or agent_revision is not None):
+            raise ValueError("assistant requires reply options")
+        assistant = (self.advisor_service().reply_identity(agent_id, agent_revision)
+                     if reply_options else None)
+        account, workdir, store = self._scoped_identity()
+        with self.api_lock:
+            mode, source_id = self.active_model_source_mode, self.active_model_source_id
+            job_key = (account, user, source_id, member or user)
+            if assistant:
+                job_key += (assistant["agentId"], assistant["stamp"])
+            current = self.api_guidance_jobs.get(job_key)
+            job = self._guidance_job_snapshot(current if current and
+                bool(current.get("replyOptions")) == reply_options else {"id": None, "status": "idle"})
+        saved = None
+        if mode == "api":
+            saved = store.api_guidance_get(account, user, guidance_scope(source_id, reply_options, assistant), member or user)
+            if saved and ((normalize_reply_options if reply_options else normalize_guidance)(
+                    saved["guidance"]) is None):
+                saved = None
+        self._assert_scope((account, workdir))
+        if assistant:
+            self.advisor_service().assert_reply_settings(assistant)
+        return {"account": account, "sourceId": source_id, "subject": member or user,
+                "version": REPLY_OPTIONS_REVISION if reply_options else GUIDANCE_REVISION,
+                **({key: assistant[key] for key in ("agentId", "agentRevision")} if assistant else {}),
+                "guidance": saved["guidance"] if saved else None, "job": job,
+                "suspended": store.cache_suspended(account, source_id) if mode == "api" else False}
+
+    def start_guidance(self, requested_account, user, member=None, scenario="auto",
+                       analyze_self=False, feedback=None, draft=None, reply_options=False,
+                       expected_source_id=None, agent_id=None, agent_revision=None):
+        if expected_source_id is not None and (
+                not isinstance(expected_source_id, str) or not 1 <= len(expected_source_id) <= 256 or
+                any(ord(char) < 32 or ord(char) == 127 for char in expected_source_id)):
+            raise ValueError("invalid guidance source")
+        if type(reply_options) is not bool:
+            raise ValueError("invalid reply options flag")
+        if not reply_options and (agent_id is not None or agent_revision is not None):
+            raise ValueError("assistant requires reply options")
+        if reply_options and (scenario != "auto" or analyze_self or feedback is not None or draft is not None):
+            raise ValueError("reply options require conversation context only")
+        if member is not None and (not user.endswith("@chatroom") or
+                                   not isinstance(member, str) or not 1 <= len(member) <= 256):
+            raise ValueError("invalid guidance subject")
+        if scenario not in GUIDANCE_SCENARIOS:
+            raise ValueError("invalid guidance scenario")
+        if type(analyze_self) is not bool:
+            raise ValueError("invalid guidance self-style flag")
+        if feedback is not None:
+            if (not isinstance(feedback, str) or len(feedback) > GUIDANCE_FEEDBACK_MAX or
+                    any(ord(char) < 32 or ord(char) == 127 for char in feedback)):
+                raise ValueError("invalid guidance feedback")
+            feedback = feedback.strip() or None
+        if draft is not None:
+            if (not isinstance(draft, str) or len(draft) > GUIDANCE_DRAFT_MAX or
+                    any((ord(char) < 32 and char not in "\t\r\n") or ord(char) == 127
+                        for char in draft)):
+                raise ValueError("invalid guidance draft")
+            draft = draft.strip() or None
+        account, workdir, store = self._scoped_identity()
+        if account != requested_account:
+            raise AccountChangedError()
+        scope = self._capture_scope(account, workdir)
+        with self.api_lock:
+            if expected_source_id is not None and self.active_model_source_id != expected_source_id:
+                raise RuntimeError("model-source-changed")
+            assistant_identity = (self.advisor_service().reply_identity(agent_id, agent_revision)
+                                  if reply_options else None)
+            response_identity = ({"version": REPLY_OPTIONS_REVISION,
+                                  "agentId": assistant_identity["agentId"],
+                                  "agentRevision": assistant_identity["agentRevision"]}
+                                 if assistant_identity else {})
+            input_digest = hashlib.sha256(json.dumps(
+                [scenario, analyze_self, feedback, draft, reply_options, assistant_identity], ensure_ascii=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest()
+            source_id, config, api_key = self._api_source_snapshot()
+            revision = self.model_source_revision
+            reset_epoch = self._analysis_epoch(account, user, source_id)
+            subject = member or user
+            job_key = (account, user, source_id, subject)
+            if assistant_identity:
+                job_key += (assistant_identity["agentId"], assistant_identity["stamp"])
+            current = self.api_guidance_jobs.get(job_key)
+            if current and current["status"] in ("queued", "running"):
+                if current.get("_inputDigest") != input_digest:
+                    raise RuntimeError("guidance-busy")
+                return {"account": account, "sourceId": source_id, "subject": subject,
+                        **response_identity,
+                        "job": self._guidance_job_snapshot(current)}
+            if store.cache_suspended(account, source_id):
+                return {"account": account, "sourceId": source_id, "subject": subject,
+                        **response_identity,
+                        "job": {"id": None, "status": "suspended"}}
+        window = self.source.messages(user, GUIDANCE_WINDOW_MESSAGES)
+        self._assert_scope(scope)
+        group = user.endswith("@chatroom")
+        wire = []
+        eligible = []
+        characters = 0
+        speakers = {}
+        for item in reversed(window):
+            if item["side"] not in ("self", "other") or item["kind"] != "text":
+                continue
+            if group and member and item["side"] == "other" and item.get("senderId") != member:
+                continue
+            text = item["text"]
+            if not isinstance(text, str):
+                continue
+            # Links never reach a model: the wire text is the link-free one, and a message
+            # that carried nothing but a link has no content to read.
+            analysis = message_input.analysis_text(text)
+            speaker_name = None
+            if group and not member and item["side"] == "other":
+                display = item.get("senderName")
+                if isinstance(display, str):
+                    display = re.sub(r"[\x00-\x1f\x7f]", " ", display).strip()
+                    if display and display != item.get("senderId"):
+                        speaker_name = display[:80]
+            characters += len(analysis) + len(speaker_name or "")
+            if characters > GUIDANCE_CONTEXT_CHARACTERS:
+                break
+            message = {"id": item["id"],
+                       "sender": "SELF" if item["side"] == "self" else "OTHER",
+                       "text": analysis}
+            if group and not member and item["side"] == "other":
+                # Keep group participants distinct without sending their contact ids.
+                # An unknown sender is never silently merged with another unknown one.
+                sender = item.get("senderId")
+                identity = (("sender", sender) if isinstance(sender, str) and sender
+                            else ("message", item["id"]))
+                message["speaker"] = speakers.setdefault(identity, f"P{len(speakers) + 1}")
+                if speaker_name:
+                    message["speakerName"] = speaker_name
+            wire.append(message)
+            if (item["side"] == "other" and message_input.has_analysis_content(text) and
+                    len(eligible) < MAX_SUBTEXTS and
+                    (not group or not member or item.get("senderId") == member)):
+                eligible.append(item["id"])
+        wire.reverse()
+        eligible.reverse()
+        if not eligible:
+            return {"account": account, "sourceId": source_id, "subject": subject,
+                    **response_identity,
+                    "job": {"id": None, "status": "insufficient"}}
+        assistant = None
+        if reply_options:
+            question = "如何回复当前会话：\n" + "\n".join(
+                item["sender"] + ": " + item["text"] for item in wire[-12:])[-12000:]
+            assistant = self.advisor_service().reply_settings(
+                agent_id, agent_revision, question=question, context_tokens=config["contextTokens"])
+            if assistant["stamp"] != assistant_identity["stamp"]:
+                from advisor_contracts import AdvisorError
+                raise AdvisorError("agent-changed", "助手设置已更新，请重新生成")
+        other_portrait = "" if reply_options else self._api_subject_summary(
+            store, account, user, source_id, subject)[:GUIDANCE_PORTRAIT_CONTEXT_MAX]
+        job = {"id": uuid.uuid4().hex, "status": "queued", "scenario": scenario,
+               "analyzeSelf": analyze_self, "targetCount": len(eligible),
+               "startedAtMs": int(time.time() * 1000), "_inputDigest": input_digest}
+        if reply_options:
+            job["replyOptions"] = True
+            job.update(agentId=assistant["agentId"], agentRevision=assistant["agentRevision"],
+                       _assistant=assistant)
+        with self.api_lock:
+            if (self.closing or self.active_model_source_mode != "api" or
+                    self.model_source_revision != revision or
+                    self.active_model_source_id != source_id or self.active_api_config != config):
+                raise ModelSourceUnavailable("model source changed")
+            self._assert_scope(scope)
+            self._assert_analysis_epoch(reset_epoch)
+            if assistant:
+                self.advisor_service().assert_reply_settings(assistant)
+            current = self.api_guidance_jobs.get(job_key)
+            if current and current["status"] in ("queued", "running"):
+                if current.get("_inputDigest") != input_digest:
+                    raise RuntimeError("guidance-busy")
+                return {"account": account, "sourceId": source_id, "subject": subject,
+                        **response_identity,
+                        "job": self._guidance_job_snapshot(current)}
+            self.api_guidance_jobs[job_key] = job
+            if len(self.api_guidance_jobs) > API_JOB_CACHE_LIMIT:
+                for old_key, old_job in list(self.api_guidance_jobs.items()):
+                    if len(self.api_guidance_jobs) <= API_JOB_CACHE_LIMIT:
+                        break
+                    if old_key != job_key and old_job["status"] not in ("queued", "running"):
+                        del self.api_guidance_jobs[old_key]
+            self.api_tasks.begin()
+        thread = threading.Thread(target=self._run_guidance,
+                                  args=(job_key, job, scope, store, config,
+                                        api_key, wire, eligible, other_portrait, feedback, draft),
+                                  daemon=True)
+        try:
+            thread.start()
+        except Exception:
+            self.api_tasks.finish()
+            job["status"] = "error"
+            job["error"] = "model-analysis-failed"
+            raise
+        return {"account": account, "sourceId": source_id, "subject": subject,
+                **response_identity,
+                "job": self._guidance_job_snapshot(job)}
+
+    def _assert_guidance_job(self, job_key, job, scope, store):
+        self._assert_api_job(self.api_guidance_jobs, job_key, job, scope, store)
+        if job.get("_assistant"):
+            self.advisor_service().assert_reply_settings(job["_assistant"])
+
+    def _run_guidance(self, job_key, job, scope, store, config, api_key, wire, targets,
+                      other_portrait, feedback, draft):
+        try:
+            with self._source_scope(scope):
+                self._run_guidance_bound(job_key, job, scope, store, config, api_key, wire, targets,
+                                         other_portrait, feedback, draft)
+        except Exception:
+            with self.api_lock:
+                job.update(status="error", error="model-source-changed")
+            # `_run_guidance_bound` owns the inflight counter in its own finally; finishing
+            # here as well drove it negative, which `wait_for_idle` can never satisfy.
+
+    def _run_guidance_bound(self, job_key, job, scope, store, config, api_key, wire, targets,
+                            other_portrait, feedback, draft):
+        try:
+            self._assert_guidance_job(job_key, job, scope, store)
+            with self.api_lock:
+                if (self.closing or self.active_model_source_mode != "api" or
+                        self.active_model_source_id != job_key[2]):
+                    job["status"] = "error"
+                    job["error"] = "model-source-changed"
+                    return
+                job["status"] = "running"
+            for attempt in range(API_MODEL_RETRY_MAX + 1):
+                try:
+                    self._assert_guidance_job(job_key, job, scope, store)
+                    with self.api_lock:
+                        if self.api_guidance_jobs.get(job_key) is not job:
+                            raise RuntimeError("model-source-changed")
+                    self._assert_scope(scope)
+                    with self.api_pool.lease(validate=lambda: self._assert_guidance_job(
+                            job_key, job, scope, store)) as analyzer:
+                        response = analyzer.model_guidance(
+                            config["protocol"], config["baseUrl"], api_key, config["model"],
+                            wire, targets, job["scenario"], job["analyzeSelf"],
+                            config["contextTokens"],
+                            other_portrait or None,
+                            self._guidance_self_summary(store, job_key) if job["analyzeSelf"] else None,
+                            feedback, draft, *((True, job["_assistant"]) if job.get("replyOptions") else ()))
+                    self.api_pool.note_success()
+                    if job.get("replyOptions"):
+                        guidance = normalize_reply_options(response.get("guidance"))
+                        if guidance is None:
+                            raise RuntimeError("invalid-guidance")
+                    else:
+                        guidance = normalize_guidance(response.get("guidance"))
+                        if (guidance is None or guidance["scenario"] != job["scenario"] or
+                                guidance["analyzeSelf"] != job["analyzeSelf"] or
+                                {entry["id"] for entry in guidance["subtexts"]} != set(targets)):
+                            raise RuntimeError("invalid-guidance")
+                except Exception as exc:
+                    code = getattr(exc, "code", str(exc))
+                    if code == "rate-limit":
+                        self.api_pool.note_rate_limited()
+                    if (attempt >= API_MODEL_RETRY_MAX or code not in API_MODEL_RETRYABLE or
+                            (job.get("replyOptions") and code == "output-truncated")):
+                        raise
+                    self._assert_scope(scope)
+                    self._wait_api_model_retry(self.api_guidance_jobs, job_key, job, store,
+                                               code, attempt + 1)
+                    continue
+                break
+            with self.api_lock:
+                if (self.closing or self.active_model_source_mode != "api" or
+                        self.active_model_source_id != job_key[2] or
+                        self.api_guidance_jobs.get(job_key) is not job or
+                        store.cache_suspended(job_key[0], job_key[2])):
+                    raise RuntimeError("model-source-changed")
+                source_lock = getattr(self.source, "lock", None)
+                settings_lock = self.advisor_service().stores.config.lock if job.get("_assistant") else nullcontext()
+                # Assistant sends already acquire source before catalog configuration.
+                with source_lock if source_lock is not None else nullcontext():
+                    with settings_lock:
+                        self._assert_guidance_job(job_key, job, scope, store)
+                        self._assert_scope(scope)
+                        store.api_guidance_save(job_key[0], job_key[1],
+                                                guidance_scope(job_key[2], bool(job.get("replyOptions")), job.get("_assistant")),
+                                                job_key[3], guidance)
+                job["status"] = "done"
+        except Exception as exc:
+            code = getattr(exc, "code", str(exc))
+            with self.api_lock:
+                job.pop("retry", None)
+                job["error"] = code if code in MODEL_CONNECTOR_ERRORS or code in {
+                    "model-source-changed", "invalid-guidance", "guidance-version-invalid",
+                    "invalid-request", "agent-changed", "agent-disabled", "agent-unknown", "skill-unknown"} else "model-analysis-failed"
+                job["status"] = "error"
+        finally:
+            self.api_tasks.finish()
+
+    def _guidance_self_summary(self, store, job_key):
+        """Self advice uses SELF turns; the stored conversation portrait describes OTHER."""
+        return None
+
+    def api_worker_status(self):
+        """Current API parallelism, for the settings row and the API panel tooltip."""
+        return self.api_pool.status()
+
+    def set_api_worker_settings(self, workers=None):
+        """Resize the API analyzer pool and remember the choice for the next launch."""
+        return self.api_pool.configure(workers)
 
     def model_insights(self, user, ids=None):
         if ids is not None and (not isinstance(ids, list) or len(ids) > 500 or
@@ -1022,26 +1523,7 @@ class Backend:
         return {"account": account, "sourceId": source_id, "results": results, "job": job,
                 "suspended": suspended}
 
-    def _api_source_snapshot(self):
-        """The single gate every provider turn passes: no user-chosen API source, no call.
-
-        Returning the source id, a copy of the config and the resolved key from one critical
-        section keeps the "which endpoint is live" decision atomic, and leaves one place to
-        audit when a new API entry point is added.
-
-        `model_source_list` and `model_source_test` deliberately do NOT come through here: an
-        endpoint has to be probed before it can be activated, so those two run while the
-        active source is still local, and only ever on an explicit click.
-        """
-        with self.api_lock:
-            if self.active_model_source_mode != "api" or not self.active_api_config:
-                raise ModelSourceUnavailable("API model is not active")
-            config = dict(self.active_api_config)
-            return (self.active_model_source_id, config,
-                    self.model_source_store.resolve_key(config["protocol"],
-                                                        config["baseUrl"], None))
-
-    def start_model_insights(self, requested_account, user, limit, target_ids=None, around=None):
+    def start_model_insights(self, requested_account, user, limit, target_ids=None, around=None, *, force=False):
         started = time.perf_counter()
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid API insight limit")
@@ -1057,17 +1539,21 @@ class Backend:
         account, workdir, store = self._scoped_identity()
         if account != requested_account:
             raise AccountChangedError()
+        scope = self._capture_scope(account, workdir)
         with self.api_lock:
             source_id, config, api_key = self._api_source_snapshot()
+            revision = self.model_source_revision
+            reset_epoch = self._analysis_epoch(account, user, source_id)
         window = (browse_history(self.source, account, user, around=around, limit=500,
                                  max_issued_images=MAX_ISSUED_IMAGES)["messages"]
                   if around is not None else self.source.messages(user, 500))
-        self._assert_scope((account, workdir))
+        self._assert_scope(scope)
         with self.api_lock:
             if (self.closing or self.active_model_source_mode != "api" or
+                    self.model_source_revision != revision or
                     self.active_model_source_id != source_id):
                 raise ModelSourceUnavailable("model source changed")
-            self._check_analysis_reset(account, user, source_id)
+            self._assert_analysis_epoch(reset_epoch)
             if store.cache_suspended(account, source_id):
                 return {"account": account, "sourceId": source_id,
                         "job": {"id": None, "status": "suspended", "total": 0, "processed": 0}}
@@ -1090,11 +1576,11 @@ class Backend:
             # provider decides how much of it fits its context window.
             known = store.api_insight_known(account, user, api_insight_scope(source_id),
                                             [item["id"] for item in selected])
-            job_key = (account, user, source_id)
+            job_key = (account, user, source_id, uuid.uuid4().hex) if force else (account, user, source_id)
             current = self.api_jobs.get(job_key)
             if current and current["status"] in ("queued", "running"):
                 return {"account": account, "sourceId": source_id, "job": dict(current)}
-            pending = [item for item in selected if item["id"] not in known]
+            pending = list(selected) if force else [item for item in selected if item["id"] not in known]
             wire = []
             if pending:
                 pending_ids = {item["id"] for item in pending}
@@ -1124,6 +1610,10 @@ class Backend:
                    "partialText": "",
                    "timings": {"firstBodyMs": None}}
             self.api_jobs[job_key] = job
+            for item in pending:
+                self.api_insight_writers[(*job_key[:3], item["id"])] = job["id"]
+            if force:
+                self._register_message_job(account, user, source_id, scope, job)
             if len(self.api_jobs) > API_JOB_CACHE_LIMIT:
                 for old_key, old_job in list(self.api_jobs.items()):
                     if len(self.api_jobs) <= API_JOB_CACHE_LIMIT:
@@ -1137,11 +1627,13 @@ class Backend:
                 return {"account": account, "sourceId": source_id, "job": dict(job)}
             self.api_tasks.begin()
             thread = threading.Thread(target=self._run_model_insights,
-                                      args=(job_key, job, (account, workdir), store, config,
+                                      args=(job_key, job, scope, store, config,
                                             api_key, wire, pending), daemon=True)
             try:
                 thread.start()
             except Exception:
+                for item in pending:
+                    self.api_insight_writers.pop((*job_key[:3], item["id"]), None)
                 self.api_tasks.finish()
                 job["status"] = "error"
                 job["error"] = "model-analysis-failed"
@@ -1150,6 +1642,34 @@ class Backend:
 
     def _run_model_insights(self, job_key, job, scope, store, config, api_key, wire, pending):
         try:
+            with self._source_scope(scope):
+                self._run_model_insights_bound(job_key, job, scope, store, config, api_key, wire, pending)
+        except Exception:
+            with self.api_lock:
+                job.update(status="error", error="model-source-changed")
+        finally:
+            with self.api_lock:
+                for message in pending:
+                    key = (*job_key[:3], message["id"])
+                    if self.api_insight_writers.get(key) == job["id"]:
+                        del self.api_insight_writers[key]
+            # `_run_model_insights_bound` already finishes the inflight count in its finally.
+
+    def _assert_api_insight_job(self, job_key, job, scope, store):
+        self._assert_api_job(self.api_jobs, job_key, job, scope, store)
+
+    def _assert_api_job(self, jobs, job_key, job, scope, store):
+        with self.api_lock:
+            if (self.closing or self.active_model_source_mode != "api" or
+                    self.active_model_source_id != job_key[2] or
+                    jobs.get(job_key) is not job or
+                    store.cache_suspended(job_key[0], job_key[2])):
+                raise RuntimeError("model-source-changed")
+        self._assert_scope(scope)
+
+    def _run_model_insights_bound(self, job_key, job, scope, store, config, api_key, wire, pending):
+        try:
+            self._assert_api_insight_job(job_key, job, scope, store)
             with self.api_lock:
                 if (self.closing or self.active_model_source_mode != "api" or
                         self.active_model_source_id != job_key[2]):
@@ -1188,6 +1708,7 @@ class Backend:
             target_ids = [item["id"] for item in pending]
             for attempt in range(API_INSIGHT_RETRY_MAX + 1):
                 try:
+                    self._assert_api_insight_job(job_key, job, scope, store)
                     with self.api_lock:
                         if self.api_jobs.get(job_key) is job:
                             # A retry is a fresh provider turn. Do not let a
@@ -1214,13 +1735,13 @@ class Backend:
 
                     # Test doubles and legacy analyzers may keep their six-argument
                     # contract. Pass the optional callback whenever the adapter
-                    # explicitly exposes it, including streaming test doubles. The lease
-                    # is taken per attempt so a retry backoff does not hold a slot.
-                    with self.api_pool.lease() as analyzer:
+                    # explicitly exposes it, including streaming test doubles. The lease is
+                    # taken per attempt, so a retry backoff does not hold a slot.
+                    with self.api_pool.lease(validate=lambda: self._assert_api_insight_job(
+                            job_key, job, scope, store)) as analyzer:
                         model_insights = analyzer.model_insights
                         try:
-                            supports_delta = ("on_delta" in
-                                              inspect.signature(model_insights).parameters)
+                            supports_delta = ("on_delta" in inspect.signature(model_insights).parameters)
                         except (TypeError, ValueError):
                             supports_delta = isinstance(analyzer, NodeAnalysis)
                         if supports_delta:
@@ -1282,7 +1803,9 @@ class Backend:
                     self._assert_scope(scope)
                     save_started = time.perf_counter()
                     store.save_api_insights(job_key[0], job_key[1], api_insight_scope(job_key[2]),
-                                            [(message, by_id[message["id"]]) for message in pending])
+                                            [(message, by_id[message["id"]]) for message in pending
+                                             if self.api_insight_writers.get(
+                                                 (*job_key[:3], message["id"])) == job["id"]])
                     job.setdefault("timings", {})["saveMs"] = round(
                         (time.perf_counter() - save_started) * 1000, 3)
                 job["processed"] = job["total"]
@@ -1301,199 +1824,6 @@ class Backend:
                 job["status"] = "error"
         finally:
             self.api_tasks.finish()
-
-    def _api_subject_summary(self, store, account, user, source_id, subject):
-        """A short saved description of one subject, or "" when nothing is stored yet.
-
-        Guidance reads the same portrait summary the message labels use, so the advice
-        and the portrait card can never describe the same person differently.
-        """
-        saved = store.api_portrait_get(account, user, api_portrait_scope(source_id), subject)
-        if not saved:
-            return ""
-        statistics = (saved.get("resume") or {}).get("portraitStatistics")
-        if valid_statistics(statistics):
-            derived = profile_from_statistics(statistics, statistics["classifierVersion"],
-                                              is_group=user.endswith("@chatroom"), subject=subject)
-            return (derived["summary"] or "")[:GUIDANCE_SUMMARY_CONTEXT_MAX]
-        return (saved["portrait"]["summary"] or "")[:GUIDANCE_SUMMARY_CONTEXT_MAX]
-
-    def guidance(self, user, member=None):
-        account, workdir, store = self._scoped_identity()
-        with self.api_lock:
-            mode, source_id = self.active_model_source_mode, self.active_model_source_id
-            job = dict(self.api_guidance_jobs.get(
-                (account, user, source_id, member or user)) or {"id": None, "status": "idle"})
-        saved = None
-        if mode == "api":
-            saved = store.api_guidance_get(account, user, guidance_scope(source_id), member or user)
-        self._assert_scope((account, workdir))
-        return {"account": account, "sourceId": source_id, "subject": member or user,
-                "version": GUIDANCE_REVISION, "guidance": saved, "job": job,
-                "suspended": store.cache_suspended(account, source_id) if mode == "api" else False}
-
-    def start_guidance(self, requested_account, user, member=None, scenario="general",
-                       analyze_self=False, feedback=None):
-        if member is not None and (not user.endswith("@chatroom") or
-                                   not isinstance(member, str) or not 1 <= len(member) <= 256):
-            raise ValueError("invalid guidance subject")
-        if scenario not in GUIDANCE_SCENARIOS:
-            raise ValueError("invalid guidance scenario")
-        if type(analyze_self) is not bool:
-            raise ValueError("invalid guidance self-style flag")
-        if feedback is not None:
-            if (not isinstance(feedback, str) or len(feedback) > GUIDANCE_FEEDBACK_MAX or
-                    any(ord(char) < 32 or ord(char) == 127 for char in feedback)):
-                raise ValueError("invalid guidance feedback")
-            feedback = feedback.strip() or None
-        account, workdir, store = self._scoped_identity()
-        if account != requested_account:
-            raise AccountChangedError()
-        with self.api_lock:
-            source_id, config, api_key = self._api_source_snapshot()
-            subject = member or user
-            job_key = (account, user, source_id, subject)
-            current = self.api_guidance_jobs.get(job_key)
-            if current and current["status"] in ("queued", "running"):
-                return {"account": account, "sourceId": source_id, "subject": subject,
-                        "job": dict(current)}
-            if store.cache_suspended(account, source_id):
-                return {"account": account, "sourceId": source_id, "subject": subject,
-                        "job": {"id": None, "status": "suspended"}}
-        window = self.source.messages(user, GUIDANCE_WINDOW_MESSAGES)
-        self._assert_scope((account, workdir))
-        group = user.endswith("@chatroom")
-        wire = []
-        eligible = []
-        characters = 0
-        for item in reversed(window):
-            if item["side"] not in ("self", "other") or item["kind"] != "text":
-                continue
-            text = item["text"]
-            if not isinstance(text, str):
-                continue
-            # Links never reach the model, and a message that is only a link carries no
-            # reading either, so it is dropped from the window as well.
-            text = message_input.analysis_text(text)
-            if not text.strip():
-                continue
-            characters += len(text)
-            if characters > GUIDANCE_CONTEXT_CHARACTERS:
-                break
-            wire.append({"id": item["id"],
-                         "sender": "SELF" if item["side"] == "self" else "OTHER",
-                         "text": text})
-            if (item["side"] == "other" and message_input.has_analysis_content(item["text"]) and
-                    len(eligible) < MAX_SUBTEXTS and
-                    (not group or not member or item.get("senderId") == member)):
-                eligible.append(item["id"])
-        if not eligible:
-            return {"account": account, "sourceId": source_id, "subject": subject,
-                    "job": {"id": None, "status": "insufficient"}}
-        other_portrait = self._api_subject_summary(
-            store, account, user, source_id, subject)[:GUIDANCE_PORTRAIT_CONTEXT_MAX]
-        job = {"id": uuid.uuid4().hex, "status": "queued", "scenario": scenario,
-               "analyzeSelf": analyze_self, "targetCount": len(eligible),
-               "startedAtMs": int(time.time() * 1000)}
-        self.api_guidance_jobs[job_key] = job
-        if len(self.api_guidance_jobs) > API_JOB_CACHE_LIMIT:
-            for old_key, old_job in list(self.api_guidance_jobs.items()):
-                if len(self.api_guidance_jobs) <= API_JOB_CACHE_LIMIT:
-                    break
-                if old_key != job_key and old_job["status"] not in ("queued", "running"):
-                    del self.api_guidance_jobs[old_key]
-        self.api_tasks.begin()
-        thread = threading.Thread(target=self._run_guidance,
-                                  args=(job_key, job, (account, workdir), store, config,
-                                        api_key, wire, eligible, other_portrait, feedback),
-                                  daemon=True)
-        try:
-            thread.start()
-        except Exception:
-            self.api_tasks.finish()
-            job["status"] = "error"
-            job["error"] = "model-analysis-failed"
-            raise
-        return {"account": account, "sourceId": source_id, "subject": subject, "job": dict(job)}
-
-    def _run_guidance(self, job_key, job, scope, store, config, api_key, wire, targets,
-                      other_portrait, feedback):
-        try:
-            with self.api_lock:
-                if (self.closing or self.active_model_source_mode != "api" or
-                        self.active_model_source_id != job_key[2]):
-                    job["status"] = "error"
-                    job["error"] = "model-source-changed"
-                    return
-                job["status"] = "running"
-            for attempt in range(API_MODEL_RETRY_MAX + 1):
-                try:
-                    with self.api_lock:
-                        if self.api_guidance_jobs.get(job_key) is not job:
-                            raise RuntimeError("model-source-changed")
-                    self._assert_scope(scope)
-                    with self.api_pool.lease() as analyzer:
-                        response = analyzer.model_guidance(
-                            config["protocol"], config["baseUrl"], api_key, config["model"],
-                            wire, targets, job["scenario"], job["analyzeSelf"],
-                            config["contextTokens"],
-                            other_portrait or None,
-                            self._guidance_self_summary(store, job_key) if job["analyzeSelf"] else None,
-                            feedback)
-                    self.api_pool.note_success()
-                    guidance = normalize_guidance(response.get("guidance"))
-                    if guidance is None:
-                        raise RuntimeError("invalid-guidance")
-                except Exception as exc:
-                    code = str(exc)
-                    if code == "rate-limit":
-                        self.api_pool.note_rate_limited()
-                    if attempt >= API_MODEL_RETRY_MAX or code not in API_MODEL_RETRYABLE:
-                        raise
-                    self._assert_scope(scope)
-                    self._wait_api_model_retry(self.api_guidance_jobs, job_key, job, store,
-                                               code, attempt + 1)
-                    continue
-                break
-            with self.api_lock:
-                if (self.closing or self.active_model_source_mode != "api" or
-                        self.active_model_source_id != job_key[2] or
-                        self.api_guidance_jobs.get(job_key) is not job or
-                        store.cache_suspended(job_key[0], job_key[2])):
-                    raise RuntimeError("model-source-changed")
-                source_lock = getattr(self.source, "lock", None)
-                with source_lock if source_lock is not None else nullcontext():
-                    self._assert_scope(scope)
-                    store.api_guidance_save(job_key[0], job_key[1],
-                                            guidance_scope(job_key[2]), job_key[3], guidance)
-                job["status"] = "done"
-        except Exception as exc:
-            code = str(exc)
-            with self.api_lock:
-                job.pop("retry", None)
-                job["error"] = code if code in MODEL_CONNECTOR_ERRORS or code in {
-                    "model-source-changed", "invalid-guidance", "guidance-version-invalid",
-                    "invalid-request"} else "model-analysis-failed"
-                job["status"] = "error"
-        finally:
-            self.api_tasks.finish()
-
-    def _guidance_self_summary(self, store, job_key):
-        """The user's own conversation summary, read only when the switch asks for it."""
-        saved = store.api_portrait_get(job_key[0], job_key[1],
-                                       api_portrait_scope(job_key[2]), job_key[1])
-        if not saved:
-            return None
-        statistics = (saved.get("resume") or {}).get("portraitStatistics")
-        if valid_statistics(statistics):
-            derived = profile_from_statistics(statistics, statistics["classifierVersion"],
-                                              is_group=job_key[1].endswith("@chatroom"),
-                                              subject=job_key[1])
-            summary = derived["summary"] or ""
-        else:
-            summary = saved["portrait"]["summary"] or ""
-        return summary[:GUIDANCE_SUMMARY_CONTEXT_MAX] or None
-
     def _api_portrait_history(self, user, subject, highwater, scope, after=None,
                               piece_limit_bytes=None, cancel_check=None, start_after=None,
                               skip_first_pieces=0, partial_sort=None, known_ids=None):
@@ -1611,15 +1941,16 @@ class Backend:
         account, _workdir, user, subject, highwater = key
         try:
             request_scope = getattr(self.source, "request_scope", None)
-            with request_scope() if callable(request_scope) else nullcontext():
+            with self._source_scope(scope), request_scope() if callable(request_scope) else nullcontext():
                 pieces, _delta, _delta_fingerprint, available, fingerprint, _rows = (
                     self._api_portrait_history(user, subject, highwater, scope,
                                                piece_limit_bytes=API_PORTRAIT_INVENTORY_CACHE_BYTES))
                 self._assert_scope(scope)
             with self.api_condition:
                 if not self.closing:
-                    store.api_history_inventory_save(account, user, subject, highwater,
-                                                     fingerprint, available)
+                    with self._scope_commit(scope):
+                        store.api_history_inventory_save(account, user, subject, highwater,
+                                                         fingerprint, available)
                     if pieces is not None and _rows is not None:
                         self.api_portrait_inventory_pieces = (key, pieces, available,
                                                               fingerprint, time.monotonic() + 60,
@@ -1632,6 +1963,7 @@ class Backend:
 
     def model_portrait(self, user, member=None):
         account, workdir, store = self._scoped_identity()
+        scope = self._capture_scope(account, workdir)
         with self.api_condition:
             snapshot = self.api_portrait_inventory_pieces
             if snapshot is not None and (snapshot[4] < time.monotonic() or
@@ -1663,7 +1995,7 @@ class Backend:
             if member:
                 message_count, text_count = self.source.stats(user, member)[:2]
             contact = self.source.contact(subject)
-        self._assert_scope((account, workdir))
+        self._assert_scope(scope)
         with self.api_lock:
             mode, source_id = self.active_model_source_mode, self.active_model_source_id
             running = self.api_portrait_jobs.get((account, user, source_id, subject))
@@ -1719,7 +2051,7 @@ class Backend:
                             self.api_tasks.register_inventory(key)
                             self.api_tasks.begin()
                             thread = threading.Thread(target=self._run_api_portrait_inventory,
-                                                      args=(key, (account, workdir), store), daemon=True)
+                                                      args=(key, scope, store), daemon=True)
                             try:
                                 thread.start()
                             except Exception:
@@ -1729,7 +2061,7 @@ class Backend:
             else:
                 available = inventory["available"]
                 inventory_status = "ready"
-        self._assert_scope((account, workdir))
+        self._assert_scope(scope)
         if group and text_count is None and available is not None:
             text_count = available["targetTextCount"] if member else available["textCount"]
             if not member and available.get("messageCount") is not None:
@@ -1797,6 +2129,9 @@ class Backend:
                               "analysisUnit": "batch", "job": job,
                               "dataStatus": "analyzed" if progress["complete"] else
                                             "partial" if derived["analyzedCount"] else "unanalyzed"}
+        if available is not None:
+            available = {**available, "mbtiEvidenceCount":
+                         (saved.get("available") or {}).get("mbtiEvidenceCount", 0) if saved else 0}
         return {"account": account, "sourceId": source_id, "subject": subject,
                 "identity": identity,
                 "portrait": saved["portrait"] if saved else None,
@@ -1841,19 +2176,12 @@ class Backend:
         self._ensure_load_monitor()
         return self.worker_status()
 
-    def api_worker_status(self):
-        """Current API parallelism, for the settings row and the API panel tooltip."""
-        return self.api_pool.status()
-
-    def set_api_worker_settings(self, workers=None):
-        """Resize the API analyzer pool and remember the choice for the next launch."""
-        return self.api_pool.configure(workers)
-
     def analysis_overview(self):
         """Whole-account tally behind the sidebar progress bar: how many conversations
         the local background scan has walked to the end of their history, and how many
         texts it has analysed so far."""
         account, workdir, store = self._scoped_identity()
+        scope = self._capture_scope(account, workdir)
         version = self.analyzer.analysis_version()
         metadata = self.source.sessions()
         if metadata.get("account") != account:
@@ -1878,10 +2206,11 @@ class Backend:
         # only new messages change the answer.
         cached = self.text_totals.get(account)
         now = time.monotonic()
-        if cached is None or now - cached[0] > 300:
-            cached = (now, self.source.target_text_totals(users))
+        selection = (tuple(sorted(users)), scope[2] if len(scope) > 2 else None)
+        if cached is None or now - cached[0] > 300 or cached[1] != selection:
+            cached = (now, selection, self.source.target_text_totals(users))
             self.text_totals[account] = cached
-        totals = cached[1]
+        totals = cached[2]
         text_total = sum(totals.get(user, 0) for user in users)
         running = None
         with self.jobs_lock:
@@ -1889,7 +2218,7 @@ class Backend:
                 if key[0] == account and job["status"] in ("queued", "running"):
                     running = key[2]
                     break
-        self._assert_scope((account, workdir))
+        self._assert_scope(scope)
         # Local parallelism is reported by /api/analysis-workers; this endpoint stays a plain
         # progress read so it does not depend on the parallel-analysis feature being present.
         return {"account": account, "version": version, "conversations": len(users),
@@ -1901,13 +2230,13 @@ class Backend:
         """Read-only timing breakdown of local analysis, for tuning and support."""
         account, _workdir, _store = self._scoped_identity()
         with self.jobs_lock:
-            rows = list(self.performance.values())
+            rows = [(key, metrics) for key, metrics in self.performance.items() if key[0] == account]
         totals = {}
-        for metrics in rows:
+        for _key, metrics in rows:
             for name, value in metrics.items():
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     totals[name] = totals.get(name, 0) + value
-        totals["conversations"] = len(rows)
+        totals["conversations"] = len({key[1] for key, _metrics in rows})
         return {"account": account, "totals": totals}
 
 
@@ -1941,6 +2270,7 @@ class Backend:
             if clear_scope in self.cache_clear_in_progress:
                 raise RuntimeError("cache clear already running")
             self.cache_clear_in_progress.add(clear_scope)
+            self.analysis_source_epochs[clear_scope] = self.analysis_source_epochs.get(clear_scope, 0) + 1
         was_suspended = False
         quiesced = False
         try:
@@ -2045,6 +2375,7 @@ class Backend:
             if reset_scope in self.analysis_scope_resets:
                 raise RuntimeError("analysis-reset-in-progress")
             self.analysis_scope_resets.add(reset_scope)
+            self.analysis_epochs[reset_scope] = self.analysis_epochs.get(reset_scope, 0) + 1
         locks = []
         try:
             if source_id == LOCAL_SOURCE_ID:
@@ -2065,6 +2396,10 @@ class Backend:
                 self._assert_scope((account, workdir))
                 with self.jobs_lock:
                     # Queued tasks retain their job object, so explicitly invalidate it.
+                    with self.message_jobs_lock:
+                        for entry in self.message_jobs.values():
+                            if entry[:3] == (account, user, source_id) and subject is None:
+                                entry[4].update(_cancelledByReset=True, status="cancelled", error="analysis-reset")
                     if subject in (None, "") or not user.endswith("@chatroom"):
                         for key, job in list(self.jobs.items()):
                             if key[0] == account and key[2] == user:
@@ -2108,6 +2443,10 @@ class Backend:
                         if key[:3] == (account, user, source_id) and (subject is None or key[3] == api_subject):
                             job.update(status="cancelled", error="analysis-reset")
                             del self.api_portrait_jobs[key]
+                    for key, job in list(self.api_guidance_jobs.items()):
+                        if key[:3] == (account, user, source_id) and (subject is None or key[3] == api_subject):
+                            job.update(status="cancelled", error="analysis-reset")
+                            del self.api_guidance_jobs[key]
                     if subject is None:
                         for key, job in list(self.api_jobs.items()):
                             if key[:3] == (account, user, source_id):
@@ -2157,6 +2496,7 @@ class Backend:
         if type(refresh_axes) is not bool:
             raise ValueError("invalid portrait refresh")
         account, workdir, store = self._scoped_identity()
+        scope = self._capture_scope(account, workdir)
         if account != requested_account:
             raise AccountChangedError()
         subject = member or user
@@ -2183,7 +2523,7 @@ class Backend:
             self.api_portrait_jobs[job_key] = job
             self.api_tasks.begin()
             thread = threading.Thread(target=self._run_model_portrait,
-                                      args=(job_key, job, (account, workdir), store, config, api_key),
+                                      args=(job_key, job, scope, store, config, api_key),
                                       daemon=True)
             try:
                 thread.start()
@@ -2493,6 +2833,9 @@ class Backend:
                     jobs.get(job_key) is not job or
                     store.cache_suspended(job_key[0], job_key[2])):
                 raise RuntimeError("model-source-changed")
+            scope = getattr(self._analyzer_ctx, "task_scope", None)
+            if scope is not None:
+                self._assert_scope(scope)
 
         self.api_tasks.wait_api_model_retry(jobs, job_key, job, code, attempt,
                                             retry_seconds, retry_max, check)
@@ -2501,7 +2844,7 @@ class Backend:
         """Keep the verified source reader pinned through generation and commit."""
         request_scope = getattr(self.source, "request_scope", None)
         try:
-            with request_scope() if callable(request_scope) else nullcontext():
+            with self._source_scope(scope), request_scope() if callable(request_scope) else nullcontext():
                 self._run_model_portrait_scoped(job_key, job, scope, store, config, api_key)
         except Exception as exc:
             code = str(exc)
@@ -2568,10 +2911,15 @@ class Backend:
                     self._assert_scope(scope)
                     self._assert_api_portrait_job(job_key, job, store, config)
                     try:
-                        generated = self.api_portrait_analyzer.classify_portrait_batch(
-                            config["protocol"], config["baseUrl"], api_key, config["model"],
-                            wire, subject_kind, config.get("contextTokens")) if any(
-                                item["target"] and item["text"].strip() for item in batch) else {"result": None}
+                        generated = {"result": None}
+                        if any(item["target"] and item["text"].strip() for item in batch):
+                            def validate_turn():
+                                self._assert_api_portrait_job(job_key, job, store, config)
+                                self._assert_scope(scope)
+                            with self.api_pool.dedicated("portrait", validate=validate_turn):
+                                generated = self.api_portrait_analyzer.classify_portrait_batch(
+                                    config["protocol"], config["baseUrl"], api_key, config["model"],
+                                    wire, subject_kind, config.get("contextTokens"))
                         if not isinstance(generated, dict) or "result" not in generated:
                             raise RuntimeError("invalid-portrait")
                         if (any(item["target"] and item["text"].strip() for item in batch) and
@@ -2668,20 +3016,26 @@ class Backend:
 
     def messages(self, user, limit):
         account, workdir, _ = self._scoped_identity()
+        scope = self._capture_scope(account, workdir)
         messages = self.source.messages(user, limit)
-        self._assert_scope((account, workdir))
-        self._observe_advisor_window(account, workdir, user, messages, getattr(messages, "has_more_before", None))
+        self._assert_scope(scope)
+        self._observe_advisor_window(account, workdir, user, messages, getattr(messages, "has_more_before", None),
+                                     binding=scope[2] if len(scope) > 2 else None)
         return {"messages": [{key: value for key, value in item.items() if not key.startswith("_")} for item in messages],
                 "account": account, "total": None,
                 **({"hasMoreBefore": messages.has_more_before}
                    if type(getattr(messages, "has_more_before", None)) is bool else {})}
 
     def message_windows(self, requested_account, users):
+        capture = getattr(self.source, "capture_binding", None)
+        binding = capture() if callable(capture) else None
         if not isinstance(self.source, WeChatSource):
             ready = getattr(self.source, "require_messages_ready", None)
             if callable(ready):
                 ready()
         windows = self.source.message_windows(users, 80, expected_account=requested_account)
+        if binding is not None:
+            self.source.assert_binding(binding)
         if getattr(self, "_advisor", None) is not None:
             verified = getattr(windows, "verified_scope", None)
             if isinstance(verified, tuple) and len(verified) == 2:
@@ -2692,7 +3046,7 @@ class Backend:
                 raise AccountChangedError()
             for user in users:
                 self._observe_advisor_window(account, workdir, user, windows[user],
-                                             getattr(windows, "has_more_before", {}).get(user))
+                                             getattr(windows, "has_more_before", {}).get(user), binding=binding)
         return {"account": requested_account, "windows": [
             {"user": user, "messages": [
                 {key: value for key, value in item.items() if not key.startswith("_")}
@@ -2835,6 +3189,29 @@ class Backend:
                 "basisFingerprint": fingerprint, "lastMessageId": last_message_id,
                 "candidates": candidates}
 
+    def _register_message_job(self, account, user, source_id, scope, job):
+        with self.message_jobs_lock:
+            self.message_jobs[job["id"]] = (account, user, source_id, scope, job)
+            for identity, entry in list(self.message_jobs.items()):
+                if len(self.message_jobs) <= API_JOB_CACHE_LIMIT:
+                    break
+                if entry[4].get("status") not in ("queued", "running"):
+                    del self.message_jobs[identity]
+
+    def analysis_job(self, job_id):
+        if not isinstance(job_id, str) or re.fullmatch(r"[0-9a-f]{32}", job_id) is None:
+            raise ValueError("invalid analysis job")
+        with self.message_jobs_lock:
+            entry = self.message_jobs.get(job_id)
+            if entry is None:
+                raise ValueError("unknown analysis job")
+            account, user, source_id, scope, job = entry
+            snapshot = dict(job)
+        self._assert_scope(scope)
+        if self.active_model_source_id != source_id:
+            raise ModelSourceUnavailable("model source changed")
+        return {"account": account, "user": user, "sourceId": source_id, "job": snapshot}
+
     def _schedule_recent(self, key, store, job, scope, limit, standalone=False, selected=None):
         state = self.recent_windows.get(key)
         if state is not None:
@@ -2853,10 +3230,22 @@ class Backend:
         job["recent"] = {"id": uuid.uuid4().hex, "status": "queued", "total": 0, "processed": 0}
         self._enqueue((key, "recent-window", limit, store, job, scope), interactive=True)
 
-    def start(self, user, mode, limit, expected_account=None, target_ids=None):
+    def start(self, user, mode, limit, expected_account=None, target_ids=None, message_id=None):
         account, workdir, store = self._scoped_identity()
+        scope = self._capture_scope(account, workdir)
+        with self.api_lock:
+            force_revision = self.model_source_revision
+            reset_epoch = self._analysis_epoch(account, user, self.active_model_source_id)
         if expected_account is not None and account != expected_account:
             raise AccountChangedError()
+        if mode == "message":
+            if not isinstance(message_id, str) or not message_id or target_ids is not None:
+                raise ValueError("invalid message target")
+            self._resolve_selected_targets(user, limit, [message_id])
+            self._assert_scope(scope)
+            self._assert_analysis_epoch(reset_epoch)
+            if self.active_model_source_mode == "api":
+                return self.start_model_insights(account, user, limit, [message_id], force=True)["job"]
         if store.cache_suspended(account, LOCAL_SOURCE_ID):
             return {"id": None, "status": "suspended", "total": 0, "processed": 0}
         # A hand-picked selection is resolved (and rejected) before the 202 response, so a
@@ -2866,18 +3255,28 @@ class Backend:
             if mode != "recent":
                 raise ValueError("invalid selected analysis mode")
             selected = self._resolve_selected_targets(user, limit, target_ids)
-            self._assert_scope((account, workdir))
+            self._assert_scope(scope)
         version = self.analyzer.analysis_version()
         if expected_account is not None:
-            self._assert_scope((account, workdir))
+            self._assert_scope(scope)
         key = (account, str(store.path), user, version)
+        self._assert_analysis_epoch(reset_epoch)
+        if mode == "message":
+            with self.api_lock:
+                if self.model_source_revision != force_revision or self.active_model_source_mode != "local":
+                    raise ModelSourceUnavailable("model source changed")
+                self._assert_analysis_epoch(reset_epoch)
+                job = {"id": uuid.uuid4().hex, "status": "queued", "total": 1, "processed": 0,
+                       "requested": {"mode": mode, "limit": limit, "messageId": message_id}}
+                self._register_message_job(account, user, LOCAL_SOURCE_ID, scope, job)
+                self._enqueue((key, "message", message_id, store, job, scope), interactive=True)
+                return dict(job)
         with self.jobs_lock:
             self._check_analysis_reset(account, user, LOCAL_SOURCE_ID)
             current = self.jobs.get(key)
             if current and (current["status"] in ("queued", "running") or key in self.recent_windows):
                 if mode == "recent":
-                    self._schedule_recent(key, store, current, (account, workdir), limit,
-                                          selected=selected)
+                    self._schedule_recent(key, store, current, scope, limit, selected=selected)
                     return dict(current)
                 if (mode == "incremental" and key in self.recent_windows and
                         current["status"] == "done"):
@@ -2904,19 +3303,21 @@ class Backend:
                    "requested": {"mode": mode, "limit": limit}}
             self.jobs[key] = job
             if mode == "recent":
-                self._schedule_recent(key, store, job, (account, workdir), limit, standalone=True,
-                                      selected=selected)
+                self._schedule_recent(key, store, job, scope, limit, standalone=True, selected=selected)
                 return dict(job)
             if (not self.batch_engine and
                     ((mode == "incremental" and not self._stored_progress(account, user, version, store)["complete"]) or
                      (mode == "history" and limit == "all"))):
                 self.priority_recent[key] = 80
-            self._enqueue((key, mode, limit, store, job, (account, workdir)))
+            self._enqueue((key, mode, limit, store, job, scope))
             return dict(job)
 
     def _analyze_item(self, account, user, version, store, context, item, scope=None, defer=False,
                       fine=False, portrait_context=None):
         started = time.perf_counter()
+        scope = scope or getattr(getattr(self, "_analyzer_ctx", None), "task_scope", None)
+        if scope is not None:
+            self._assert_scope(scope)
         # Attach the local unified-input metadata at the one point where the trusted
         # account/conversation scope is known. Legacy fields stay untouched.
         wire_context = message_input.prepare_messages(context, account_id=account,
@@ -2931,10 +3332,9 @@ class Backend:
                 raise
             if defer:
                 return {"skip": "ObservedTextTooLongError"}
-            if scope is not None:
-                self._assert_scope(scope)
-            (store.skip_fine if fine else store.skip)(account, user, version, item,
-                                                       "ObservedTextTooLongError")
+            with self._scope_commit(scope):
+                (store.skip_fine if fine else store.skip)(account, user, version, item,
+                                                         "ObservedTextTooLongError")
             return
         inferred = time.perf_counter()
         result = (validate_fine_result if fine else validate_portrait_result)(
@@ -2943,10 +3343,9 @@ class Backend:
             # The incremental caller must scope-verify the whole pending batch before saving.
             return {"result": result, "started": started, "inferred": inferred,
                     "modelMs": float(response.get("_modelMs") or (inferred-started)*1000)}
-        if scope is not None:
-            self._assert_scope(scope)
-        verified = time.perf_counter()
-        (store.save_fine if fine else store.save)(account, user, version, item, result)
+        with self._scope_commit(scope):
+            verified = time.perf_counter()
+            (store.save_fine if fine else store.save)(account, user, version, item, result)
         finished = time.perf_counter()
         with self.jobs_lock:
             metrics = self.performance.setdefault((account, user, version), {})
@@ -3113,6 +3512,39 @@ class Backend:
                 since_yield = 0
                 yield
 
+    def _run_fine_message(self, key, store, job, scope, message_id):
+        """Re-analyze one message on demand, even when a saved label already exists.
+
+        The context and the save path are the recent pass's: the message plus the three that
+        precede it, validated and stored by ``_analyze_fine_item``. What differs is the cache
+        check: the recent pass skips ids that already have this schema, this path skips
+        nothing, which is what makes the saved row get overwritten instead of reused.
+        """
+        account, _path, user, version = key
+        self._assert_scope(scope)
+        window = self.source.messages(user, int(job["requested"].get("limit") or 80))
+        self._assert_scope(scope)
+        found = None
+        for index, item in enumerate(window):
+            if item["id"] == message_id:
+                found = (index, item)
+                break
+        if found is None:
+            raise ValueError("message not in the analyzed window")
+        index, item = found
+        job["status"] = "running"
+        if item["side"] != "other" or item["kind"] != "text" or not item["text"].strip():
+            # Nothing the fine path can label; report success so the UI stops waiting.
+            job["total"] = 0
+            job["processed"] = 0
+            job["status"] = "done"
+            return
+        self._analyze_fine_item(account, user, version, store,
+                                window[max(0, index - 3):index + 1], item, scope,
+                                portrait_context=self._fine_portrait_context(account, user, version, store, item))
+        job["processed"] = 1
+        job["status"] = "done"
+
     def _run_visible_priority(self, account, user, version, store, job, scope,
                                highwater, cached_ids, counted_ids, processed_ids, limit):
         if not limit:
@@ -3158,11 +3590,11 @@ class Backend:
             known = self.batch_engine.known(account, user, version, store, subject, remaining)
             first = next((index for index, item in enumerate(remaining) if item["id"] not in known), None)
             if first is None:
-                batches.advance_quoted_backfill(account, user, version, subject,
+                self.batch_engine._commit(scope, batches.advance_quoted_backfill, account, user, version, subject,
                                                 tuple(remaining[-1]["_sort"]))
                 return
             if first:
-                batches.advance_quoted_backfill(account, user, version, subject,
+                self.batch_engine._commit(scope, batches.advance_quoted_backfill, account, user, version, subject,
                                                 tuple(remaining[first-1]["_sort"]))
                 remaining = remaining[first:]
             self._assert_scope(scope)
@@ -3171,7 +3603,7 @@ class Backend:
             completed = [item for item in remaining if tuple(item["_sort"]) < cursor or
                          tuple(item["_sort"]) == cursor and not offset]
             if completed:
-                batches.advance_quoted_backfill(account, user, version, subject,
+                self.batch_engine._commit(scope, batches.advance_quoted_backfill, account, user, version, subject,
                                                 tuple(completed[-1]["_sort"]))
             remaining = [item for item in remaining if tuple(item["_sort"]) > cursor or
                          offset and tuple(item["_sort"]) == cursor]
@@ -3186,7 +3618,8 @@ class Backend:
         if saved["cursor"] is None:
             return
         batches = self.batch_engine.store(store)
-        checkpoint = batches.begin_quoted_backfill(account, user, version, subject, saved["cursor"])
+        checkpoint = self.batch_engine._commit(scope, batches.begin_quoted_backfill,
+                                              account, user, version, subject, saved["cursor"])
         if checkpoint["complete"]:
             return
         after = checkpoint["cursor"]
@@ -3196,7 +3629,8 @@ class Backend:
                 user, checkpoint["ceiling"], after, member=member)
             self._assert_scope(scope)
             if next_after is None:
-                batches.advance_quoted_backfill(account, user, version, subject, complete=True)
+                self.batch_engine._commit(scope, batches.advance_quoted_backfill,
+                                          account, user, version, subject, complete=True)
                 return
             if after is not None and next_after <= after:
                 raise RuntimeError("quoted backfill cursor did not advance")
@@ -3235,15 +3669,17 @@ class Backend:
                         ensure_ascii=False).encode()).hexdigest()
                     current = batches.load(account, user, version, subject)
                     self._assert_scope(scope)
-                    batches.commit(account, user, version, subject, batch_id=batch_id,
+                    self.batch_engine._commit(scope, batches.commit, account, user, version, subject, batch_id=batch_id,
                                    consumed=[record], cursor=current["cursor"],
                                    char_offset=current["charOffset"], context=current["context"],
                                    result=None, is_group=True, advance=False)
-                    batches.advance_quoted_backfill(account, user, version, subject, position)
+                    self.batch_engine._commit(scope, batches.advance_quoted_backfill,
+                                              account, user, version, subject, position)
             if pending:
                 yield from self._infer_quoted_batch(account, user, version, store, scope,
                                                     subject, batches, pending)
-            batches.advance_quoted_backfill(account, user, version, subject, next_after)
+            self.batch_engine._commit(scope, batches.advance_quoted_backfill,
+                                      account, user, version, subject, next_after)
             after = next_after
             if self._interactive_waiting():
                 yield
@@ -3342,15 +3778,16 @@ class Backend:
             verified = time.perf_counter()
             saved = []
             for item, position, saved_context, prepared in pending:
-                if prepared is not None:
-                    if "skip" in prepared:
-                        store.skip(account, user, version, item, prepared["skip"])
-                    else:
-                        save_started = time.perf_counter()
-                        store.save(account, user, version, item, prepared["result"])
-                        saved.append((prepared, (time.perf_counter() - save_started) * 1000))
-                # Results and skips always reach durable storage before their scan cursor.
-                store.advance(account, user, version, position, saved_context, item)
+                with self._scope_commit(scope):
+                    if prepared is not None:
+                        if "skip" in prepared:
+                            store.skip(account, user, version, item, prepared["skip"])
+                        else:
+                            save_started = time.perf_counter()
+                            store.save(account, user, version, item, prepared["result"])
+                            saved.append((prepared, (time.perf_counter() - save_started) * 1000))
+                    # Results and skips always reach durable storage before their scan cursor.
+                    store.advance(account, user, version, position, saved_context, item)
                 cursor = position
                 if item["kind"] == "text" and message_input.has_analysis_content(item["text"]):
                     job["total"] += 1
@@ -3419,14 +3856,15 @@ class Backend:
                     yield
             flush()
             if cursor is None or next_cursor > cursor:
-                self._assert_scope(scope)
-                store.advance(account, user, version, next_cursor, context)
+                with self._scope_commit(scope):
+                    store.advance(account, user, version, next_cursor, context)
                 cursor = next_cursor
             if self._interactive_waiting():
                 yield
         self._assert_scope(scope)
         final_cursor = max(cursor, highwater) if cursor is not None and highwater is not None else cursor or highwater
-        store.advance(account, user, version, final_cursor, context, complete=True)
+        with self._scope_commit(scope):
+            store.advance(account, user, version, final_cursor, context, complete=True)
         job["checkpointComplete"] = True
 
     def _run_finite_history(self, account, user, version, store, job, scope, limit):
@@ -3717,9 +4155,28 @@ class Backend:
                 lock.release()
 
     def _run_one(self, task):
+        entered = False
+        try:
+            with self._source_scope(task[5], task[4]):
+                entered = True
+                return self._run_one_bound(task)
+        except Exception as exc:
+            cancelled = task[4].get("_cancelledByReset") or task[4].get("_cancelledByModelSource")
+            task[4].update(status="cancelled" if cancelled else "error",
+                           error=str(exc)[:200])
+            if isinstance(task[4].get("recent"), dict):
+                task[4]["recent"].update(status=task[4]["status"], error=str(exc)[:200])
+            if task[1] != "message":
+                self.history_iterators.pop(task[0], None)
+                self.history_iterator_modes.pop(task[0], None)
+                self.recent_windows.pop(task[0], None)
+            if not entered:
+                self.tasks.task_done()
+
+    def _run_one_bound(self, task):
         key, mode, limit, store, job, source_scope = task
         try:
-            if job.get("_cancelledByReset"):
+            if job.get("_cancelledByReset") or job.get("_cancelledByModelSource"):
                 job["status"] = "cancelled"
                 return
             if store.cache_suspended(key[0], LOCAL_SOURCE_ID):
@@ -3728,7 +4185,10 @@ class Backend:
             if self.active_model_source_mode != "local":
                 # Local Laya analysis must not compete with an active API source. The
                 # persisted cursor is kept; a later local switch resumes from it.
-                job["status"] = "paused"
+                job["status"] = "cancelled" if mode == "message" else "paused"
+                return
+            if mode == "message":
+                self._run_fine_message(key, store, job, source_scope, limit)
                 return
             if mode == "batch-subject" and self.batch_engine:
                 try:
@@ -3883,23 +4343,26 @@ class Backend:
                                  if item["id"] in selected and item["kind"] == "text")
             self._assert_scope((account, workdir))
             return texts
-        return store.profile_state(account, user, version, subject, read_texts)
+        with self._scope_commit((account, workdir)):
+            return store.profile_state(account, user, version, subject, read_texts)
 
     def profile(self, user, member=None, retry=False):
         account, workdir, store = self._scoped_identity()
+        scope = self._capture_scope(account, workdir)
         self._check_analysis_reset(account, user, LOCAL_SOURCE_ID)
         lock = self._profile_lock(account, str(store.path), user)
         if not lock.acquire(timeout=30):
             raise RuntimeError("analysis-reset-busy")
         try:
             self._check_analysis_reset(account, user, LOCAL_SOURCE_ID)
-            self._assert_scope((account, workdir))
-            return self._profile_locked(user, member, retry)
+            with self._source_scope(scope):
+                return self._profile_locked(user, member, retry)
         finally:
             lock.release()
 
     def _profile_locked(self, user, member=None, retry=False):
         account, workdir, store = self._scoped_identity()
+        scope = self._capture_scope(account, workdir)
         version = self.analyzer.analysis_version()
         group = user.endswith("@chatroom")
         selected = member or user
@@ -3933,18 +4396,18 @@ class Backend:
         elif self.batch_engine and (self.active_model_source_mode != "local" or
                                     (callable(getattr(self.analyzer, "local_model_status", None)) and
                                      self.local_model_status()["state"] != "ready")):
-            saved = self.batch_engine.ensure(account, user, version, store, (account, workdir), member)
+            saved = self.batch_engine.ensure(account, user, version, store, scope, member)
             state = saved["state"]
             profile_job = {"status": "missing-model" if self.active_model_source_mode == "local"
                            else "inactive-source", "checkpointComplete": saved["complete"]}
         elif self.batch_engine:
-            saved = self.batch_engine.ensure(account, user, version, store, (account, workdir), member)
+            saved = self.batch_engine.ensure(account, user, version, store, scope, member)
             state = saved["state"]
             backfill_pending = self.batch_engine.store(store).quoted_backfill_pending(
                 account, user, version, self.batch_engine.subject(user, member), saved["cursor"])
             if member:
                 profile_job = self.batch_engine.request_member(account, user, version, store,
-                                                                (account, workdir), member,
+                                                                scope, member,
                                                                 max(text_count, state["count"] + 1)
                                                                 if backfill_pending else text_count, retry)
             else:
@@ -3977,7 +4440,8 @@ class Backend:
                 profile_job = {**{name: value for name, value in profile_job.items() if name != "recent"},
                                "analysisUnit": "batch"}
         else:
-            state = store.profile_state(account, user, version, subject, read_legacy_texts)
+            with self._scope_commit(scope):
+                state = store.profile_state(account, user, version, subject, read_legacy_texts)
             profile_job = None
         distributions = {field: [{"label": label, "probability": value / state["count"]}
                                  for label, value in state[field].items()] if state["count"] else []

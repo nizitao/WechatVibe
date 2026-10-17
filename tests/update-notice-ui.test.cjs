@@ -17,7 +17,7 @@ function section(start, end) {
 }
 const updateCode = section("function unlockStartupUi()", "function completeStartup()") +
   section("const OFFICIAL_RELEASES_URL", 'byId("btnAddConversation")') +
-  section('document.querySelectorAll(".settings-tab-btn")', 'byId("btnEmoji")');
+  section('document.querySelectorAll(".settings-tab-btn")', 'async function loadCatalog()');
 
 function makeNode(id = "") {
   const node = {
@@ -88,6 +88,7 @@ function harness(options = {}) {
     setInterval(fn, delay) { timers.push({ fn, delay, kind: "interval" }); return timers.length; },
     clearTimeout() {}, clearInterval() {},
     loadRuntime() {}, loadModelSource() {}, loadLocalModel() {}, loadDataRoot() {},
+    loadAccountPin() {}, loadApiWorkerSettings() {},
     showLocalModelDownload() {},
     fetch() { calls.fetches++; throw new Error("update check must not use the network"); },
     document: {

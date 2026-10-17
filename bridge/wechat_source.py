@@ -14,6 +14,7 @@ import time
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlsplit
 from xml.etree import ElementTree
 
@@ -111,6 +112,14 @@ def message_id(account, user, shard, row):
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
+class SourceBinding(NamedTuple):
+    """An in-process task identity, never a persisted result/cache identifier."""
+    account: str
+    workdir: str
+    origin: tuple
+    generation: int
+
+
 class WeChatSource:
     def __init__(self, factory=None, classifier=None, media_factory=None, active_account_locator=None):
         self.factory = factory
@@ -122,8 +131,9 @@ class WeChatSource:
         self.dynamic_account = factory is None or active_account_locator is not None
         self._ownership_cache_enabled = self.live_account
         if self.live_account:
-            from live_source import active_account_snapshot
-            self.active_account_locator = active_account_snapshot
+            from account_pin_source import AccountPinSource
+            from instance_identity import profile_name
+            self.active_account_locator = AccountPinSource(ROOT, profile_name()).locator()
         else:
             self.active_account_locator = active_account_locator or active_account_dir
         self.lock = threading.RLock()
@@ -132,6 +142,11 @@ class WeChatSource:
         self._account_dir = None
         self._active_checked_at = 0.0
         self._request_context = threading.local()
+        self._source_origin = None
+        self._source_generation = 0
+        self._binding_lock = threading.RLock()
+        self.account_leases = None
+        self._account_lease = None
         self._advisor_identity_lock = threading.Lock()
         self._advisor_verification_lock = threading.Lock()
         self._advisor_binding = None
@@ -153,11 +168,21 @@ class WeChatSource:
         self.window_images.clear()
         self.profile_metadata_cache.clear()
 
+    def _hold_account(self, account):
+        if self.account_leases is None:
+            return
+        current = self._account_lease
+        if current is not None and current.account == account:
+            current.assert_held()
+            return
+        replacement = self.account_leases.hold(account)
+        self._account_lease = replacement
+        if current is not None:
+            current.release()
+
     def _active_selection(self, *, fresh=True):
-        from live_source import active_account_snapshot
-        if self.live_account and self.active_account_locator is active_account_snapshot:
-            return self.active_account_locator(fresh=fresh)
-        return self.active_account_locator()
+        from live_source import call_account_locator
+        return call_account_locator(self.active_account_locator, fresh=fresh)
 
     def _ordinary_db(self):
         if getattr(self, "_ownership_cache_enabled", False):
@@ -175,6 +200,69 @@ class WeChatSource:
             yield
         finally:
             context.active, context.reader = previous
+
+    def _observe_source_origin(self, origin):
+        # Reader objects and snapshot revisions may change on an ordinary refresh.
+        # Only the actual account directory/process binding changes task identity.
+        with self._binding_lock:
+            if origin != self._source_origin:
+                self._source_origin = origin
+                self._source_generation += 1
+            expected = getattr(self._request_context, "binding", None)
+            if expected is not None and (expected.origin != origin or
+                                         expected.generation != self._source_generation):
+                raise AccountChangedError()
+
+    def invalidate_binding(self):
+        """Invalidate queued work before an explicit source selection/clear changes."""
+        with self.lock:
+            with self._binding_lock:
+                self._source_generation += 1
+        self.invalidate_advisor_identity()
+
+    def capture_binding(self, *, messages=True):
+        """Capture a fresh transferable binding before reading any task input."""
+        with self.lock:
+            account, workdir = self.verified_identity(messages=messages)
+            return SourceBinding(str(account), str(Path(workdir).resolve()),
+                                 self._source_origin, self._source_generation)
+
+    @staticmethod
+    def binding_fingerprint(binding):
+        """Stable projection scope; process restarts never relocate the account data."""
+        origin = binding.origin[0] if binding.origin else None
+        return hashlib.sha256(json.dumps([binding.account, binding.workdir, origin],
+                                         ensure_ascii=False).encode("utf-8")).hexdigest()
+
+    def assert_binding(self, binding, *, messages=True, fresh=True):
+        """Check the captured generation as well as the current fresh source."""
+        if not fresh:
+            identity = self._leased_advisor_identity(messages)
+            if identity is not None:
+                with self._binding_lock:
+                    current = SourceBinding(str(identity[0]), str(Path(identity[1]).resolve()),
+                                            self._source_origin, self._source_generation)
+                    if current != binding:
+                        raise AccountChangedError()
+                return identity
+        with self.lock:
+            if self.capture_binding(messages=messages) != binding:
+                raise AccountChangedError()
+            return binding.account, Path(binding.workdir)
+
+    @contextmanager
+    def binding_scope(self, binding):
+        """Carry a pre-read binding into another thread without recapturing it."""
+        context = self._request_context
+        previous = getattr(context, "binding", None)
+        if previous is not None and previous != binding:
+            raise AccountChangedError()
+        context.binding = binding
+        try:
+            self.assert_binding(binding)
+            yield
+        finally:
+            context.binding = previous
 
     def _live_reader_valid(self, db, selection):
         from live_source import _pages, _readiness, _token, _valid_page_key
@@ -206,6 +294,8 @@ class WeChatSource:
                 self._advisor_binding = None
                 self._advisor_binding_generation += 1
         with self.lock:
+            if self.db is not None and str(self.db.account) == account:
+                self.invalidate_binding()
             for key in list(self.profile_overview_counts_cache):
                 if key[0] == account:
                     del self.profile_overview_counts_cache[key]
@@ -220,6 +310,9 @@ class WeChatSource:
             forget = getattr(self.factory, "forget_account", None)
             if callable(forget):
                 forget(account)
+            if self._account_lease is not None and self._account_lease.account == account:
+                self._account_lease.release()
+                self._account_lease = None
 
     def close(self):
         """Stop this bridge instance from reopening any WeChat-derived snapshot."""
@@ -228,32 +321,52 @@ class WeChatSource:
             self._advisor_binding = None
             self._advisor_binding_generation += 1
         with self.lock:
+            with self._binding_lock:
+                self._source_generation += 1
             self.closed = True
             if self.db is not None:
                 self.forget_account(str(self.db.account))
             self._release_db()
             self.profile_overview_counts_cache.clear()
+            if self._account_lease is not None:
+                self._account_lease.release()
+                self._account_lease = None
 
     def _db(self, fresh=False, reuse_ownership=False):
         with self.lock:
             if self.closed:
                 raise AccountUnavailableError()
+            expected = getattr(self._request_context, "binding", None)
+            if expected is not None and expected.generation != self._source_generation:
+                raise AccountChangedError()
             if not self.dynamic_account and self.db is not None:
+                self._hold_account(str(self.db.account))
+                self._observe_source_origin((os.path.normcase(os.path.realpath(str(
+                    getattr(self.db, "account_dir", getattr(self.db, "workdir", ""))))), str(self.db.account)))
                 return self.db
             if self.dynamic_account:
                 if (self.db is not None and not self.live_account and not fresh and
                         time.monotonic() - self._active_checked_at < 0.5):
+                    self._hold_account(str(self.db.account))
                     return self.db
                 try:
                     selection = self._active_selection(fresh=not reuse_ownership)
                     location = (selection.account_dir if self.live_account and selection is not None
                                 else Path(selection).resolve() if selection is not None else None)
                 except Exception as exc:
+                    self._observe_source_origin(None)
                     self._release_db()
                     raise AccountUnavailableError() from exc
                 if location is None or not (location / "db_storage").is_dir():
+                    self._observe_source_origin(None)
                     self._release_db()
                     raise AccountUnavailableError()
+                origin = (os.path.normcase(os.path.realpath(str(location))),
+                          tuple(getattr(selection, "processes", ())) if self.live_account else ())
+                self._observe_source_origin(origin)
+                # Automatic selection and explicit pins claim the same shared resource
+                # before either a cached reader or a new key scan can touch it.
+                self._hold_account(location.name)
                 pinned = getattr(self._request_context, "reader", None)
                 if self.live_account and pinned is not None:
                     try:
@@ -275,7 +388,7 @@ class WeChatSource:
                 if self.factory is None:
                     if self.live_account:
                         from live_source import LiveWeChatFactory
-                        self.factory = LiveWeChatFactory()
+                        self.factory = LiveWeChatFactory(locator=self.active_account_locator)
                     else:
                         from cache_source import CacheOnlyWeChatDB
                         self.factory = CacheOnlyWeChatDB
@@ -307,7 +420,7 @@ class WeChatSource:
             if self.factory is None:
                 if self.live_account:
                     from live_source import LiveWeChatFactory
-                    self.factory = LiveWeChatFactory()
+                    self.factory = LiveWeChatFactory(locator=self.active_account_locator)
                 else:
                     from cache_source import CacheOnlyWeChatDB
                     self.factory = CacheOnlyWeChatDB
@@ -344,6 +457,10 @@ class WeChatSource:
                 db._live_token = page_token
                 if getattr(self._request_context, "active", False):
                     self._request_context.reader = db
+            if not self.dynamic_account:
+                self._hold_account(str(db.account))
+                self._observe_source_origin((os.path.normcase(os.path.realpath(str(
+                    getattr(db, "account_dir", getattr(db, "workdir", ""))))), str(db.account)))
             return db
 
     def identity(self):

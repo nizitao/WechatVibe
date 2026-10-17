@@ -872,8 +872,13 @@ class ApiInsightTests(unittest.TestCase):
         self.assertNotIn("portraitEvidence", saved["resume"])
         self.assertEqual(saved["resume"]["portraitStatistics"]["version"], 1)
         self.assertEqual(rebuilt["portrait"]["mbtiAxes"], previous["mbtiAxes"], "old snapshot remains display-only")
-        self.assertTrue(all(axis["leftShare"] is None
-                            for axis in rebuilt["nativeProfile"]["mbtiInference"]["axes"].values()))
+        inference = rebuilt["nativeProfile"]["mbtiInference"]
+        self.assertIsNone(inference["type"])
+        for axis in inference["axes"].values():
+            self.assertGreater(axis["evidenceCount"], 0)
+            self.assertAlmostEqual(axis["leftShare"], 8 / 9,
+                                   msg="show freshly inferred evidence, not the old snapshot's score")
+            self.assertIsNone(axis["preference"], "a few observations cannot assign personality letters")
 
     def test_internal_type_error_does_not_repeat_as_a_legacy_signature_call(self):
         self.activate()

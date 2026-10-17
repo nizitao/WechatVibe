@@ -94,7 +94,7 @@ function harness({ selected = [], messagesReady = true, sourceMode = "api", post
       const next = new Set(context.chatState.selectedConversations);
       if (Array.isArray(payload.sessions)) for (const id of payload.sessions) next.delete(id);
       else if (payload.selected) next.add(payload.session); else next.delete(payload.session);
-      return { account: payload.expectedAccount, selectedSessions: [...next] };
+      return { account: payload.expectedAccount, selectedSessions: [...next], requestedSessions: [] };
     },
   });
   seed(context, {
@@ -251,7 +251,7 @@ it("accepts a same-account removal acknowledgement during a session refresh", as
   h.ui.conversationRemovalSelection().add("second");
   const pending = h.ui.removeSelectedConversations();
   h.context.chatState.sessionRequest++;
-  resolve({ account: "synthetic-account", selectedSessions: ["first"] });
+  resolve({ account: "synthetic-account", selectedSessions: ["first"], requestedSessions: [] });
   await pending;
   assert.deepEqual([...h.context.chatState.selectedConversations], ["first"]);
 });
@@ -264,7 +264,7 @@ it("ignores a delayed batch response after switching account or refreshing selec
   h.context.chatState.currentAccount = "new-account";
   h.context.chatState.selectionLoadedAccount = "new-account";
   h.context.chatState.selectedConversations = new Set(["new-chat"]);
-  resolve({ account: "synthetic-account", selectedSessions: ["first"] });
+  resolve({ account: "synthetic-account", selectedSessions: ["first"], requestedSessions: [] });
   await pending;
   assert.deepEqual([...h.context.chatState.selectedConversations], ["new-chat"]);
   assert.equal(h.posts.length, 1);

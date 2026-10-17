@@ -228,12 +228,13 @@ API_JOB_CACHE_LIMIT = 256
 GROUNDED_INTENT_EVIDENCE = {
     "greet": {"greeting_phrase"}, "thank": {"thanks_phrase"},
     "confirm": {"short_acknowledgement"}, "inspect": {"first_person_inspection"},
-    "agree": {"explicit_acceptance"}, "reject": {"explicit_refusal", "contextual_deferral"},
+    "agree": {"explicit_acceptance", "conditional_acceptance"}, "reject": {"explicit_refusal", "contextual_deferral"},
     "deny": {"contextual_denial"},
     "invite": {"inclusive_invitation"}, "ask_question": {"answer_seeking_question"},
     "seek_help": {"action_request"},
     "suggest_action": {"advice_marker", "negative_imperative", "imperative_adjustment", "delegated_action"},
-    "plan": {"first_person_intention"}, "correct": {"explicit_correction"},
+    "plan": {"first_person_intention", "concrete_reschedule"}, "correct": {"explicit_correction"},
+    "close_chat": {"conversation_pause"},
     "explain": {"causal_explanation", "process_explanation"}, "complain": {"negative_evaluation"},
     "status_report": {"progress_statement"}, "share_news": {"sharing_announcement"},
 }
@@ -318,15 +319,18 @@ def mbti_from_totals(eligible, supported_messages, axis_totals, version):
     for axis, (left, right) in AXES.items():
         left_total, right_total, evidence_count, insufficient_count = axis_totals[axis]
         mass = left_total + right_total
-        left_share = left_total / mass if evidence_count >= MIN_AXIS_EVIDENCE and mass > 0 else None
+        # Display observed scores before enough evidence exists to assign a type.
+        left_share = left_total / mass if evidence_count > 0 and mass > 0 else None
         right_share = right_total / mass if left_share is not None else None
+        if (evidence_count < MIN_AXIS_EVIDENCE or left_share is None or
+                abs(left_share - right_share) < MIN_AXIS_MARGIN):
+            preference = None
+        else:
+            preference = left if left_share > right_share else right
         axes[axis] = {"left": left, "right": right, "leftShare": left_share,
                       "rightShare": right_share, "evidenceCount": evidence_count,
-                      "insufficientCount": insufficient_count}
-        if left_share is None or abs(left_share - right_share) < MIN_AXIS_MARGIN:
-            preferences.append(None)
-        else:
-            preferences.append(left if left_share > right_share else right)
+                      "insufficientCount": insufficient_count, "preference": preference}
+        preferences.append(preference)
 
     inferred_type = "".join(preferences) if eligible >= MIN_PERSONALITY_MESSAGES and all(preferences) else None
     return {"basis": "chat-inference", "theory": "MBTI preferences", "version": version,

@@ -8,13 +8,16 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import Mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from guidance_contracts import (GUIDANCE_REVISION, MAX_REPLIES, MAX_STRATEGIES,
-                                guidance_material, guidance_scope, normalize_guidance,
-                                valid_guidance)
+                                REPLY_OPTIONS_REVISION, guidance_material, guidance_scope,
+                                normalize_guidance, normalize_reply_options, valid_guidance,
+                                valid_reply_options)
 from result_store import ResultStore
+from node_analysis import NodeAnalysis
 
 
 def others(**overrides):
@@ -34,12 +37,47 @@ def guidance(**overrides):
     return value
 
 
+def reply_options(**overrides):
+    value = {"kind": "reply-options", "version": REPLY_OPTIONS_REVISION,
+             "replies": [{"text": "好呀 几点集合？"}, {"text": "我看看安排，晚点告诉你。"},
+                         {"text": "这次先不去了，下次约。"}]}
+    return {**value, **overrides}
+
+
+class ReplyOptionsContractTests(unittest.TestCase):
+    def test_exact_three_distinct_standalone_texts(self):
+        self.assertTrue(valid_reply_options(reply_options()))
+        self.assertEqual(normalize_reply_options(reply_options()), reply_options())
+        for value in [reply_options(replies=[]), reply_options(replies=[{"text": "好"}] * 3),
+                      reply_options(replies=[{"text": "好"}, {"text": " 好 "}, {"text": "收到"}]),
+                      reply_options(replies=[{"text": "好"}, {"text": "收到"}]),
+                      reply_options(replies=[{"text": "a" * 91}, {"text": "好"}, {"text": "收到"}]),
+                      reply_options(replies=[{"text": "好\n呀"}, {"text": "好"}, {"text": "收到"}]),
+                      reply_options(reading="额外分析"), reply_options(version=GUIDANCE_REVISION)]:
+            with self.subTest(value=value):
+                self.assertFalse(valid_reply_options(value))
+                self.assertIsNone(normalize_reply_options(value))
+        self.assertFalse(valid_guidance(reply_options()))
+        self.assertFalse(valid_reply_options(guidance()))
+
+
 class GuidanceContractTests(unittest.TestCase):
     def test_accepts_one_complete_reading_with_its_advice(self):
         self.assertTrue(valid_guidance(guidance()))
 
+    def test_auto_scene_and_explicit_legacy_scenarios_share_one_contract(self):
+        for scenario in ("auto", "general", "leader"):
+            with self.subTest(scenario=scenario):
+                value = guidance(scenario=scenario)
+                self.assertTrue(valid_guidance(value))
+                self.assertEqual(normalize_guidance(value)["scenario"], scenario)
+        self.assertFalse(valid_guidance(guidance(scenario="guessed-relationship")))
+
     def test_requires_the_current_revision(self):
         self.assertFalse(valid_guidance(guidance(version="api-guidance-v0")))
+        self.assertFalse(valid_guidance(guidance(version="api-guidance-v2")))
+        self.assertFalse(valid_guidance(guidance(version="api-guidance-v3")))
+        self.assertFalse(valid_guidance(guidance(version="api-guidance-v4")))
         self.assertEqual(guidance_scope("abc"), "abc:" + GUIDANCE_REVISION)
 
     def test_self_branch_follows_the_switch_in_both_directions(self):
@@ -54,6 +92,11 @@ class GuidanceContractTests(unittest.TestCase):
 
     def test_rejects_an_unusable_reading_or_advice(self):
         cases = [
+            guidance(scenario=[]),
+            guidance(subtexts=[{"id": [], "status": "uncertain"}]),
+            guidance(subtexts=[{"id": "m2", "status": []}]),
+            guidance(subtexts=[{"id": "m2", "status": "ok", "implied": "a" * 49}]),
+            guidance(subtexts=[{"id": "m2", "status": "ok", "sentiment": {"polarity": []}}]),
             guidance(subtexts=[]),
             guidance(subtexts=[{"id": "m2", "status": "ok"}]),
             guidance(subtexts=[{"id": "m2", "status": "done", "implied": "猜的"}]),
@@ -115,6 +158,23 @@ class GuidanceStoreTests(unittest.TestCase):
                          ["guidance"]["scenario"], "general")
         # Another source keeps its own result; the scope carries the prompt revision.
         self.assertIsNone(self.store.api_guidance_get("acct", "friend", scope_b, "friend"))
+
+    def test_reply_options_replace_their_own_scope_without_reusing_old_guidance(self):
+        old_scope = guidance_scope("api-a")
+        scope = guidance_scope("api-a", True)
+        self.assertNotEqual(scope, old_scope)
+        self.store.api_guidance_save("acct", "friend", old_scope, "friend", guidance())
+        self.assertIsNone(self.store.api_guidance_get("acct", "friend", scope, "friend"))
+        self.store.api_guidance_save("acct", "friend", scope, "friend", reply_options())
+        self.assertEqual(self.store.api_guidance_get("acct", "friend", scope, "friend")["guidance"],
+                         reply_options())
+        second = reply_options(replies=[{"text": "几点出发？"}, {"text": "我还得确认一下安排。"},
+                                       {"text": "这周先算啦，下周看看。"}])
+        self.store.api_guidance_save("acct", "friend", scope, "friend", second)
+        self.assertEqual(self.store.api_guidance_get("acct", "friend", scope, "friend")["guidance"], second)
+        self.assertEqual(self.store.api_guidance_get("acct", "friend", old_scope, "friend")["guidance"], guidance())
+        self.store.clear_analysis_cache("acct", "api-a")
+        self.assertIsNone(self.store.api_guidance_get("acct", "friend", scope, "friend"))
 
     def test_a_damaged_row_is_dropped_instead_of_surfaced(self):
         self.store.api_guidance_save("acct", "friend", guidance_scope("api-a"), "friend",
@@ -225,6 +285,38 @@ class GuidanceMaterialTests(unittest.TestCase):
         self.assertEqual(guidance_material(None), "")
         self.assertEqual(guidance_material({}), "")
         self.assertEqual(guidance_material({"guidance": {"version": GUIDANCE_REVISION}}), "")
+
+
+class GuidanceTransportTests(unittest.TestCase):
+    def test_reply_mode_has_its_own_revision_and_no_legacy_analysis_shape(self):
+        analyzer = object.__new__(NodeAnalysis)
+        analyzer._request = Mock(return_value=({**reply_options(),
+                                               "guidanceVersion": REPLY_OPTIONS_REVISION}, None))
+        response = analyzer.model_guidance("openai", "http://invalid.test", "synthetic", "synthetic",
+                                          [{"id": "m2", "sender": "OTHER", "text": "周六来吗"}],
+                                          ["m2"], "auto", False, 4096, reply_options=True)
+        self.assertTrue(analyzer._request.call_args.args[0]["replyOptions"])
+        self.assertFalse(set(analyzer._request.call_args.args[0]) &
+                         {"targetIds", "scenario", "analyzeSelf", "otherPortrait", "selfSummary", "feedback", "draft"})
+        self.assertEqual(response["guidance"], reply_options())
+        analyzer._request.return_value = ({**guidance(), "guidanceVersion": GUIDANCE_REVISION}, None)
+        with self.assertRaisesRegex(RuntimeError, "guidance-version-invalid"):
+            analyzer.model_guidance("openai", "http://invalid.test", "synthetic", "synthetic",
+                                    [], [], "auto", False, 4096, reply_options=True)
+
+    def test_node_request_keeps_the_new_draft_separate_from_legacy_feedback(self):
+        analyzer = object.__new__(NodeAnalysis)
+        result = guidance()
+        analyzer._request = Mock(return_value=({**result, "guidanceVersion": GUIDANCE_REVISION}, None))
+        draft = "我想婉拒。\n保持自然口吻。"
+        response = analyzer.model_guidance("openai", "http://invalid.test", "synthetic", "synthetic",
+                                          [{"id": "m2", "sender": "OTHER", "text": "周六来吗"}],
+                                          ["m2"], "leader", False, 8192, draft=draft)
+        request = analyzer._request.call_args.args[0]
+        self.assertEqual(request["draft"], draft)
+        self.assertIsNone(request["feedback"])
+        self.assertEqual(response["guidance"], result)
+        analyzer._request.assert_called_once()
 
 
 if __name__ == "__main__":

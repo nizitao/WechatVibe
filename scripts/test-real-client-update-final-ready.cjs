@@ -62,7 +62,10 @@ async function main() {
         if (name === "electron") return electron;
         if (name === "node:fs") return fs;
         if (name === "node:path") return path;
-        if (name === "node:child_process") return { execFile() { throw new Error("ready check must not stop a bridge"); } };
+        if (name === "node:child_process") return { execFile(_file, args, _options, callback) {
+          assert.ok(args[0].endsWith("installation_gate.py"), "ready check must not stop a bridge");
+          callback(null, JSON.stringify({ registered: true }));
+        } };
         if (name === "./real-client-model.cjs") return { ModelDownload: class { cancel() {} } };
         if (name === "./real-client-update-proxy.cjs") return {
           createUpdateProxyFetch: () => ({ fetchImpl: async () => { throw new Error("unexpected network"); } }),
@@ -77,6 +80,7 @@ async function main() {
           createUpdateController: () => ({ getState: () => ({ phase: "idle" }),
             check: async () => ({ phase: "current" }), begin: async () => ({}), rollback: async () => ({}) }),
         };
+        if (name === "./runtime-paths.cjs") return require("./runtime-paths.cjs");
         throw new Error(`Unexpected dependency: ${name}`);
       },
     });

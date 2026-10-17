@@ -29,6 +29,9 @@ async function checkJunctionParent(parent) {
   };
   put(path.join(installRoot, "resources", "client", "runtime", "node", "node.exe"));
   put(path.join(installRoot, "resources", "client", "scripts", "real-client-update-helper.cjs"));
+  for (const name of ["installation_gate.py", "process_lock.py"]) {
+    put(path.join(installRoot, "resources", "client", "bridge", name));
+  }
   fs.symlinkSync(physicalParent, alias, process.platform === "win32" ? "junction" : "dir");
   assert.notEqual(path.resolve(root), fs.realpathSync.native(root));
 
@@ -46,6 +49,10 @@ async function checkJunctionParent(parent) {
   const calls = { launcher: [], helper: [], quit: 0 };
   const mockedChildProcess = {
     execFile(program, args, options, callback) {
+      if (args[0].endsWith("installation_gate.py")) {
+        callback(null, JSON.stringify({ available: true }));
+        return;
+      }
       calls.launcher.push({ program, args, options });
       assert.ok(args.includes("--stop-owned-bridge"));
       callback(null, JSON.stringify({ stopped: true }));
@@ -60,15 +67,17 @@ async function checkJunctionParent(parent) {
     },
   };
   const moduleStub = { exports: {} };
+  const controllerEnv = {};
   vm.runInNewContext(fs.readFileSync(path.join(__dirname, "real-client-update-controller.cjs"), "utf8"), {
     module: moduleStub,
     require(name) {
       if (name === "node:child_process") return mockedChildProcess;
       if (name === "./real-client-update.cjs") return {};
       if (["node:crypto", "node:fs", "node:path"].includes(name)) return require(name);
+      if (name === "./runtime-paths.cjs") return require("./runtime-paths.cjs");
       throw new Error(`Unexpected controller import: ${name}`);
     },
-    process: { platform: "win32", pid: process.pid, env: {} }, setImmediate,
+    process: { platform: "win32", pid: process.pid, env: controllerEnv }, setImmediate,
   });
   const options = {
     app: { getVersion: () => "1.2.0", isPackaged: true }, root,
@@ -94,6 +103,14 @@ async function checkJunctionParent(parent) {
   assert.equal(calls.launcher.length, 1);
   assert.equal(calls.helper.length, 1);
   assert.equal(calls.quit, 1);
+  controllerEnv.WECHATVIBE_PROFILE = "synthetic-second";
+  const managed = moduleStub.exports.createUpdateController({ ...options,
+    checkImpl: async () => { throw new Error("profile must not check updates"); },
+    stageImpl: async () => { throw new Error("profile must not stage updates"); } });
+  assert.equal((await managed.check()).phase, "profile-managed");
+  assert.equal((await managed.begin()).phase, "profile-managed");
+  assert.equal((await managed.rollback()).phase, "profile-managed");
+  delete controllerEnv.WECHATVIBE_PROFILE;
   const operationFile = calls.helper[0].args[1];
   const operation = JSON.parse(fs.readFileSync(operationFile, "utf8"));
   for (const [key, expected] of Object.entries({ installRoot, workDir, candidatePath })) {

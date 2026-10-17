@@ -20,9 +20,6 @@ function section(start, end) {
   return app.slice(first, last);
 }
 const PICK_SOURCE = section("function pickableMessage(", "function uncoveredMessages(");
-// The link rule lives beside the other text predicates; `pickableMessage` only calls it, so
-// the slice has to carry it (and it must stay in step with `bridge/message_input.py`).
-const LINK_SOURCE = section("// Links never reach a model", "function hasIntentContent(");
 
 function matches(node, selector) {
   return selector.split(".").filter(Boolean).every(name => node.classes.includes(name));
@@ -107,10 +104,9 @@ function harness(messages = [], seed = {}) {
   installViewState(context);
   context.settingsState.modelSourceResolved = true;
   context.settingsState.modelSourceSnapshot = { mode: "local", api: null, sourceId: "local" };
-  vm.runInContext(`${LINK_SOURCE}${PICK_SOURCE}
+  vm.runInContext(`${PICK_SOURCE}
     globalThis.picks = { pickableMessage, pickedMessages, pickedWindow, renderPickBar,
-      setPickedMessage, syncPickControls, setMessagePicking, pickAllMessages, attachPickControl,
-      stripMessageLinks, messageAnalysisText, hasAnalyzableText };`,
+      setPickedMessage, syncPickControls, setMessagePicking, pickAllMessages, attachPickControl };`,
   context);
   const container = byId("chatMessages");
   container.children = [];
@@ -135,33 +131,6 @@ it("offers a checkbox only for messages the active source can analyse", () => {
   assert.equal(context.picks.pickableMessage(message("m1", "other", "嗯")), true);
 });
 
-it("keeps a message that is only a link out of every analysis path", () => {
-  const { picks, context, nodes } = harness([
-    message("m1", "other", "https://example.com/share"),
-    message("m2", "other", "www.example.com/a"),
-    message("m3", "other", "[链接]"),
-    message("m4", "other", "看这个 https://example.com/a 挺有意思"),
-    message("m5", "other", "？？？"),
-  ]);
-  // The rule itself, shared with `bridge/message_input.py`.
-  assert.equal(picks.hasAnalyzableText("https://example.com/a"), false);
-  assert.equal(picks.hasAnalyzableText("https://example.com/a。"), false, "trailing punctuation stays with the sentence");
-  assert.equal(picks.hasAnalyzableText("[链接]"), false);
-  assert.equal(picks.hasAnalyzableText("[重要]"), true, "only WeChat placeholder names are dropped");
-  assert.equal(picks.hasAnalyzableText("？？？"), true, "punctuation alone still carries tone, as before");
-  assert.equal(picks.messageAnalysisText("看 https://example.com/a。"), "看 。");
-  assert.equal(picks.messageAnalysisText("见 mp.weixin.qq.com/s/a"), "见 mp.weixin.qq.com/s/a",
-    "a bare domain without a scheme is not stripped");
-  // Hand-picking never offers them, and the API submit list never carries them either.
-  assert.deepEqual([nodes[0].classList.contains("pickable"), nodes[1].classList.contains("pickable"),
-    nodes[2].classList.contains("pickable"), nodes[3].classList.contains("pickable"),
-    nodes[4].classList.contains("pickable")],
-  [false, false, false, true, true]);
-  assert.equal(picks.pickableMessage(message("m9", "other", "https://example.com/a")), false);
-  context.settingsState.modelSourceSnapshot = { mode: "api", api: null, sourceId: "api-a" };
-  assert.equal(picks.pickableMessage(message("m9", "other", "https://example.com/a")), false);
-});
-
 it("sends exactly the picked ids inside the tail window the backend resolves", () => {
   const messages = Array.from({ length: 20 }, (_unused, index) => message(`m${index}`));
   const { picks, context } = harness(messages);
@@ -182,14 +151,18 @@ it("drops ids that fell out of the 80-message window instead of sending them", (
   assert.equal(window.limit, 80);
   assert.equal(window.candidates.length, 80, "the oldest ten ids are outside the window");
   assert.deepEqual(window.candidates[0].id, "m10");
-  assert.match(context.byId("pickBarCount").textContent, /已选 80 条（10 条超出当前窗口）/u);
+  assert.equal(context.byId("pickBarCount").textContent, "已选 80 条");
+  assert.equal(context.chatState.selectedMessageIds.size, 80);
+  picks.setPickedMessage("m0", true);
+  assert.equal(context.chatState.selectedMessageIds.has("m0"), false, "old rows cannot re-enter the selection");
 });
 
 it("counts the selection on the bar and clears it on exit", () => {
   const { picks, context, byId } = harness([message("m1"), message("m2")]);
   picks.setMessagePicking(true);
-  assert.equal(byId("btnPickAnalyze").disabled, true, "an empty selection cannot be submitted");
-  picks.setPickedMessage("m1", true);
+  assert.equal(byId("btnPickAnalyze").disabled, false, "entering selects the current eligible window");
+  assert.equal(context.chatState.selectedMessageIds.size, 2);
+  picks.setPickedMessage("m2", false);
   assert.match(byId("pickBarCount").textContent, /已选 1 条/u);
   assert.equal(byId("btnPickAnalyze").disabled, false);
   assert.ok(byId("chatMessages").classList.contains("pick-mode"));
@@ -202,6 +175,18 @@ it("counts the selection on the bar and clears it on exit", () => {
   assert.equal(row.querySelector(".msg-pick input").checked, false);
   assert.equal(byId("pickBar").hidden, true);
   assert.equal(byId("chatMessages").classList.contains("pick-mode"), false);
+});
+
+it("does not reselect excluded messages or newly arriving messages on refresh", () => {
+  const { picks, context } = harness([message("m1"), message("m2")]);
+  picks.setMessagePicking(true);
+  picks.setPickedMessage("m1", false);
+  context.chatState.messages.push(message("new"));
+  picks.syncPickControls();
+  assert.deepEqual([...context.chatState.selectedMessageIds], ["m2"]);
+  picks.setMessagePicking(false);
+  picks.setMessagePicking(true);
+  assert.deepEqual([...context.chatState.selectedMessageIds], ["m1", "m2", "new"]);
 });
 
 it("toggles from the row itself and never from the checkbox twice", () => {
@@ -238,7 +223,7 @@ it("keeps the automatic window runs off while the selection is being made", () =
   assert.match(submit, /if \(chatState\.messagePicking\) \{ submitPickedMessages\(\); return; \}/u);
   const ensure = app.slice(app.indexOf("function ensureApiInsights("),
     app.indexOf("let managedAccounts = [];"));
-  assert.match(ensure, /if \(chatState\.messagePicking\) \{ renderApiInsightStatus\(\); return; \}/u);
+  assert.match(ensure, /if \(chatState\.messagePicking && !scope\?\.picked\) \{ renderApiInsightStatus\(\); return; \}/u);
   // The picked ids ride on the existing recent-window request instead of a new endpoint.
   const analyze = app.slice(app.indexOf("async function analyzeRecent("),
     app.indexOf("async function scheduleIncremental("));

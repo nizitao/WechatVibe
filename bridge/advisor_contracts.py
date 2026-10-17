@@ -64,7 +64,7 @@ MESSAGE_STATUSES = ("stopped", "error", "reading")
 
 # --- Stable error codes -----------------------------------------------------
 ERROR_CODES = frozenset({
-    "invalid-request", "agent-unknown", "agent-disabled", "builtin-agent",
+    "invalid-request", "agent-unknown", "agent-disabled", "agent-changed", "builtin-agent",
     "skill-unknown", "skill-name-taken", "config-invalid", "config-full",
     "api-not-configured", "engine-unavailable", "account-changed",
     "account-paused", "account-closed", "context-error", "context-too-long",

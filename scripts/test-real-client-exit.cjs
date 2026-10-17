@@ -78,6 +78,10 @@ async function startShell(extraEnv = {}, extraArgs = [], monitorDrain, options =
       if (name === "node:path") return path;
       if (name === "node:child_process") return {
         execFile(file, args, options, callback) {
+          if (args[0].endsWith("installation_gate.py")) {
+            callback(null, JSON.stringify({ registered: true }));
+            return {};
+          }
           stopCalls.push({ file, args: Array.from(args), options, callback });
           return { kill() {} };
         },
@@ -111,6 +115,7 @@ async function startShell(extraEnv = {}, extraArgs = [], monitorDrain, options =
           };
         },
       };
+      if (name === "./runtime-paths.cjs") return require("./runtime-paths.cjs");
       throw new Error(`Unexpected require: ${name}`);
     },
     __dirname: SHELL_DIR,

@@ -73,11 +73,15 @@ class ModelSourceTestCase(unittest.TestCase):
         self.backend.api_lock = self.backend.api_tasks.lock
         self.backend.api_condition = self.backend.api_tasks.condition
         self.backend.api_jobs = self.backend.api_tasks.insight_jobs
+        self.backend.message_jobs = {}
+        self.backend.message_jobs_lock = threading.RLock()
+        self.backend.source = SimpleNamespace(lock=threading.RLock())
         self.backend.model_source_revision = 0
         self.backend.closing = False
         self.backend.model_source_store = self.store
         self.backend.active_model_source_mode = "local"
         self.backend.active_model_source_id = LOCAL_SOURCE_ID
+        self.backend.active_model_profile_id = None
         self.backend.active_api_config = None
         self.backend.request_lease = nullcontext
 
@@ -103,7 +107,11 @@ class ModelSourceTestCase(unittest.TestCase):
                                           "model": "test-model", "contextTokens": 128000}
         self.backend.api_jobs[("account-a", "friend", source_id)] = {"status": "running"}
         self.backend.api_portrait_jobs[("account-a", "friend", source_id, "friend")] = {"status": "running"}
-        self.backend.model_source_activate({"mode": "local"})
+        switched = self.backend.model_source_activate({"mode": "local"})
+        self.assertEqual((switched["mode"], switched["sourceId"], switched["label"]),
+                         ("local", LOCAL_SOURCE_ID, "本地 Laya"))
+        self.assertIsNone(self.backend.active_api_config)
+        self.assertEqual(switched["api"]["model"], "test-model")
         self.assertEqual((insight.cancelled, portrait.cancelled), (1, 1))
         self.assertEqual(self.backend.api_jobs, {})
         self.assertEqual(self.backend.api_portrait_jobs, {})
@@ -114,8 +122,12 @@ class ModelSourceTestCase(unittest.TestCase):
                    "model": "test-model", "apiKey": "test-only-key", "contextTokens": 128000}
         first = self.backend.model_source_activate(request)["sourceId"]
         self.assertEqual(len(self.backend.api_probe_analyzer.calls), 1)
-        self.backend.model_source_activate({"mode": "local"})
-        second = self.backend.model_source_activate({**request, "apiKey": ""})["sourceId"]
+        local = self.backend.model_source_activate({"mode": "local"})
+        self.assertEqual(local["label"], "本地 Laya")
+        self.assertEqual(local["api"]["model"], "test-model")
+        restored = self.backend.model_source_activate({**request, "apiKey": ""})
+        self.assertEqual((restored["mode"], restored["label"]), ("api", "test-model"))
+        second = restored["sourceId"]
         self.assertEqual(second, first)
         self.assertEqual(len(self.backend.api_probe_analyzer.calls), 1)
         self.backend.model_source_activate({**request, "model": "different-model", "apiKey": ""})
@@ -143,7 +155,8 @@ class ModelSourceTestCase(unittest.TestCase):
             "id": source_id, "protocol": "responses", "baseUrl": "https://example.test/v1",
             "model": "test-model", "contextTokens": 128000, "hasKey": True})
         self.assertEqual(self.store.public()["mode"], "local")
-        self.assertEqual(self.store.public()["label"], "test-model")
+        self.assertEqual(self.store.public()["label"], "本地 Laya")
+        self.assertEqual(self.store.public(mode="api", source_id=source_id)["label"], "test-model")
         self.assertEqual(self.store.resolve_key("responses", "https://example.test/v1", None), "test-only-key")
         self.assertIsNone(self.store.resolve_key("responses", "https://other.test/v1", None))
         self.assertIsNone(self.store.resolve_key("anthropic", "https://example.test/v1", None))
@@ -356,6 +369,31 @@ class ModelSourceTestCase(unittest.TestCase):
 
 
 class ModelProfileTests(ModelSourceTestCase):
+    def test_probe_uses_the_named_profile_key_even_when_another_profile_is_active(self):
+        first = self.backend.model_source_activate({"mode": "api", "protocol": "responses",
+            "baseUrl": "https://example.test/v1", "model": "model-a", "apiKey": "key-a", "contextTokens": 8192})
+        second = self.backend.model_source_profile_save({"name": "B", "protocol": "responses",
+            "baseUrl": "https://example.test/v1", "model": "model-b", "apiKey": "key-b", "contextTokens": 8192})
+        self.backend.model_source_test({"profileId": second["profile"], "protocol": "responses",
+            "baseUrl": "https://example.test/v1", "model": "model-b", "contextTokens": 8192})
+        self.assertEqual(self.backend.api_probe_analyzer.calls[-1][3], "key-b")
+        self.assertEqual(self.backend.model_source()["sourceId"], first["sourceId"])
+        self.backend.model_source_test({"protocol": "responses", "baseUrl": "https://example.test/v1",
+                                       "model": "draft", "contextTokens": 8192})
+        self.assertIsNone(self.backend.api_probe_analyzer.calls[-1][3])
+
+    def test_editing_model_changes_cache_identity_without_changing_profile_id(self):
+        first = self.backend.model_source_activate({"mode": "api", "protocol": "responses",
+            "baseUrl": "https://example.test/v1", "model": "model-a", "apiKey": "key-a", "contextTokens": 8192})
+        profile_id = first["api"]["id"]
+        request = {"profileId": profile_id, "name": "A", "protocol": "responses",
+                   "baseUrl": "https://example.test/v1", "model": "model-b", "contextTokens": 8192}
+        edited = self.backend.model_source_profile_save(request)
+        self.assertEqual(edited["api"]["id"], profile_id)
+        self.assertNotEqual(edited["sourceId"], first["sourceId"])
+        restored = self.backend.model_source_profile_save({**request, "model": "model-a"})
+        self.assertEqual(restored["sourceId"], first["sourceId"])
+
     """Multiple saved API profiles: create, edit, switch and delete."""
 
     def activate(self, model, base_url="https://example.test/v1", key="test-only-key",
@@ -533,7 +571,8 @@ class ModelProfileTests(ModelSourceTestCase):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(legacy), encoding="utf-8")
         migrated = self.store.public()
-        self.assertEqual(migrated["label"], "model-a")
+        self.assertEqual(migrated["label"], "本地 Laya")
+        self.assertEqual(self.store.public(mode="api", source_id="a" * 32)["label"], "model-a")
         self.assertEqual(migrated["profiles"][0]["name"], "model-a")
         self.assertEqual(self.store.resolve_key("responses", "https://example.test/v1", None),
                          "legacy-key")

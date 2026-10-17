@@ -1,10 +1,8 @@
 """Parallel API insight workers: one inference process per concurrent call.
 
-`NodeAnalysis` serialises every request behind its own instance condition, so a single
-API worker can only have one provider turn in flight. The Node side already runs each
-command lane with up to ten concurrent requests (`bridge/analysis_server.ts`), so the
-ceiling here stays well below that: a short lane queue avoids turning a provider 429 into
-the retry storm that `API_INSIGHT_RETRYABLE` would otherwise amplify.
+NodeAnalysis already multiplexes requests while its condition releases the lock.
+This pool provides an explicit bounded budget across its API-only processes; it
+does not assume that another process automatically improves provider throughput.
 
 Parallelism is per conversation. Insight jobs are keyed by `(account, user, source_id)`
 and a repeated request for the same key returns the running job, so extra capacity only
@@ -17,6 +15,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -57,11 +56,16 @@ def api_worker_settings(settings_path=None):
 def save_api_worker_settings(workers, settings_path=None):
     """Persist the API parallelism choice next to the other runtime state."""
     path = Path(settings_path or _SETTINGS_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"workers": int(workers)}) + "\n", encoding="utf-8")
-    except OSError:
-        pass
+        with temporary.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps({"workers": int(workers)}) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 class ApiAnalyzerPool:
     """Hands out API-only analyzers, at most one lease per analyzer at a time.
@@ -84,6 +88,10 @@ class ApiAnalyzerPool:
         self.rate_limit_streak = 0
         self.clean_streak = 0
         self.downshifts = 0
+        self.generation = 0
+        self.closed = False
+        self.waiters = {"shared": [], "portrait": [], "probe": []}
+        self.dedicated_active = {"portrait": 0, "probe": 0}
 
     def configure(self, workers=None):
         """Resize the ceiling and remember it. An explicit choice takes effect at once,
@@ -91,19 +99,25 @@ class ApiAnalyzerPool:
         analyzers: they keep serving a lease they already hold, and `close_extras` drops
         the rest."""
         with self.condition:
+            if self.closed:
+                raise RuntimeError("model-source-changed")
             if workers is not None:
-                self.maximum = max(1, min(MAX_API_WORKERS, int(workers)))
+                maximum = max(1, min(MAX_API_WORKERS, int(workers)))
+                save_api_worker_settings(maximum, self.settings_path)
+                self.maximum = maximum
                 self.limit = self.maximum
             if self.limit > self.maximum:
                 self.limit = self.maximum
             self.condition.notify_all()
-        save_api_worker_settings(self.maximum, self.settings_path)
         return self.status()
 
     def status(self):
         with self.condition:
             return {"workers": self.maximum, "max": MAX_API_WORKERS, "limit": self.limit,
-                    "active": self.active, "spawned": max(0, len(self.entries) - 1),
+                    "active": self.active, "spawned": 0 if self.closed else max(0, len(self.entries) - 1),
+                    "totalActive": self.active + sum(self.dedicated_active.values()),
+                    "totalLimit": self.limit + 2,
+                    "waiting": sum(map(len, self.waiters.values())),
                     "rateLimitStreak": self.rate_limit_streak, "downshifts": self.downshifts}
 
     def _spawn_locked(self):
@@ -111,7 +125,7 @@ class ApiAnalyzerPool:
         return len(self.entries) - 1
 
     @contextmanager
-    def lease(self, timeout=180.0):
+    def lease(self, timeout=180.0, *, cancelled=None, validate=None):
         """Reserve one analyzer for the duration of a single provider turn.
 
         Waiting happens here rather than at the provider, so raising the ceiling turns
@@ -119,28 +133,99 @@ class ApiAnalyzerPool:
         waited longer than the provider's own 180s budget would fail anyway.
         """
         deadline = time.monotonic() + timeout
+        ticket = object()
         with self.condition:
-            index = None
+            generation = self.generation
+            self.waiters["shared"].append(ticket)
+        index = None
+        try:
             while index is None:
-                free = [i for i, (_, busy) in enumerate(self.entries) if i < self.limit and not busy]
-                if free:
-                    index = free[0]
-                elif len(self.entries) < self.limit:
-                    index = self._spawn_locked()
-                else:
+                self._validate_waiter(cancelled, validate)
+                with self.condition:
+                    self._check_epoch(generation)
+                    if self.waiters["shared"][0] is ticket and self.active < self.limit:
+                        free = [i for i, (_, busy) in enumerate(self.entries) if i < self.limit and not busy]
+                        if free:
+                            index = free[0]
+                        elif len(self.entries) < self.limit:
+                            index = self._spawn_locked()
+                    if index is not None:
+                        analyzer = self.primary() if index == 0 else self.entries[index][0]
+                        self.entries[index] = (analyzer, True)
+                        self.active += 1
+                        self.waiters["shared"].remove(ticket)
+                        self.condition.notify_all()
+                        break
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError("API analyzer pool exhausted")
-                    self.condition.wait(min(remaining, 1.0))
-            analyzer = self.entries[index][0]
-            self.entries[index] = (analyzer, True)
-            self.active += 1
-        try:
+                    self.condition.wait(min(remaining, .05))
+            self._validate_waiter(cancelled, validate)
+            with self.condition:
+                self._check_epoch(generation)
             yield analyzer
         finally:
             with self.condition:
-                self.entries[index] = (self.entries[index][0], False)
-                self.active -= 1
+                if ticket in self.waiters["shared"]:
+                    self.waiters["shared"].remove(ticket)
+                if index is not None:
+                    self.entries[index] = (self.entries[index][0], False)
+                    self.active -= 1
+                    if self.closed and not self.active:
+                        self.entries = [(self.primary(), False)]
+                self.condition.notify_all()
+
+    @staticmethod
+    def _validate_waiter(cancelled, validate):
+        # Never invoke application callbacks while holding the pool condition.
+        if cancelled is not None and cancelled():
+            raise RuntimeError("model-source-changed")
+        if validate is not None:
+            validate()
+
+    def _check_epoch(self, generation):
+        if self.closed or generation != self.generation:
+            raise RuntimeError("model-source-changed")
+
+    @contextmanager
+    def dedicated(self, lane, timeout=240.0, *, cancelled=None, validate=None):
+        """One bounded slot for each existing portrait/probe process.
+
+        Shared label/guidance capacity remains 1..4; two dedicated slots retain
+        lane isolation. The combined envelope is always shared limit + 2.
+        """
+        if lane not in self.dedicated_active:
+            raise ValueError("invalid API lane")
+        ticket = object()
+        deadline = time.monotonic() + timeout
+        acquired = False
+        with self.condition:
+            generation = self.generation
+            self.waiters[lane].append(ticket)
+        try:
+            while not acquired:
+                self._validate_waiter(cancelled, validate)
+                with self.condition:
+                    self._check_epoch(generation)
+                    if self.waiters[lane][0] is ticket and not self.dedicated_active[lane]:
+                        self.dedicated_active[lane] = 1
+                        self.waiters[lane].remove(ticket)
+                        acquired = True
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("API lane exhausted")
+                    self.condition.wait(min(remaining, .05))
+            self._validate_waiter(cancelled, validate)
+            with self.condition:
+                self._check_epoch(generation)
+            yield
+        finally:
+            with self.condition:
+                if ticket in self.waiters[lane]:
+                    self.waiters[lane].remove(ticket)
+                if acquired:
+                    self.dedicated_active[lane] = 0
                 self.condition.notify_all()
     def note_rate_limited(self):
         """Step the effective limit down after repeated provider rate limits."""
@@ -176,7 +261,9 @@ class ApiAnalyzerPool:
     def invalidate(self):
         """Cancel in-flight provider turns on every analyzer (model source switch)."""
         with self.condition:
+            self.generation += 1
             analyzers = [analyzer for analyzer, _ in self.entries]
+            self.condition.notify_all()
         seen = set()
         for analyzer in analyzers:
             if id(analyzer) in seen:
@@ -185,14 +272,18 @@ class ApiAnalyzerPool:
             cancel = getattr(analyzer, "cancel", None)
             if callable(cancel):
                 cancel()
+        return seen
 
     def close_extras(self):
         """Close every analyzer except the primary; the caller owns the primary."""
         with self.condition:
+            self.closed = True
+            self.generation += 1
             kept = self.primary()
             extras = [analyzer for analyzer, _ in self.entries[1:] if analyzer is not kept]
-            self.entries = [(kept, False)]
-            self.active = 0
+            if not self.active:
+                self.entries = [(kept, False)]
+            self.condition.notify_all()
         for analyzer in extras:
             close = getattr(analyzer, "close", None)
             if callable(close):

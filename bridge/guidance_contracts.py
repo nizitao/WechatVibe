@@ -9,9 +9,13 @@ normalised, so a malformed provider reply can never be persisted or displayed.
 """
 from __future__ import annotations
 
-GUIDANCE_REVISION = "api-guidance-v2"
+import hashlib
+import json
 
-GUIDANCE_SCENARIOS = frozenset({"general", "leader"})
+GUIDANCE_REVISION = "api-guidance-v5"
+REPLY_OPTIONS_REVISION = "api-reply-options-v2"
+
+GUIDANCE_SCENARIOS = frozenset({"auto", "general", "leader"})
 
 GUIDANCE_STATUSES = frozenset({"ok", "uncertain", "insufficient"})
 
@@ -32,6 +36,7 @@ MAX_SUBTEXTS = 12
 GUIDANCE_WINDOW_MESSAGES = 160
 GUIDANCE_CONTEXT_CHARACTERS = 24_000
 GUIDANCE_FEEDBACK_MAX = 400
+GUIDANCE_DRAFT_MAX = 2000
 GUIDANCE_PORTRAIT_CONTEXT_MAX = 120
 GUIDANCE_SUMMARY_CONTEXT_MAX = 120
 MAX_SURFACE = 24
@@ -49,15 +54,51 @@ MAX_REPLIES = 3
 MAX_SELF_POINTS = 3
 
 
-def guidance_scope(source_id):
+def guidance_scope(source_id, reply_options=False, assistant=None):
     """Source-scoped storage key. A prompt revision never mixes with an older one."""
-    return source_id + ":" + GUIDANCE_REVISION
+    scope = source_id + ":" + (REPLY_OPTIONS_REVISION if reply_options else GUIDANCE_REVISION)
+    if reply_options and assistant is not None:
+        identity = [assistant["agentId"], assistant["agentRevision"], assistant["stamp"]]
+        scope += ":" + hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return scope
+
+
+def valid_reply_options(value):
+    """Three distinct complete reply texts, without legacy analysis fields."""
+    if (not isinstance(value, dict) or
+            set(value) != {"kind", "version", "replies"} or
+            value.get("kind") != "reply-options" or
+            value.get("version") != REPLY_OPTIONS_REVISION):
+        return False
+    replies = value.get("replies")
+    if not isinstance(replies, list) or len(replies) != 3:
+        return False
+    seen = set()
+    for reply in replies:
+        if not isinstance(reply, dict) or set(reply) != {"text"}:
+            return False
+        text = _text(reply["text"], MAX_REPLY_TEXT)
+        if not text or text in seen:
+            return False
+        seen.add(text)
+    return True
+
+
+def normalize_reply_options(value):
+    if not valid_reply_options(value):
+        return None
+    return {"kind": "reply-options", "version": REPLY_OPTIONS_REVISION,
+            "replies": [{"text": reply["text"].strip()} for reply in value["replies"]]}
+
+
+def valid_guidance_payload(value):
+    return valid_reply_options(value) or valid_guidance(value)
 
 
 def _text(value, maximum):
     if not isinstance(value, str):
         return None
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+    if len(value) > maximum or any(ord(char) < 32 or ord(char) == 127 for char in value):
         return None
     return value.strip()[:maximum]
 
@@ -79,7 +120,7 @@ def _valid_subtext(item):
     if not isinstance(item, dict):
         return False
     status = item.get("status")
-    if status not in GUIDANCE_STATUSES:
+    if not isinstance(status, str) or status not in GUIDANCE_STATUSES:
         return False
     if status != "ok":
         # A terminal reading carries no interpretation, so it may not smuggle one in.
@@ -96,7 +137,8 @@ def _valid_subtext(item):
     if sentiment is not None:
         if not isinstance(sentiment, dict) or set(sentiment) - SENTIMENT_FIELDS:
             return False
-        if sentiment.get("polarity") not in GUIDANCE_POLARITIES:
+        if (not isinstance(sentiment.get("polarity"), str) or
+                sentiment.get("polarity") not in GUIDANCE_POLARITIES):
             return False
         if "label" in sentiment and _text(sentiment["label"], MAX_SENTIMENT_LABEL) is None:
             return False
@@ -141,7 +183,7 @@ def valid_guidance(value):
         return False
     if value.get("version") != GUIDANCE_REVISION:
         return False
-    if value.get("scenario") not in GUIDANCE_SCENARIOS:
+    if not isinstance(value.get("scenario"), str) or value.get("scenario") not in GUIDANCE_SCENARIOS:
         return False
     analyze_self = value.get("analyzeSelf")
     if not isinstance(analyze_self, bool):
@@ -152,7 +194,9 @@ def valid_guidance(value):
     if not isinstance(subtexts, list) or not 1 <= len(subtexts) <= MAX_SUBTEXTS:
         return False
     identifiers = [item.get("id") for item in subtexts if isinstance(item, dict)]
-    if len(identifiers) != len(subtexts) or len(set(identifiers)) != len(identifiers):
+    if (len(identifiers) != len(subtexts) or
+            any(not isinstance(identifier, str) for identifier in identifiers) or
+            len(set(identifiers)) != len(identifiers)):
         return False
     if any(not isinstance(item["id"], str) or not item["id"] or len(item["id"]) > 200 or
            any(ord(char) < 32 or ord(char) == 127 for char in item["id"]) or
@@ -174,9 +218,50 @@ def valid_guidance(value):
     return True
 
 
+def normalize_guidance(value):
+    """Canonical stored shape, or None when the payload violates the contract."""
+    if not valid_guidance(value):
+        return None
+    subtexts = []
+    for item in value["subtexts"]:
+        entry = {"id": item["id"], "status": item["status"]}
+        for field in ("surface", "implied", "tactic"):
+            if item.get(field):
+                entry[field] = item[field]
+        sentiment = item.get("sentiment")
+        if isinstance(sentiment, dict):
+            entry["sentiment"] = {key: sentiment[key] for key in ("polarity", "label")
+                                  if key in sentiment}
+        subtexts.append(entry)
+    others = value["advice"]["forOthers"]
+    advice_self = value["advice"]["forSelf"]
+    return {
+        "version": GUIDANCE_REVISION,
+        "scenario": value["scenario"],
+        "analyzeSelf": value["analyzeSelf"],
+        "subtexts": subtexts,
+        "advice": {
+            "forOthers": {
+                "reading": others["reading"],
+                "strategies": list(others["strategies"]),
+                "replies": [{"text": reply["text"],
+                             **({"tone": reply["tone"]} if reply.get("tone") else {})}
+                            for reply in others["replies"]],
+            },
+            "forSelf": None if advice_self is None else {
+                "summary": advice_self["summary"],
+                "strengths": list(advice_self["strengths"]),
+                "improvements": list(advice_self["improvements"]),
+            },
+        },
+    }
+
+
+# --- Fork addition (b63fd99): render one stored result as assistant reference material.
+
 _STATUS_LABELS = {"uncertain": "不确定", "insufficient": "信息不足"}
 _POLARITY_LABELS = {"positive": "偏正面", "neutral": "中性", "negative": "偏负面", "mixed": "好坏参半"}
-_SCENARIO_LABELS = {"general": "普通联系人", "leader": "与领导／上级"}
+_SCENARIO_LABELS = {"auto": "自动识别", "general": "普通联系人", "leader": "与领导／上级"}
 
 GUIDANCE_MISSING_NOTE = (
     "本次会话还没有保存过「潜台词与沟通建议」的分析结果；如果用户需要这类解读或建议，"
@@ -230,42 +315,3 @@ def guidance_material(saved):
         lines.append("做得好的：" + "；".join(advice_self["strengths"]))
         lines.append("可以改进：" + "；".join(advice_self["improvements"]))
     return "\n".join(lines)
-
-
-def normalize_guidance(value):
-    """Canonical stored shape, or None when the payload violates the contract."""
-    if not valid_guidance(value):
-        return None
-    subtexts = []
-    for item in value["subtexts"]:
-        entry = {"id": item["id"], "status": item["status"]}
-        for field in ("surface", "implied", "tactic"):
-            if item.get(field):
-                entry[field] = item[field]
-        sentiment = item.get("sentiment")
-        if isinstance(sentiment, dict):
-            entry["sentiment"] = {key: sentiment[key] for key in ("polarity", "label")
-                                  if key in sentiment}
-        subtexts.append(entry)
-    others = value["advice"]["forOthers"]
-    advice_self = value["advice"]["forSelf"]
-    return {
-        "version": GUIDANCE_REVISION,
-        "scenario": value["scenario"],
-        "analyzeSelf": value["analyzeSelf"],
-        "subtexts": subtexts,
-        "advice": {
-            "forOthers": {
-                "reading": others["reading"],
-                "strategies": list(others["strategies"]),
-                "replies": [{"text": reply["text"],
-                             **({"tone": reply["tone"]} if reply.get("tone") else {})}
-                            for reply in others["replies"]],
-            },
-            "forSelf": None if advice_self is None else {
-                "summary": advice_self["summary"],
-                "strengths": list(advice_self["strengths"]),
-                "improvements": list(advice_self["improvements"]),
-            },
-        },
-    }

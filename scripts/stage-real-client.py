@@ -12,6 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = (
     "start-real-client.py", "start-real-client.cmd", "desktop-main.cjs",
+    "runtime-paths.cjs",
     "real-client-shell.cjs", "real-client-preload.cjs", "real-client-recovery.cjs",
     "real-client-update.cjs", "real-client-update-proxy.cjs", "real-client-model.cjs",
     "real-client-update-controller.cjs",
@@ -22,7 +23,9 @@ SCRIPTS = (
     "advisor-companion.cjs", "advisor-preload.cjs",
 )
 BRIDGE = (
-    "account_api.py", "account_store.py", "conversation_selection.py",
+    "account_api.py", "account_store.py", "account_pin_source.py", "conversation_selection.py",
+    "account_leases.py", "process_lock.py", "payload_crypto.py", "payload_recovery.py", "installation_gate.py",
+    "api_pool.py", "guidance_contracts.py",
     "analysis_server.ts", "batch_engine.py",
     "batch_state.py", "cache_source.py", "chat_server.py", "data_root_source.py", "history_browser.py",
     "instance_identity.py", "live_source.py", "model_source.py", "model_bundle.py",
@@ -65,7 +68,7 @@ PUBLIC_FILES = (
     "chatui/app.js", "chatui/message-labels.js", "chatui/message-insight-adapters.js", "chatui/view-state.js", "chatui/style.css", "chatui/kaomoji.js",
     "chatui/data/analysis-catalog.json", "chatui/assets/wechatvibe-icon.png",
     "chatui/assets/wechatvibe-icon.ico", "electron/analysis.ts",
-    "electron/model-connectors.ts", "electron/api-insights.ts",
+    "electron/model-connectors.ts", "electron/api-insights.ts", "electron/api-guidance.ts", "electron/api-reply-options.ts",
     "electron/api-message-insights.ts", "electron/api-insight-stream.ts", "electron/api-portrait.ts", "electron/api-portrait-evidence.ts", "electron/api-analysis-json.ts",
     "electron/api-portrait-classifier.ts",
     "electron/api-guidance.ts",
@@ -205,7 +208,7 @@ def stage_public(source: Path, models: Path, output: Path) -> dict:
         rows.append({"file": relative.as_posix(), "bytes": length, "sha256": checksum})
     metadata = output / "package.json"
     metadata.write_text(json.dumps({"name": "wechatvibe-runtime", "version": version,
-                                    "private": True, "type": "module"}, indent=2) + "\n",
+                                    "private": True, "type": "module", "analysisPayloadFormats": ["wv1:"]}, indent=2) + "\n",
                         encoding="utf-8")
     rows.append({"file": "package.json", "bytes": metadata.stat().st_size,
                  "sha256": digest(metadata)})

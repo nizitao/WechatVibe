@@ -14,7 +14,8 @@ import uuid
 from pathlib import Path
 
 from backend_contracts import ROOT, valid_api_portrait, validate_personality_evidence
-from guidance_contracts import GUIDANCE_REVISION, valid_guidance
+from guidance_contracts import (GUIDANCE_REVISION, REPLY_OPTIONS_REVISION,
+                                valid_guidance, valid_reply_options)
 from local_model_source import ModelSource
 from profile_signals import validate_style_evidence
 from portrait_contracts import valid_mbti_basis, valid_portrait_evidence
@@ -332,20 +333,34 @@ class NodeAnalysis:
 
     def model_guidance(self, protocol, base_url, api_key, model, messages, target_ids,
                        scenario, analyze_self, context_tokens, other_portrait=None,
-                       self_summary=None, feedback=None):
-        """One provider turn for the subtext reading plus the scenario advice.
+                       self_summary=None, feedback=None, draft=None, reply_options=False, assistant=None):
+        """One provider turn for reply options or compatible legacy guidance.
 
         The payload is re-validated here: Node already normalised it, so a shape that
         reaches Python has been checked twice before it can be stored or displayed.
         """
-        response, _ = self._request({"cmd": "model:guidance", "protocol": protocol,
-                                     "baseUrl": base_url, "apiKey": api_key, "model": model,
-                                     "messages": messages, "targetIds": target_ids,
-                                     "scenario": scenario, "analyzeSelf": analyze_self,
-                                     "contextTokens": context_tokens,
-                                     "otherPortrait": other_portrait,
-                                     "selfSummary": self_summary, "feedback": feedback},
-                                    require_model=False)
+        payload = {"cmd": "model:guidance", "protocol": protocol, "baseUrl": base_url,
+                   "apiKey": api_key, "model": model, "messages": messages,
+                   "contextTokens": context_tokens}
+        if reply_options:
+            payload["replyOptions"] = True
+            if assistant is not None:
+                payload["assistant"] = {key: assistant[key] for key in ("prompt", "skills")}
+        else:
+            payload.update(targetIds=target_ids, scenario=scenario, analyzeSelf=analyze_self,
+                           otherPortrait=other_portrait, selfSummary=self_summary,
+                           feedback=feedback, draft=draft)
+        response, _ = self._request(payload, require_model=False)
+        if reply_options:
+            if response.get("guidanceVersion") != REPLY_OPTIONS_REVISION:
+                raise RuntimeError("guidance-version-invalid")
+            if set(response) & {"scenario", "analyzeSelf", "subtexts", "advice"}:
+                raise RuntimeError("invalid-guidance")
+            guidance = {key: response[key] for key in ("kind", "version", "replies") if key in response}
+            if not valid_reply_options(guidance):
+                raise RuntimeError("invalid-guidance")
+            return {"guidance": guidance, "usage": response.get("usage"),
+                    "responseId": response.get("responseId")}
         if response.get("guidanceVersion") != GUIDANCE_REVISION:
             raise RuntimeError("guidance-version-invalid")
         guidance = {key: response[key] for key in

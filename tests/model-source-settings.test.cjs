@@ -90,7 +90,7 @@ const profile = (letter, name, model) => ({
 });
 const localState = { mode: "local", api: null, profiles: [], label: "本地 Laya", sourceId: "local", status: "ready" };
 const apiState = {
-  mode: "api", sourceId: id("b"), status: "ready", label: "线路 B",
+  mode: "api", sourceId: "api:source-b-revision-2", status: "ready", label: "线路 B",
   api: { id: id("b"), protocol: "responses", baseUrl: "https://b.test/v1", model: "model-b", contextTokens: 128000, hasKey: true },
   profiles: [profile("a", "线路 A", "model-a"), profile("b", "线路 B", "model-b")],
 };
@@ -328,9 +328,46 @@ it("hides the model badge until the active source is known", () => {
   assert.equal(byId("modelBadgeLabel").textContent, "本地 Laya");
 });
 
+it("keeps local Laya and model management available in both menus without API profiles", () => {
+  const { ui, byId } = harness(async () => response(localState));
+  ui.showModelSource(localState);
+  for (const [trigger, menu] of [["modelBadge", "modelBadgeMenu"], ["portraitSourceBadge", "portraitSourceMenu"]]) {
+    ui.toggleModelBadgeMenu(trigger, menu);
+    const options = byId(menu).options;
+    assert.equal(options.length, 2);
+    assert.equal(options[0].dataset.profileId, "");
+    assert.equal(options[0].getAttribute("aria-checked"), "true");
+    assert.equal(options[1].dataset.manage, "1");
+    ui.toggleModelBadgeMenu(trigger, menu);
+  }
+});
+
+it("uses the actual local mode even when a saved API label is retained, then restores the API name", async () => {
+  const savedLocal = { ...apiState, mode: "local", sourceId: "local:laya" };
+  const requests = [];
+  const { ui, byId } = harness(async (url, options) => {
+    const body = JSON.parse(options.body);
+    requests.push({ url, body });
+    return response(body.mode === "local" ? savedLocal : apiState);
+  });
+  ui.showModelSource(apiState);
+  assert.equal(byId("modelBadgeLabel").textContent, "线路 B");
+  await ui.activateModelProfile("");
+  assert.equal(ui.getSnapshot().mode, "local");
+  assert.equal(byId("modelBadgeLabel").textContent, "本地 Laya");
+  assert.equal(ui.getSnapshot().profiles.length, 2);
+  ui.toggleModelBadgeMenu();
+  assert.deepEqual(byId("modelBadgeMenu").options.slice(0, 3).map(item => item.getAttribute("aria-checked")),
+    ["false", "false", "true"]);
+  await ui.activateModelProfile(id("b"));
+  assert.equal(byId("modelBadgeLabel").textContent, "线路 B");
+  assert.equal(ui.getSnapshot().sourceId, apiState.sourceId);
+  assert.deepEqual(requests.map(item => item.body), [{ mode: "local" }, { mode: "api", profileId: id("b") }]);
+});
+
 it("switches the conversation model from the header without touching the settings form", async () => {
   const requests = [];
-  const switched = { ...apiState, sourceId: id("a"), label: "线路 A",
+  const switched = { ...apiState, sourceId: "api:source-a-revision-1", label: "线路 A",
     api: { ...apiState.api, id: id("a"), model: "model-a" } };
   const { ui, byId } = harness(async (url, options) => {
     requests.push({ url, body: JSON.parse(options.body) });
@@ -341,7 +378,7 @@ it("switches the conversation model from the header without touching the setting
   ui.markDirty();
   await ui.activateModelProfile(id("a"));
   assert.deepEqual(requests, [{ url: "/api/model-source/activate", body: { mode: "api", profileId: id("a") } }]);
-  assert.equal(ui.getSnapshot().sourceId, id("a"));
+  assert.equal(ui.getSnapshot().sourceId, "api:source-a-revision-1");
   assert.equal(byId("modelBadgeLabel").textContent, "线路 A");
   // The unsaved draft survives the switch.
   assert.equal(byId("inputApiModelId").value, "unsaved-model");
@@ -471,4 +508,24 @@ it("marks the profile the user is editing as current in the settings picker", ()
   assert.deepEqual([options[1].textContent, options[2].textContent], ["线路 A", "线路 B（当前）"]);
   assert.equal(byId("selectApiProfile").value, id("b"));
   assert.equal(byId("btnDeleteApiProfile").hidden, false);
+});
+
+it("probes with the edited profile id, never the active source id or another saved key", async () => {
+  const requests = [];
+  const { ui, byId } = harness(async (url, options) => {
+    requests.push({ url, body: JSON.parse(options.body) });
+    return response(url.endsWith("/list") ? { supported: true, models: [] } : { ok: true });
+  });
+  ui.showModelSource(apiState);
+  ui.loadApiProfileDraft(id("a"));
+  await ui.fetchApiModels();
+  await ui.testApiModel();
+  assert.deepEqual(requests.map(item => item.body.profileId), [id("a"), id("a")]);
+  assert.equal(requests.every(item => !("apiKey" in item.body) && !("sourceId" in item.body)), true);
+  ui.loadApiProfileDraft("");
+  byId("inputApiBaseUrl").value = "https://a.test/v1";
+  byId("inputApiModelId").value = "model-a";
+  await ui.testApiModel();
+  assert.equal("profileId" in requests[2].body, false, "a new draft cannot borrow the matching saved profile's key");
+  assert.equal(byId("apiKeySaved").hidden, true);
 });

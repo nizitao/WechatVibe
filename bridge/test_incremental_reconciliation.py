@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -68,6 +69,7 @@ class ReconciliationTests(unittest.TestCase):
         self.backend = SimpleNamespace(source=self.source, analyzer=self.analyzer,
                                        jobs_lock=threading.RLock(), performance={},
                                        _assert_scope=lambda scope: None, _take_recent_priority=lambda key: None,
+                                       _scope_commit=lambda scope: nullcontext(),
                                        _legacy_profile_state=lambda *args: empty_state())
         self.engine = BatchEngine(self.backend)
         self.scope = ("synthetic-account", "friend", "synthetic-version")
@@ -229,6 +231,49 @@ class ReconciliationTests(unittest.TestCase):
         reopened = ResultStore(self.store.path)
         self.assertEqual(reopened.summary(*self.scope), summary)
         self.assertEqual(reopened.profile_state(*self.scope, "friend", lambda refs: {}), profile)
+
+    def test_pr31_original_tail_labels_rebuild_summary_and_profile_completely(self):
+        # PR #31 used happy/开心/.8 + a newer sad/难过/.6 whose label had
+        # disappeared. Restore the durable tail's sum as well as its weighted term.
+        happy = {**signal(), "emotion": [{"rawLabel": "happy", "label": "开心", "probability": .8}]}
+        sad = {**signal(), "emotion": [{"rawLabel": "sad", "label": "难过", "probability": .6}]}
+        with patch("result_store.keyword_counts", return_value={}):
+            self.store.save(*self.scope, message(5), sad)
+            self.store.profile_state(*self.scope, "friend", lambda refs: {})
+            with self.store.connect() as conn:
+                summary = self.store.summary(*self.scope)
+                summary["mood"] = {}
+                conn.execute("UPDATE summary_v1 SET mood_json=?", (json.dumps(summary["mood"]),))
+                row = conn.execute("SELECT state FROM profile_state_v1").fetchone()
+                state = json.loads(row[0])
+                state["mood"] = {}
+                conn.execute("UPDATE profile_state_v1 SET state=?", (json.dumps(state),))
+            self.store.save(*self.scope, message(3), happy)
+        summary = self.store.summary(*self.scope)
+        profile = self.store.profile_state(*self.scope, "friend", lambda refs: {})
+        self.assertEqual(summary["mood"]["sad"], {"label": "难过", "sum": .6, "weighted": .6})
+        self.assertEqual(profile["mood"], summary["mood"])
+        self.assertEqual((summary["moodCount"], profile["count"]), (2, 2))
+
+    def test_pr31_original_tail_labels_rebuild_batch_statistics_completely(self):
+        batches = BatchStateStore(self.store)
+        identity = (*self.scope, "friend")
+        batches.seed(*identity, empty_state())
+        def commit(number, raw, label, probability):
+            record = {"id": f"row-{number}", "position": [number, "message__message_0.db", number],
+                      "senderId": "friend", "side": "other", "target": True,
+                      "startOffset": 0, "endOffset": 1, "textLength": 1, "complete": True}
+            return batches.commit(*identity, batch_id=f"batch-{number}", consumed=[record],
+                                  cursor=None, char_offset=0, context=[], advance=False,
+                                  word_counts={record["id"]: {}}, result={**signal(), "emotion": [
+                                      {"rawLabel": raw, "label": label, "probability": probability}]})
+        saved = commit(5, "sad", "难过", .6)
+        saved["state"]["mood"] = {}
+        with self.store.connect() as conn:
+            conn.execute("UPDATE batch_progress_v1 SET state_json=?", (json.dumps(saved["state"]),))
+        recovered = commit(3, "happy", "开心", .8)["state"]
+        self.assertEqual(recovered["mood"]["sad"], {"label": "难过", "sum": .6, "weighted": .6})
+        self.assertEqual((recovered["moodCount"], recovered["count"]), (2, 2))
 
     def test_scoped_portrait_reset_preserves_messages_other_members_and_accounts(self):
         self.source.rows = [message(1)]

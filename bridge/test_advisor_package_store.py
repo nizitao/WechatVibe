@@ -229,8 +229,9 @@ class PackageStoreTests(unittest.TestCase):
         self.assertEqual(len(outcomes), 8)
         self.assertEqual(sum(result["created"] for result in outcomes), 1)
         self.assertEqual(len({result["agent"]["id"] for result in outcomes}), 1)
-        self.assertEqual(len(self.config.agents()), 4)
-        self.assertEqual(len(self.config.skills()), 4)
+        # 4 builtin assistants/skills plus the single imported pair.
+        self.assertEqual(len(self.config.agents()), 5)
+        self.assertEqual(len(self.config.skills()), 5)
         self.assertEqual(len(self.config._load()["importRequests"]), 1)
 
     def test_imported_association_cannot_point_to_a_plain_skill(self):
