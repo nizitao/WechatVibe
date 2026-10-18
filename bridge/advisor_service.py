@@ -755,6 +755,7 @@ class AdvisorService:
         try:
             database = run.database
             self._check_run(run)
+            self._step(run, "reading", "正在读取会话资料")
             self.context.prepare(run.account, run.user, run.cancel, run.source_scope, binding=run.binding)
             self._check_run(run)
             with self.condition:
@@ -766,6 +767,8 @@ class AdvisorService:
             if snapshot["sourceFingerprint"] != run.source_scope:
                 raise AdvisorError("context-error", "聊天数据来源已经变化")
             self._check_run(run)
+            # Counts only: the step tells the user the app is working without echoing chat text.
+            self._step(run, "preparing", "已读取 %d 条消息，正在整理上下文" % int(snapshot["readCount"]))
             with self.condition:
                 self._check_run(run, thorough=False)
                 database.freeze_run_context(run.id, snapshot["revision"])
@@ -823,6 +826,7 @@ class AdvisorService:
             self._check_run(run, fresh=True)
             if prompt_cost + len(run.message) + len(context_text) + margin > budget:
                 raise AdvisorError("context-too-long", "当前输入超出模型窗口，请缩短消息或更换模型")
+            self._step(run, "thinking", "正在调用模型")
             result = runtime.respond(config, request, lambda event: self._on_event(run, event),
                                      run.cancel)
             text = result.get("text") if isinstance(result, dict) else None
@@ -929,6 +933,14 @@ class AdvisorService:
             return summary
 
         return compact
+
+    def _step(self, run, state, text):
+        """Publish one coarse progress step. Labels only: no chat text, prompt or reasoning."""
+        try:
+            self._on_event(run, {"type": "status", "state": state, "text": text})
+        except AdvisorError:
+            # A stopped run must not turn a progress label into a failure.
+            pass
 
     def _on_event(self, run, event):
         try:

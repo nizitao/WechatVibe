@@ -12,6 +12,7 @@
   const controls = byId("timelineControls");
   let sessionNonce = null, scope = null, templates = [], catalogReady = false, engineState = "unknown";
   let threadId = null, renderedScope = "", currentRun = null, submitting = false, stopping = false, retryKind = "load", problem = "";
+  let runSteps = [], stepRunId = "";
   let lastSavedMessage = null;
   let templateSignature = "";
   let modelProfiles = [], assistantProfileId = "", modelSignature = "";
@@ -71,6 +72,41 @@
     const row = updateMessage({ id, role: "status", text: content, status: kind, event }); row.dataset.status = kind;
     if (id === "ui:run") { row.classList.add("advisor-current-status"); row.dataset.runId = currentRun?.id || ""; }
     if (timeline.children[timeline.children.length - 1] !== row) timeline.appendChild(row);
+    updateLayout();
+  }
+  function collectStep(steps, event) {
+    const api = window.AdvisorSteps;
+    return api && typeof api.collect === "function" ? api.collect(steps, event) : steps;
+  }
+  // A compact list of what the run is doing right now. It only shows coarse labels sent by the
+  // bridge and disappears as soon as the answer itself starts streaming.
+  function renderSteps() {
+    let host = document.getElementById("advisorSteps");
+    const running = !!currentRun && !terminal.has(currentRun.state);
+    if (!running || !runSteps.length || currentRun?.phase === "answering" || problem) {
+      if (host) host.remove();
+      return;
+    }
+    if (!host) {
+      host = document.createElement("div");
+      host.id = "advisorSteps"; host.className = "advisor-steps";
+      host.setAttribute("role", "status"); host.setAttribute("aria-live", "polite");
+      host.setAttribute("aria-label", "执行步骤");
+    }
+    host.textContent = "";
+    runSteps.forEach((step, index) => {
+      const row = document.createElement("div");
+      row.className = "advisor-step";
+      row.dataset.state = index === runSteps.length - 1 ? "active" : "done";
+      const mark = document.createElement("span");
+      mark.className = "advisor-step-mark"; mark.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "advisor-step-text"; label.textContent = step.text;
+      row.append(mark, label);
+      host.appendChild(row);
+    });
+    const anchor = messageNodes.get("ui:run");
+    timeline.insertBefore(host, anchor && anchor.parentNode === timeline ? anchor.nextSibling : null);
     updateLayout();
   }
   function updateLayout() {
@@ -149,6 +185,10 @@
   }
   function updateControls() {
     const running = !!currentRun && !terminal.has(currentRun.state);
+    // The host forwards one coarse status at a time (`run.phaseEvent`), so the list grows here
+    // by remembering each distinct label this run has shown.
+    if (currentRun?.id !== stepRunId) { stepRunId = currentRun?.id || ""; runSteps = []; }
+    if (running && currentRun?.phaseEvent) runSteps = collectStep(runSteps, currentRun.phaseEvent);
     const resetCommand = /^\s*\/reset\s*$/.test(input.value);
     send.disabled = submitting || (!resetCommand && (running || !catalogReady || engineState !== "available")) || !scope?.account || !scope?.user || !scope?.agentId;
     stop.hidden = !running || resetCommand; send.hidden = running && !resetCommand;
@@ -167,6 +207,7 @@
     const content = submitting || stopping || problem ? event.text : running ? phase.text || labels[phase.state] || "正在准备" :
       currentRun?.state === "stopped" ? "已停止" : currentRun?.state === "error" && !savedError ? currentRun.error || "生成失败" : "";
     statusRow("ui:run", content, event.state, event);
+    renderSteps();
   }
   function applyStream(payload) {
     if (payload.threadId !== threadId) return;
@@ -264,6 +305,7 @@
   function submitMessage() {
     const value = input.value;
     if (!value.trim() || value.length > 16000 || send.disabled) return;
+    runSteps = []; stepRunId = "";
     submitting = true; updateControls();
     sendToParent("ADVISOR_SEND", { text: value, agentId: scope.agentId });
   }

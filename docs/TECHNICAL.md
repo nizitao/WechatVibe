@@ -654,6 +654,8 @@ POST /api/model-guidance
 - **助手自己生成**：内置技能 `builtin-skill:guidance`（「潜台词与沟通建议」）+ 内置助手 `builtin:guidance`（「沟通参谋」），定义在 `bridge/advisor_contracts.py`；助手用自己的模型与托管资料产出解读与建议。因此 `POST /api/model-guidance` 目前**没有界面入口**。
 - **引用存量结果**：`result_store.api_guidance_latest(account, user)` 按会话取最新一条（不限模型来源；会话级 `subject` 优先于成员级；坏行直接删掉），`guidance_contracts.guidance_material(saved)` 把它渲染成一段参考文字，`advisor_service._guidance_material()` 附在托管资料末尾并从**同一 token 预算**里扣除。没有存量结果**且本轮选了该技能**时，改附一行 `GUIDANCE_MISSING_NOTE`，让助手直接分析当前会话。
 
+**助手进度提示**：`advisor_service._run_worker_bound()` 在「读取资料 → 整理上下文 → 调用模型」三处各发一条 `status` 事件（`state` 为 `reading` / `preparing` / `thinking`），文案只含阶段名和**已读取的消息条数**，不含聊天原文、提示词或模型推理。`chatui/advisor-steps.js` 负责校验、去重与截断（最多 4 条），`advisor-frame.js` 渲染到 `#advisorSteps`；收到首个 `text` 事件（`run.phase == "answering"`）后整块移除，避免和正文抢位置。
+
 ### 6.6 会话添加与「信息列表」
 
 ```

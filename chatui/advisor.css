@@ -114,3 +114,13 @@ body.theme-light .advisor-input,body.theme-light .advisor-textarea-form { backgr
 .advisor-send-btn:disabled { opacity: .4; cursor: default; }
 .advisor-frame-body.theme-light .advisor-send-btn { background: #252525; color: #fff; }
 @media (max-height: 420px) { .advisor-welcome { padding-bottom: 14px; } .advisor-welcome h1 { font-size: 20px; } .advisor-frame-top { flex-basis: 42px; } .advisor-textarea { height: 54px; } }
+
+/* Coarse run steps: what the assistant is doing before the answer starts streaming. */
+.advisor-steps { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 6px; }
+.advisor-step { display: flex; align-items: center; gap: 7px; color: var(--advisor-muted); font-size: 12px; line-height: 1.5; }
+.advisor-step-mark { flex: none; width: 12px; height: 12px; display: grid; place-items: center; box-sizing: border-box; }
+.advisor-step[data-state="done"] .advisor-step-mark::before { content: ""; width: 5px; height: 9px; border: solid currentColor; border-width: 0 1.5px 1.5px 0; transform: rotate(45deg) translate(-1px, -1px); opacity: .75; }
+.advisor-step[data-state="active"] { color: inherit; }
+.advisor-step[data-state="active"] .advisor-step-mark { border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: advisor-step-spin .8s linear infinite; opacity: .8; }
+@keyframes advisor-step-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .advisor-step[data-state="active"] .advisor-step-mark { animation: none; border-right-color: currentColor; } }
