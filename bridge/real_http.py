@@ -329,7 +329,8 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             model_endpoints = ("/api/model-source/list", "/api/model-source/test",
-                               "/api/model-source/activate", "/api/model-source/clear-key",
+                               "/api/model-source/activate", "/api/model-source/select",
+                               "/api/model-source/clear-key",
                                "/api/model-source/profiles", "/api/model-source/profiles/delete")
             if endpoint not in ("/api/analyze", "/api/predict-reply", "/api/messages/batch",
                                  "/api/runtime", "/api/local-model", "/api/model-insights",
@@ -368,6 +369,8 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                             return self.send(200, backend.model_source_test(request))
                         if endpoint == "/api/model-source/activate":
                             return self.send(200, backend.model_source_activate(request))
+                        if endpoint == "/api/model-source/select":
+                            return self.send(200, backend.model_source_select(request))
                         if endpoint == "/api/model-source/profiles":
                             return self.send(200, backend.model_source_profile_save(request))
                         if endpoint == "/api/model-source/profiles/delete":

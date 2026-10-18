@@ -1079,6 +1079,24 @@ class Backend:
             self._commit_api_source_locked(profile_id, config, previous_context)
             return self.model_source()
 
+    def model_source_select(self, request):
+        """Point the assistant at one saved profile; the analysis line keeps running as it is.
+
+        Unlike ``model_source_activate`` this never flips ``active_model_source_mode`` and never
+        touches the active API source, so local analysis stays local and API analysis keeps its
+        own profile.
+        """
+        if not isinstance(request, dict) or set(request) != {"profileId"}:
+            raise ValueError("invalid model source request")
+        profile_id = request["profileId"]
+        if not isinstance(profile_id, str) or not profile_id:
+            raise ValueError("invalid model source request")
+        with self.api_lock:
+            self.model_source_store.select_assistant_profile(profile_id)
+            source_id = self.model_source_store.profile_source_id(profile_id)
+            revision = self.model_source_revision
+        return {"profileId": profile_id, "sourceId": source_id, "revision": revision}
+
     def model_source_profile_save(self, request):
         """Create or update one profile without switching the conversation to it."""
         allowed = {"profileId", "name", "protocol", "baseUrl", "apiKey", "model", "contextTokens"}

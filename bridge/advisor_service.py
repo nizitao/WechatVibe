@@ -157,7 +157,10 @@ class AdvisorService:
 
     def _engine_selection(self):
         try:
-            selected = self.model_source_store.saved_selection()
+            # The assistant may run on its own saved profile while analysis keeps another one;
+            # without a dedicated choice the assistant follows the analysis selection.
+            choose = getattr(self.model_source_store, "assistant_selection", None)
+            selected = choose() if callable(choose) else self.model_source_store.saved_selection()
         except ModelSourceUnavailable:
             return None
         if not isinstance(selected, dict):
