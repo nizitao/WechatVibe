@@ -90,7 +90,7 @@ function host() {
 }
 function frame() {
   const env = environment(["agentName", "agentMenu", "btnAgentMenu", "advisorWelcome", "welcomeText", "advisorTimeline", "timelineControls",
-    "btnStopRun", "btnRetryRun", "advisorInput", "btnAdvisorSend"]);
+    "btnStopRun", "btnRetryRun", "advisorInput", "btnAdvisorSend", "btnModelMenu", "modelMenu", "modelName"]);
   env.window.parent = { postMessage: data => env.messages.push(json(data)) };
   vm.runInContext(frameSource, env.context);
   return env;
@@ -279,7 +279,7 @@ test("session changes and native open do not request or show context preparation
   const env = host(), advisor = ready(env), calls = [];
   advisor.fetchJson = async url => { calls.push(url); return { thread: thread(advisor.currentAccount, advisor.currentUser, advisor.activeAgentId) }; };
   advisor.onSessionChanged("account-a", "friend-b"); await advisor.togglePanel(true);
-  assert.ok(calls.every(url => url.startsWith("/api/advisor/thread?")));
+  assert.ok(calls.every(url => url.startsWith("/api/advisor/thread?") || url === "/api/model-source"));
   assert.ok(!hostSource.includes("/api/advisor/context"));
   assert.ok(!frameSource.includes("readCount"));
 });
@@ -451,6 +451,108 @@ test("simple agent popover switches enabled template without management tabs or 
   await frameEnv.elements.get("btnAgentMenu").dispatch("click"); assert.equal(menu.hidden, false);
   await menu.children[1].dispatch("click"); await Promise.resolve();
   assert.equal(advisor.activeAgentId, "empathy"); assert.equal(menu.hidden, true);
+});
+function modelProfiles() {
+  return [{ id: "a".repeat(32), name: "档案甲" }, { id: "b".repeat(32), name: "档案乙" }];
+}
+test("model menu renders host profiles, marks the assistant selection and ignores a repeat click", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.modelProfiles = modelProfiles(); advisor.assistantProfileId = "b".repeat(32);
+  const sent = [];
+  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
+  advisor.initFrameHandshake(); advisor.syncModelsToFrame();
+  const menu = frameEnv.elements.get("modelMenu");
+  assert.equal(menu.children.length, 2);
+  assert.equal(menu.children[0].classList.contains("active"), false);
+  assert.equal(menu.children[1].classList.contains("active"), true);
+  assert.equal(menu.children[1].attributes["aria-checked"], "true");
+  assert.equal(frameEnv.elements.get("modelName").textContent, "档案乙");
+  await frameEnv.elements.get("btnModelMenu").dispatch("click"); assert.equal(menu.hidden, false);
+  await menu.children[1].dispatch("click"); assert.equal(menu.hidden, true);
+  assert.equal(sent.filter(message => message.type === "ADVISOR_SELECT_MODEL").length, 0);
+  await frameEnv.elements.get("btnModelMenu").dispatch("click");
+  await menu.children[0].dispatch("click");
+  const selected = sent.filter(message => message.type === "ADVISOR_SELECT_MODEL");
+  assert.equal(selected.length, 1);
+  assert.deepEqual(selected[0].payload, { profileId: "a".repeat(32) });
+});
+test("profile switch posts select then refreshes the catalog and never touches the analysis mode", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.modelProfiles = modelProfiles(); advisor.assistantProfileId = "a".repeat(32);
+  advisor.initFrameHandshake(); advisor.syncModelsToFrame();
+  const calls = [];
+  advisor.fetchJson = async (url, options) => {
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    if (url === "/api/model-source/select") return { profileId: "b".repeat(32), sourceId: "source-b", revision: 4 };
+    return catalog();
+  };
+  hostEnv.nativeEmit(request(hostEnv, "ADVISOR_SELECT_MODEL", { profileId: "b".repeat(32) }).data);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls.map(call => call.url), ["/api/model-source/select", "/api/advisor/catalog"]);
+  assert.deepEqual(calls[0].body, { profileId: "b".repeat(32) });
+  assert.ok(!calls.some(call => call.url === "/api/model-source/activate"));
+  assert.equal(advisor.assistantProfileId, "b".repeat(32));
+  const menu = frameEnv.elements.get("modelMenu");
+  assert.equal(menu.children[0].classList.contains("active"), false);
+  assert.equal(menu.children[1].classList.contains("active"), true);
+  assert.equal(frameEnv.elements.get("modelName").textContent, "档案乙");
+});
+test("failed profile switch keeps the previous selection and reports a short error", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.modelProfiles = modelProfiles(); advisor.assistantProfileId = "a".repeat(32);
+  advisor.initFrameHandshake(); advisor.syncModelsToFrame();
+  const calls = [];
+  advisor.fetchJson = async url => {
+    calls.push(url);
+    if (url === "/api/model-source/select") return { error: "invalid model source request", status: 400 };
+    return catalog();
+  };
+  hostEnv.nativeEmit(request(hostEnv, "ADVISOR_SELECT_MODEL", { profileId: "b".repeat(32) }).data);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ["/api/model-source/select"]);
+  assert.ok(!calls.includes("/api/model-source/activate"));
+  assert.equal(advisor.assistantProfileId, "a".repeat(32));
+  const menu = frameEnv.elements.get("modelMenu");
+  assert.equal(menu.children[0].classList.contains("active"), true);
+  assert.equal(menu.children[1].classList.contains("active"), false);
+  assert.equal(frameEnv.elements.get("modelName").textContent, "档案甲");
+  assert.ok(hostEnv.messages.some(message => message.type === "ADVISOR_PROBLEM" &&
+    message.payload.error === "模型档案不存在或已更改" && message.payload.retryKind === "catalog"));
+});
+test("an unknown or malformed profile switch is rejected before any request", async () => {
+  const env = host(), advisor = ready(env);
+  advisor.modelProfiles = modelProfiles(); let calls = 0;
+  advisor.fetchJson = async () => { calls++; return {}; };
+  env.nativeEmit(request(env, "ADVISOR_SELECT_MODEL", { profileId: "f".repeat(32) }).data);
+  env.nativeEmit(request(env, "ADVISOR_SELECT_MODEL", { profileId: "a".repeat(32), agentId: "advisor" }).data);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 0);
+  assert.equal(advisor.assistantProfileId, "");
+});
+test("the model menu follows the analysis selection until a profile is pinned", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.fetchJson = async () => ({ mode: "api", api: { id: "a".repeat(32) }, profiles: modelProfiles(), assistantProfileId: null });
+  advisor.initFrameHandshake();
+  assert.equal(await advisor.loadModelProfiles(), true);
+  assert.equal(advisor.assistantProfileId, "");
+  const menu = frameEnv.elements.get("modelMenu");
+  assert.equal(menu.children.length, 2);
+  assert.ok(menu.children.every(child => !child.classList.contains("active")));
+  assert.equal(frameEnv.elements.get("modelName").textContent, "跟随分析");
+});
+test("an empty profile list disables the model menu without any provider request", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  const calls = [];
+  advisor.fetchJson = async url => { calls.push(url); return { mode: "local", api: null, profiles: [], assistantProfileId: null }; };
+  advisor.initFrameHandshake();
+  assert.equal(await advisor.loadModelProfiles(), true);
+  assert.deepEqual(calls, ["/api/model-source"]);
+  assert.equal(advisor.modelProfiles.length, 0);
+  assert.equal(frameEnv.elements.get("btnModelMenu").disabled, true);
+  assert.equal(frameEnv.elements.get("modelName").textContent, "模型");
+  assert.equal(frameEnv.elements.get("modelMenu").children.length, 0);
 });
 test("communication advice replaces the emoji entry while the adviser keeps its own command", () => {
   const appSource = readFileSync(path.join(root, "app.js"), "utf8");

@@ -119,7 +119,18 @@
 - 从聊天标题栏的模型徽标点「管理配置」，会直接落在「模型配置」栏（不然会聚焦到一个隐藏面板里的输入框）。
 - 只是搬位置：行为、接口、本地/API 按 `hidden` 的切换规则都没变。
 
-### 九、与上游的已知分歧
+### 九、助手窗口「切换模型档案」（工作区未提交）
+
+聊天助手窗口的标题栏（模板名所在的那一行）多了一个「模型」按钮：点开是设置里已保存的全部 API 配置档案，正在使用的那项有选中态且不可重复点，点另一项就只把**助手**切到那条档案，分析模式完全不受影响。
+
+- **只切助手，不动分析**：后端 `POST /api/model-source/select`（上一轮已加）只写配置文档的 `assistantProfileId`，`selectedMode` 与活动 `sourceId` 原样不动 —— 本地分析继续本地跑，API 分析继续用它自己那条档案。切换成功后宿主会重读 `/api/advisor/catalog`，因为军师引擎的「可用 / 未安装」状态跟着助手档案变。**不会**调用 `/api/model-source/activate`。
+- **档案列表来自本地配置**：宿主读 `GET /api/model-source`（该接口本就返回 `profiles` 与 `assistantProfileId`，后端零改动）下发给 iframe 渲染，iframe 自己不发任何网络请求；没有助手专属档案时按钮显示「跟随分析」。
+- **不产生 provider 调用**：列档案与切档案都不连接模型服务，本地模式下渲染菜单同样不触发 model-connectors 请求；未知或已删除的档案返回 400，界面给一句简短提示，菜单保持原来的选中项。
+- 隐私口径不变：这里切换的是「助手用哪条已保存配置」，不改变任何消息文本的去向。
+
+回归：`tests/advisor-ui.test.cjs`（菜单渲染与选中态、点击只发一次且 payload 恰为 `{profileId}`、成功后宿主请求序列固定为 `select → catalog`、失败保持原选中并提示、未知 id 在宿主侧即被拒、空档案时按钮禁用）；后端契约仍由 `bridge/test_model_source_select.py`（7 例）钉住。
+
+### 十、与上游的已知分歧
 
 保留自用判定逻辑会带来两处可预期的不一致，下次升级上游时需要留意：
 
@@ -149,7 +160,7 @@ v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github
 | 分支 | 内容 |
 | --- | --- |
 | `main` | 跟随上游 v1.3.0 + 「自用改动」 |
-| `perf/optimize-tokenizer` | 本轮分支：手选消息 / 模型来源多配置 / MBTI 门槛修 / 链接不进分析 / 右键单条重算 + 分词优化，已合并上游 1.3.0（[PR #33](https://github.com/tswawa/WechatVibe/pull/33) 开放） |
+| `perf/optimize-tokenizer` | 本轮分支：手选消息 / 模型来源多配置 / 助手切换模型档案 / MBTI 门槛修 / 链接不进分析 / 右键单条重算 + 分词优化，已合并上游 1.3.0（[PR #33](https://github.com/tswawa/WechatVibe/pull/33) 开放） |
 | `feat/selfuse-on-1.2.4` | 上一轮升级分支（自用改动搬到 1.2.4） |
 | `feat/selfuse-on-1.2.3` | 上一轮升级分支（已并入 `main`，历史） |
 | `feat/selfuse-on-1.2.2` | 更早的升级分支（历史） |

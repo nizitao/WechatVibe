@@ -350,7 +350,7 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | `/api/runtime` | — | `{requestedProvider, modelProvider, status}` |
 | `/api/local-model` | — | `{state, source, path, labels?}` |
 | `/api/data-root` | — | `{state: unset\|ready\|missing\|invalid, path, exists, accounts}` |
-| `/api/model-source` | — | `{mode, api:{id,protocol,baseUrl,model,contextTokens,hasKey}\|null, profiles:[{id,name,label,protocol,baseUrl,model,contextTokens,hasKey}], label, sourceId, status}` |
+| `/api/model-source` | — | `{mode, api:{id,protocol,baseUrl,model,contextTokens,hasKey}\|null, profiles:[{id,name,label,protocol,baseUrl,model,contextTokens,hasKey}], assistantProfileId, label, sourceId, status}` |
 | `/api/model-insights` | `user`, `ids` | `{job, results, acceptedIds, insightErrors, suspended?}` |
 | `/api/model-portrait` | `user`,`member?` | `{portrait, nativeProfile, job, available, inventoryReady, progress, needsRebuild, rebuilding, suspended?}` |
 | `/api/model-guidance` | `user`,`member?` | `{guidance, job, suspended?}` |
@@ -391,6 +391,7 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | `/api/model-source/list` \| `test` \| `activate` \| `clear-key` | `{protocol,baseUrl,apiKey,model?,contextTokens?}` | 模型发现/探测/启用/清 key |
 | `/api/model-source/profiles` | `{profileId?,name?,protocol,baseUrl,apiKey?,model,contextTokens}` | 新建或更新一条 API 配置（**不切换**当前对话）；`activate` 额外接受 `name`/`profileId` 以便「保存并启用」同时落盘 |
 | `/api/model-source/profiles/delete` | `{profileId}` | 删除一条 API 配置；删掉正在使用的那条会切回本地模型 |
+| `/api/model-source/select` | `{profileId}` | 只把**助手**指到一条已保存配置：仅写配置文档的 `assistantProfileId`，不动 `selectedMode`/active `sourceId`，因此分析线（本地或已启用的 API 来源）原样运行；未知 id 返回 400 且不写盘；响应 `{profileId,sourceId,revision}` |
 
 `activate` 的三种入参互斥：`{mode:"local"}`、`{mode:"api",profileId}`（切换到已保存配置，**跳过探测**，因此是瞬时的）、`{mode:"api",...连接字段}`（必要时先探测再落盘）。带 `profileId` 时只允许 `mode`+`profileId` 两个键。
 

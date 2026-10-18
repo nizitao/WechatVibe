@@ -6,6 +6,7 @@
   const terminal = new Set(["done", "error", "stopped", "cancelled"]);
   const byId = id => document.getElementById(id);
   const agentName = byId("agentName"), agentMenu = byId("agentMenu"), menuButton = byId("btnAgentMenu");
+  const modelName = byId("modelName"), modelMenu = byId("modelMenu"), modelButton = byId("btnModelMenu");
   const timeline = byId("advisorTimeline"), welcome = byId("advisorWelcome"), welcomeText = byId("welcomeText");
   const input = byId("advisorInput"), send = byId("btnAdvisorSend"), stop = byId("btnStopRun"), retry = byId("btnRetryRun");
   const controls = byId("timelineControls");
@@ -13,6 +14,7 @@
   let threadId = null, renderedScope = "", currentRun = null, submitting = false, stopping = false, retryKind = "load", problem = "";
   let lastSavedMessage = null;
   let templateSignature = "";
+  let modelProfiles = [], assistantProfileId = "", modelSignature = "";
   const messageNodes = new Map();
   function transientMessage(message) {
     if (message.role !== "status") return false;
@@ -98,6 +100,27 @@
     }
     agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false");
     updateControls();
+  }
+  function renderModels() {
+    const signature = JSON.stringify([modelProfiles.map(profile => [profile.id, profile.name]), assistantProfileId]);
+    if (signature === modelSignature) return;
+    modelSignature = signature;
+    const selected = modelProfiles.find(profile => profile.id === assistantProfileId);
+    modelName.textContent = selected?.name || (modelProfiles.length ? "跟随分析" : "模型");
+    modelButton.disabled = modelProfiles.length === 0;
+    modelMenu.replaceChildren();
+    for (const profile of modelProfiles) {
+      const button = document.createElement("button"); button.type = "button";
+      button.className = "advisor-agent-choice" + (profile.id === assistantProfileId ? " active" : "");
+      button.setAttribute("role", "menuitemradio"); button.setAttribute("aria-checked", String(profile.id === assistantProfileId));
+      button.textContent = profile.name; button.title = profile.name;
+      button.addEventListener("click", () => {
+        modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
+        if (profile.id !== assistantProfileId) sendToParent("ADVISOR_SELECT_MODEL", { profileId: profile.id });
+      });
+      modelMenu.appendChild(button);
+    }
+    modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
   }
   function renderThread(thread, run, draft) {
     const nextScope = JSON.stringify([scope.account, scope.user, scope.agentId, scope.generation]);
@@ -190,7 +213,7 @@
       ADVISOR_SET_THREAD: ["thread", "run", "agentId", "draft"],
       ADVISOR_STREAM_UPDATE: ["threadId", "run", "messages"],
       ADVISOR_PROBLEM: ["error", "retryKind"], ADVISOR_SUBMIT_STATE: ["pending"], ADVISOR_STOP_STATE: ["pending"],
-      ADVISOR_COPY_RESULT: ["copied"]
+      ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId"]
     };
     if (!permitted[type] || Object.keys(payload).some(key => !permitted[type].includes(key))) return false;
     if (type === "ADVISOR_INIT" || type === "ADVISOR_SET_TEMPLATES") {
@@ -211,16 +234,30 @@
     if (type === "ADVISOR_PROBLEM" && (!text(payload.error, 20000) || !["send", "poll", "load", "catalog"].includes(payload.retryKind))) return false;
     if (["ADVISOR_SUBMIT_STATE", "ADVISOR_STOP_STATE"].includes(type) && typeof payload.pending !== "boolean") return false;
     if (type === "ADVISOR_COPY_RESULT" && typeof payload.copied !== "boolean") return false;
+    if (type === "ADVISOR_SET_MODELS") {
+      if (!Array.isArray(payload.profiles) || payload.profiles.length > 200 ||
+        !payload.profiles.every(item => object(item) && text(item.id, 240) && text(item.name, 60)) ||
+        !(payload.assistantProfileId === null || text(payload.assistantProfileId, 240))) return false;
+    }
     return true;
   }
   menuButton.addEventListener("click", () => {
     agentMenu.hidden = !agentMenu.hidden; menuButton.setAttribute("aria-expanded", String(!agentMenu.hidden));
   });
+  modelButton.addEventListener("click", () => {
+    modelMenu.hidden = !modelMenu.hidden; modelButton.setAttribute("aria-expanded", String(!modelMenu.hidden));
+  });
   document.addEventListener("click", event => {
-    if (!event.target.closest?.(".advisor-agent-control")) { agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false"); }
+    if (!event.target.closest?.(".advisor-agent-control, .advisor-model-control")) {
+      agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false");
+      modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
+    }
   });
   document.addEventListener("keydown", event => {
-    if (event.key === "Escape") { agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false"); }
+    if (event.key === "Escape") {
+      agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false");
+      modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
+    }
   });
   stop.addEventListener("click", () => sendToParent("ADVISOR_STOP"));
   retry.addEventListener("click", () => sendToParent("ADVISOR_RETRY", { retryKind: currentRun?.state === "error" ? "send" : retryKind }));
@@ -259,6 +296,8 @@
     const payload = data.payload;
     if (data.type === "ADVISOR_SET_TEMPLATES") {
       templates = payload.enabledTemplates; catalogReady = payload.catalogReady; engineState = payload.engineState; renderTemplates();
+    } else if (data.type === "ADVISOR_SET_MODELS") {
+      modelProfiles = payload.profiles; assistantProfileId = payload.assistantProfileId || ""; renderModels();
     } else if (data.type === "ADVISOR_SET_THREAD") {
       renderTemplates(); renderThread(payload.thread, payload.run, payload.draft);
     } else if (data.type === "ADVISOR_STREAM_UPDATE") applyStream(payload);
@@ -272,5 +311,5 @@
       submitting = payload.pending; if (submitting) { problem = ""; statusRow("ui:problem", ""); } updateControls();
     } else if (data.type === "ADVISOR_STOP_STATE") { stopping = payload.pending; updateControls(); }
   });
-  updateControls(); updateLayout();
+  renderModels(); updateControls(); updateLayout();
 })();
