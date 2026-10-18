@@ -794,9 +794,25 @@ def run_command(args, config):
         shell_pid = os.environ.get("WECHATVIBE_SHELL_PID")
         if shell_pid:
             import psutil
-            if int(shell_pid) != psutil.Process().ppid():
+            try:
+                expected = int(shell_pid)
+            except ValueError:
+                raise LauncherError("Desktop startup identity is invalid") from None
+            # The shell must be an ancestor, not necessarily the direct parent: a virtual
+            # environment launcher (and some py launchers) run the interpreter one level
+            # deeper, so comparing only with ppid() rejected legitimate desktop starts.
+            ancestor = psutil.Process()
+            related = False
+            for _ in range(4):
+                ancestor = ancestor.parent()
+                if ancestor is None:
+                    break
+                if ancestor.pid == expected:
+                    related = True
+                    break
+            if not related:
                 raise LauncherError("Desktop startup identity is invalid")
-            InstallationGate(config.root).register(role="shell", pid=int(shell_pid))
+            InstallationGate(config.root).register(role="shell", pid=expected)
         return _run_admitted(args, config)
     finally:
         admission.close()
