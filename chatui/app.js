@@ -3726,6 +3726,7 @@ function clearApiPortraitView() {
   byId("apiPortraitStatus").hidden = false;
   byId("btnRetryApiPortrait").hidden = true;
   text("apiPortraitStatus", "正在读取会话消息");
+byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(true));
 }
 function cancelApiPortraitPoll() {
   ++portraitState.apiPortraitRequest;
@@ -3833,6 +3834,7 @@ function renderApiPortrait(data) {
   }
   byId("apiPortraitStatus").hidden = false;
   text("apiPortraitStatus", state);
+byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(running || job.status === "queued" || (!ready && data.inventoryStatus !== "error")));
   // Like local Laya, entering/switching back to a conversation automatically continues
   // the saved incremental analysis. The backend resumes from the persisted cursor and
   // sends only new/unprocessed text, and dedupes an in-flight job. A terminal error stops
@@ -3900,6 +3902,7 @@ async function loadApiPortrait(member = "") {
   } catch (error) {
     if (token === portraitState.apiPortraitRequest && error?.name !== "AbortError") {
       text("apiPortraitStatus", "画像读取失败，请稍后重试");
+byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(false));
       portraitState.apiPortraitReadFailures++;
       if (portraitState.apiPortraitReadFailures <= 3)
         portraitState.apiPortraitPollTimer = setTimeout(() => { void loadApiPortrait(member); },
@@ -3918,6 +3921,7 @@ async function startApiPortrait(autoKey, force = false, refreshAxes = false) {
       portraitState.apiPortraitSubmitErrors.has(autoKey) && !force) return;
   if (!apiPortraitContextReady()) {
     text("apiPortraitStatus", API_PORTRAIT_CONTEXT_HINT);
+byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(false));
     byId("btnRetryApiPortrait").disabled = true;
     return;
   }
@@ -3926,6 +3930,7 @@ async function startApiPortrait(autoKey, force = false, refreshAxes = false) {
   byId("btnRetryApiPortrait").hidden = true;
   setStripStatus("API 分析中");
   text("apiPortraitStatus", refreshAxes ? "正在根据已保存画像重新评估 MBTI" : "正在提交 API 画像");
+byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(true));
   try {
     const body = { account, user, ...(member ? { member } : {}),
       ...(refreshAxes ? { refreshAxes: true } : {}) };
@@ -3942,6 +3947,7 @@ async function startApiPortrait(autoKey, force = false, refreshAxes = false) {
     rememberApiPortraitSubmitError(autoKey, reason);
     setStripStatus("分析失败，请重试");
     text("apiPortraitStatus", "API 画像提交失败（" + reason + "）");
+byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(false));
     byId("btnRetryApiPortrait").hidden = false;
   } finally {
     portraitState.apiPortraitBusy = false;
@@ -4176,6 +4182,7 @@ function renderGuidance(data) {
   else if (portraitState.guidanceRunning) state = "正在生成回复…";
   else if (job.status === "insufficient") state = "暂无可用于回复的聊天文本";
   text("guidanceStatus", state);
+byId("guidanceStatus")?.classList?.toggle?.("ai-busy", !!(portraitState.guidanceRunning || !!portraitState.guidanceBusy));
   syncGuidanceAction();
 }
 function syncGuidanceAction() {
@@ -4195,6 +4202,7 @@ function syncGuidanceAction() {
   button.setAttribute("aria-label", button.title);
   if (apiMode && chatState.view === "chat" && chatState.currentUser && chatState.currentAccount && !assistant.agentId)
     text("guidanceStatus", button.title);
+byId("guidanceStatus")?.classList?.toggle?.("ai-busy", !!(false));
   for (let index = 0; index < 3; index++)
     byId("replyChoice" + index).disabled = !available || !portraitState.guidanceRendered?.replies[index];
 }
@@ -5362,9 +5370,11 @@ function cancelApiInsightWork() {
 function renderApiInsightStatus() {
   const node = byId("analysisStatus");
   const retry = byId("btnRetryAnalysis");
+  let statusBusy = false;
   retry.textContent = "分析失败 · 重试";
   if (!settingsState.modelSourceResolved || settingsState.modelSourceSnapshot.mode !== "api" || !settingsState.settings.intent || !chatState.currentUser) {
     if (labelState.apiInsightStatusRendered) node.textContent = "";
+    node.classList?.remove?.("ai-busy");
     labelState.apiInsightStatusRendered = false;
     retry.hidden = !(portraitState.incrementalFailed || usingLocalFine() && labelState.recentFailed);
     if (usingLocalFine() && settingsState.localModelResolved && !settingsState.localModelReady) {
@@ -5397,6 +5407,7 @@ function renderApiInsightStatus() {
         `首段 ${(firstBodyMs / 1000).toFixed(1)} 秒 · ` : "";
       node.textContent = first + (total > 0 ? `分析中 ${Math.min(processed, total)}/${total} · ${elapsed} 秒` : `分析中 · ${elapsed} 秒`);
     }
+    statusBusy = true;
     setIntentActionState(labelState.apiInsightWork?.postPending ? "submitting" : entry?.job?.status || "queued");
   } else if (entry?.job?.status === "done") {
     // Real wall-clock total from the backend job, never a poll count.
@@ -5411,6 +5422,7 @@ function renderApiInsightStatus() {
     node.textContent = "";
     setIntentActionState("idle");
   }
+  node.classList?.toggle?.("ai-busy", statusBusy);
   if (!entry?.error) retry.hidden = !portraitState.incrementalFailed;
 }
 function renderApiInsightResult(result, text = "") {
