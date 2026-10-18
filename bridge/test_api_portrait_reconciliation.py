@@ -11,7 +11,6 @@ from api_portrait_ledger import ApiPortraitLedger, scope as ledger_scope
 from api_portrait_statistics import valid_statistics
 from portrait_contracts import api_portrait_scope
 from backend_contracts import empty_api_portrait
-from payload_crypto import default_cipher
 import test_api_insights as api_fixtures
 
 
@@ -170,16 +169,16 @@ class ApiPortraitReconciliationTests(unittest.TestCase):
         ledger, identity = self.ledger()
         old = empty_api_portrait()
         old["summary"] = "previous synthetic portrait"
-        with self.repository().connect() as connection:
+        store = self.repository()
+        with store.connect() as connection:
             ledger.clear(connection, identity)
             row = connection.execute("SELECT resume_json FROM api_portrait_v1").fetchone()
-            # This fork writes `portrait_json` / `resume_json` through `default_cipher`, so the
-            # legacy checkpoint has to be read and rewritten the same way. A plaintext row from
-            # an upstream build still reads back unchanged (`unprotect` tolerates it).
-            resume = default_cipher().loads(row[0])
+            # The row must be written with the same cipher the store reads it with; the store
+            # may hold a dpapi-backed cipher, or plain JSON in an isolated synthetic repository.
+            resume = store.cipher.loads(row[0])
             resume.pop("portraitLedgerVersion", None)
             connection.execute("UPDATE api_portrait_v1 SET portrait_json=?,resume_json=?",
-                               (default_cipher().dumps(old), default_cipher().dumps(resume)))
+                               (store.cipher.dumps(old), store.cipher.dumps(resume)))
         self.assertEqual(self.backend.model_portrait("friend")["portrait"], old)
         previous_count = self.backend.model_portrait("friend")["nativeProfile"]["portraitCount"]
         before = len(self.analyzer.portrait_calls)

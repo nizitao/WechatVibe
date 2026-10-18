@@ -1410,6 +1410,10 @@ class Backend:
         except Exception:
             with self.api_lock:
                 job.update(status="error", error="model-source-changed")
+        finally:
+            # One finish per begin: this wrapper also covers a scope failure that never
+            # reaches the bound worker, so the bound worker must not finish as well.
+            self.api_tasks.finish()
             # `_run_guidance_bound` owns the inflight counter in its own finally; finishing
             # here as well drove it negative, which `wait_for_idle` can never satisfy.
 
@@ -1488,8 +1492,6 @@ class Backend:
                     "model-source-changed", "invalid-guidance", "guidance-version-invalid",
                     "invalid-request", "agent-changed", "agent-disabled", "agent-unknown", "skill-unknown"} else "model-analysis-failed"
                 job["status"] = "error"
-        finally:
-            self.api_tasks.finish()
 
     def _guidance_self_summary(self, store, job_key):
         """Self advice uses SELF turns; the stored conversation portrait describes OTHER."""
@@ -1653,7 +1655,7 @@ class Backend:
                     key = (*job_key[:3], message["id"])
                     if self.api_insight_writers.get(key) == job["id"]:
                         del self.api_insight_writers[key]
-            # `_run_model_insights_bound` already finishes the inflight count in its finally.
+            self.api_tasks.finish()
 
     def _assert_api_insight_job(self, job_key, job, scope, store):
         self._assert_api_job(self.api_jobs, job_key, job, scope, store)
@@ -1822,8 +1824,6 @@ class Backend:
                 job["error"] = code if code in MODEL_CONNECTOR_ERRORS or code in {
                     "invalid-insights", "model-source-changed"} else "model-analysis-failed"
                 job["status"] = "error"
-        finally:
-            self.api_tasks.finish()
     def _api_portrait_history(self, user, subject, highwater, scope, after=None,
                               piece_limit_bytes=None, cancel_check=None, start_after=None,
                               skip_first_pieces=0, partial_sort=None, known_ids=None):
