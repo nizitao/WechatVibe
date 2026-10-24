@@ -91,7 +91,7 @@ function host() {
 function frame() {
   const env = environment(["agentName", "agentMenu", "btnAgentMenu", "advisorWelcome", "welcomeText", "advisorTimeline", "timelineControls",
     "btnStopRun", "btnRetryRun", "advisorInput", "btnAdvisorSend", "btnModelMenu", "modelMenu", "modelName", "advisorComposerNote",
-    "btnNewThread", "newThreadLabel", "btnMemory", "memoryLabel"]);
+    "btnNewThread", "newThreadLabel", "btnHistory", "historyMenu"]);
   env.window.parent = { postMessage: data => env.messages.push(json(data)) };
   vm.runInContext(frameSource, env.context);
   return env;
@@ -280,7 +280,7 @@ test("session changes and native open do not request or show context preparation
   const env = host(), advisor = ready(env), calls = [];
   advisor.fetchJson = async url => { calls.push(url); return { thread: thread(advisor.currentAccount, advisor.currentUser, advisor.activeAgentId) }; };
   advisor.onSessionChanged("account-a", "friend-b"); await advisor.togglePanel(true);
-  assert.ok(calls.every(url => url.startsWith("/api/advisor/thread?") || url === "/api/model-source"));
+  assert.ok(calls.every(url => (url.startsWith("/api/advisor/thread?") || url.startsWith("/api/advisor/threads")) || url === "/api/model-source"));
   assert.ok(!hostSource.includes("/api/advisor/context"));
   assert.ok(!frameSource.includes("readCount"));
 });
@@ -417,6 +417,7 @@ test("reset command only resets agent thread, bypasses model engine and preserve
   advisor.catalog.engine.state = "missing"; advisor.currentRunId = "old-run";
   advisor.setDraft("account-a", "friend-a", "advisor", "没有提交的普通草稿");
   advisor.fetchJson = async (url, options) => {
+    if (String(url).startsWith("/api/advisor/threads")) return { threads: [] };
     calls.push({ url, body: JSON.parse(options.body) }); return { thread: { ...thread(), id: "fresh-thread" }, run: null };
   };
   await advisor.startRun("  /reset  ");
@@ -642,50 +643,6 @@ test("the composer asks for a conversation first and clears once everything is r
   assert.equal(send.disabled, false);
   assert.equal(send.title, "发送");
 });
-test("the memory chip is on by default and travels with the message", async () => {
-  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
-  advisor.initFrameHandshake();
-  const sent = [];
-  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
-  const chip = frameEnv.elements.get("btnMemory"), label = frameEnv.elements.get("memoryLabel");
-  assert.equal(label.textContent, "记忆");
-  assert.equal(chip.dataset.state, "on");
-  assert.equal(chip.attributes["aria-pressed"], "true");
-  frameEnv.elements.get("advisorInput").value = "在吗";
-  await frameEnv.elements.get("btnAdvisorSend").dispatch("click");
-  assert.deepEqual(sent.filter(message => message.type === "ADVISOR_SEND").at(-1).payload,
-    { text: "在吗", agentId: "advisor", memory: true });
-  advisor.postToFrame("ADVISOR_SUBMIT_STATE", { pending: false });
-  await chip.dispatch("click");
-  assert.equal(label.textContent, "记忆 关");
-  assert.equal(chip.attributes["aria-pressed"], "false");
-  frameEnv.elements.get("advisorInput").value = "还在吗";
-  await frameEnv.elements.get("btnAdvisorSend").dispatch("click");
-  assert.deepEqual(sent.filter(message => message.type === "ADVISOR_SEND").at(-1).payload,
-    { text: "还在吗", agentId: "advisor", memory: false });
-});
-test("the host sends the memory flag to the run endpoint", async () => {
-  const { hostEnv } = pair(), advisor = ready(hostEnv);
-  advisor.initFrameHandshake();
-  const calls = [];
-  advisor.fetchJson = async (url, options) => {
-    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
-    return catalog();
-  };
-  hostEnv.nativeEmit(request(hostEnv, "ADVISOR_SEND", { text: "在吗", agentId: "advisor", memory: false }).data);
-  await new Promise(resolve => setImmediate(resolve));
-  await new Promise(resolve => setImmediate(resolve));
-  const run = calls.find(call => call.url === "/api/advisor/run");
-  assert.equal(run.body.memory, false);
-});
-test("a non-boolean memory flag is rejected before any request", async () => {
-  const env = host(), advisor = ready(env);
-  let calls = 0;
-  advisor.fetchJson = async () => { calls++; return catalog(); };
-  env.nativeEmit(request(env, "ADVISOR_SEND", { text: "在吗", agentId: "advisor", memory: "yes" }).data);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(calls, 0);
-});
 test("new conversation asks for a second click before replacing an existing thread", async () => {
   const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
   const sent = [];
@@ -723,7 +680,8 @@ test("the host turns the new-conversation button into a fresh thread request", a
   hostEnv.nativeEmit(request(hostEnv, "ADVISOR_NEW_THREAD").data);
   await new Promise(resolve => setImmediate(resolve));
   await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(calls, ["/api/advisor/new-thread"]);
+  assert.deepEqual(calls, ["/api/advisor/new-thread",
+    "/api/advisor/threads?account=account-a&user=friend-a&agentId=advisor"]);
 });
 test("closing model settings refreshes the picker while the panel stays open", async () => {
   const env = host(), advisor = ready(env);
@@ -745,6 +703,7 @@ test("choosing follow analysis drops the assistant pin and reloads the catalog",
   advisor.initFrameHandshake(); advisor.syncModelsToFrame();
   const calls = [];
   advisor.fetchJson = async (url, options) => {
+    if (String(url).startsWith("/api/advisor/threads")) return { threads: [] };
     calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
     if (url === "/api/model-source/select") return { profileId: null, sourceId: "source-analysis", revision: 5 };
     return catalog();

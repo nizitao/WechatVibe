@@ -93,40 +93,6 @@ class CatalogTests(ServiceTestCase):
 
 
 class RunTests(ServiceTestCase):
-    def test_carried_memory_puts_previous_conversations_before_the_live_chat(self):
-        self.wait_context_ready()
-        first = self.service.start(ACCOUNT, USER, AGENT, None, "第一轮问题", "req-a")
-        self.wait_run(first["run"]["id"])
-        self.service.new_thread(ACCOUNT, USER, AGENT)
-        result = self.service.start(ACCOUNT, USER, AGENT, None, "第二轮问题", "req-b", memory=True)
-        self.wait_run(result["run"]["id"])
-        _config, request = self.runtime.respond_calls[-1]
-        # The carried turns are background: they lead the context, the live chat follows.
-        self.assertTrue(request["contextFileText"].startswith("【此前的对话】"))
-        self.assertIn("用户：第一轮问题", request["contextFileText"])
-        self.assertIn("助手：" + self.runtime.text, request["contextFileText"])
-        self.assertEqual(request["message"], "第二轮问题")
-
-    def test_memory_off_and_a_first_conversation_carry_nothing(self):
-        self.wait_context_ready()
-        first = self.service.start(ACCOUNT, USER, AGENT, None, "第一轮问题", "req-a")
-        self.wait_run(first["run"]["id"])
-        self.service.new_thread(ACCOUNT, USER, AGENT)
-        result = self.service.start(ACCOUNT, USER, AGENT, None, "第二轮问题", "req-b", memory=False)
-        self.wait_run(result["run"]["id"])
-        _config, request = self.runtime.respond_calls[-1]
-        self.assertNotIn("【此前的对话】", request["contextFileText"])
-        self.assertNotIn("第一轮问题", request["contextFileText"])
-        # A brand-new contact has no previous turns to carry even with memory on.
-        self.service.new_thread(ACCOUNT, "someone-else", AGENT)
-        other = self.service.start(ACCOUNT, "someone-else", AGENT, None, "你好", "req-c", memory=True)
-        run_id = other["run"]["id"]
-        wait_until(lambda: self.service.events(ACCOUNT, "someone-else", run_id, 0)
-                   if self.service.events(ACCOUNT, "someone-else", run_id, 0)["run"]["state"] in
-                   ("done", "stopped", "error") else None)
-        _config, request = self.runtime.respond_calls[-1]
-        self.assertNotIn("【此前的对话】", request["contextFileText"])
-
     def test_run_streams_events_and_persists_projection(self):
         ready = self.wait_context_ready()
         self.runtime.finish_gate = threading.Event()

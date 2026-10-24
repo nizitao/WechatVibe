@@ -153,3 +153,26 @@ body.theme-light .advisor-input,body.theme-light .advisor-textarea-form { backgr
 .advisor-step[data-state="active"] .advisor-step-mark { border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: advisor-step-spin .8s linear infinite; opacity: .8; }
 @keyframes advisor-step-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .advisor-step[data-state="active"] .advisor-step-mark { animation: none; border-right-color: currentColor; } }
+
+/* History sessions: a compact pill next to 「新建」 with a scrollable menu above the input. */
+.advisor-history-control { position: relative; min-width: 0; flex: none; }
+.advisor-history-btn { display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 10px;
+  border: 1px solid var(--advisor-border); border-radius: 13px; background: transparent; color: inherit;
+  font: inherit; font-size: 12px; line-height: 1; cursor: pointer; }
+.advisor-history-btn:hover { background: var(--advisor-surface); }
+.advisor-history-btn svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; }
+.advisor-history-menu { position: absolute; bottom: calc(100% + 8px); left: 0; z-index: 12; width: 280px;
+  max-height: 320px; overflow-y: auto; padding: 5px; border: 1px solid var(--advisor-border); border-radius: 10px;
+  background: var(--advisor-surface); box-shadow: 0 8px 24px rgba(0,0,0,.18); }
+.advisor-history-menu[hidden] { display: none; }
+.advisor-history-row { display: block; width: 100%; padding: 7px 9px; border: 1px solid transparent;
+  border-radius: 7px; background: none; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.advisor-history-row:hover { background: rgba(127,127,127,.12); }
+.advisor-history-row.is-active { border-color: #07c160; background: rgba(7,193,96,.10); }
+.advisor-history-title { display: block; font-size: 13px; line-height: 1.4; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.advisor-history-meta, .advisor-history-preview { display: block; color: var(--advisor-muted); font-size: 11px;
+  line-height: 1.5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.advisor-history-empty { padding: 14px 8px; color: var(--advisor-muted); font-size: 12px; text-align: center; }
+.advisor-frame-body.theme-light .advisor-history-menu { background: #fff; }

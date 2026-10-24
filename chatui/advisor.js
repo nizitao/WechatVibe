@@ -43,7 +43,13 @@
         (value.api.name === undefined || text(value.api.name, 64)))) &&
       (value.assistantProfileId === null || value.assistantProfileId === undefined || id(value.assistantProfileId));
   }
-  function validThread(value, scope) {
+  function validThreadSummary(value) {
+  return object(value) && id(value.id) && text(value.title, 60) && text(value.preview, 60) &&
+    (value.previewRole === "" || value.previewRole === "user" || value.previewRole === "assistant" ||
+      value.previewRole === "status") && Number.isSafeInteger(value.messageCount) && value.messageCount >= 0 &&
+    Number.isSafeInteger(value.createdAtMs) && Number.isSafeInteger(value.updatedAtMs);
+}
+function validThread(value, scope) {
     return object(value) && id(value.id) && value.account === scope.account && value.user === scope.user &&
       value.agentId === scope.agentId && Array.isArray(value.messages) && value.messages.every(message =>
         object(message) && id(message.id) && ["user", "assistant", "status"].includes(message.role) && text(message.text, 2000000));
@@ -62,7 +68,7 @@
     frameReady: false, handshakeNonce: nonce("adv_"),
     catalog: { agents: [], skills: [], engine: { state: "missing" } },
     catalogReady: false, catalogError: "", catalogBusy: false,
-    modelProfiles: [], assistantProfileId: "", analysisLabel: "",
+    modelProfiles: [], assistantProfileId: "", analysisLabel: "", historySerial: 0,
     drafts: storedObject("advisor_drafts_v1"), threadCache: storedObject("advisor_threads_v1"),
     pendingRequests: storedObject("advisor_pending_v1"),
     pollAbortController: null, submitPending: false, stopPending: false,
@@ -297,13 +303,14 @@
       }
       this.flushThreadCache(); return true;
     },
-    async loadThread(scope = this.captureScope()) {
+    async loadThread(scope = this.captureScope(), threadId = undefined) {
       if (!this.isCurrent(scope)) return;
       const serial = ++this.loadSerial;
       const projection = this.projectionForScope(scope);
       this.syncThreadToFrame(projection.thread, projection.run, scope);
       if (!scope.account || !scope.user || !scope.agentId || !this.catalogReady) return;
       const query = new URLSearchParams({ account: scope.account, user: scope.user, agentId: scope.agentId });
+      if (threadId) query.set("threadId", threadId);
       const data = await this.fetchJson(`/api/advisor/thread?${query}`);
       if (!this.isCurrent(scope) || serial !== this.loadSerial) return;
       if (!validThread(data?.thread, scope)) { this.problem(data, scope); return; }
@@ -490,12 +497,36 @@
       delete this.pendingRequests[this.scopeKey(scope.account, scope.user, scope.agentId)]; save("advisor_pending_v1", this.pendingRequests);
       this.setCachedThread(scope.account, scope.user, scope.agentId, result.thread); this.syncThreadToFrame(result.thread, result.run, next);
       this.flushThreadCache();
+      await this.loadThreads(next);
     },
     retryRun() {
       if (this.currentRunId) { void this.pollEvents(this.currentRunId); return; }
       const scope = this.captureScope(), pending = this.pendingRequests[this.scopeKey(scope.account, scope.user, scope.agentId)];
       const previous = this.getCachedThread(scope.account, scope.user, scope.agentId).messages.filter(item => item.role === "user").at(-1);
       return this.startRun(pending?.message || this.getDraft(scope.account, scope.user, scope.agentId) || previous?.text || "");
+    },
+    async openThread(threadId) {
+      const scope = this.captureScope();
+      if (!this.isCurrent(scope) || !scope.account || !scope.user || !id(scope.agentId) ||
+        !id(threadId) || this.submitPending) return;
+      if (this.getCachedThread(scope.account, scope.user, scope.agentId).id === threadId) return;
+      // Leaving a conversation that is still generating stops it, exactly like switching person.
+      this.generation++; this.abortCurrentPoll();
+      await this.loadThread(scope, threadId);
+      if (!this.isCurrent(scope)) return;
+      await this.loadThreads(scope);
+    },
+    async loadThreads(scope = this.captureScope()) {
+      if (!this.isCurrent(scope) || !scope.account || !scope.user || !scope.agentId || !this.catalogReady) return;
+      const serial = ++this.historySerial;
+      const query = new URLSearchParams({ account: scope.account, user: scope.user, agentId: scope.agentId });
+      const data = await this.fetchJson(`/api/advisor/threads?${query}`);
+      if (!this.isCurrent(scope) || serial !== this.historySerial) return;
+      if (!Array.isArray(data?.threads) || !data.threads.every(validThreadSummary)) return;
+      this.clearProblem("load", scope);
+      this.postToFrame("ADVISOR_SET_THREADS", {
+        threads: data.threads, activeThreadId: this.getCachedThread(scope.account, scope.user, scope.agentId).id,
+      }, scope);
     },
     onSessionChanged(account, user) {
       account = typeof account === "string" ? account : ""; user = typeof user === "string" ? user : "";
@@ -504,6 +535,7 @@
       void this.stopForScope(this.captureScope(), this.currentRunId);
       this.generation++; this.abortCurrentPoll(); this.submitPending = false;
       this.currentAccount = account; this.currentUser = user; void this.loadThread();
+      void this.loadThreads(this.captureScope());
     },
     onAccountCleared(account) {
       this.clearedAccounts.add(account);
@@ -572,7 +604,8 @@
       if (Object.keys(data).some(key => !["envelope", "nonce", "type", "payload", "scope"].includes(key))) return false;
       const allowed = { ADVISOR_FRAME_READY: [], ADVISOR_SWITCH_TEMPLATE: ["agentId"], ADVISOR_SEND: ["text", "agentId"],
         ADVISOR_STOP: [], ADVISOR_RETRY: ["retryKind"], ADVISOR_NEW_THREAD: [],
-        ADVISOR_DRAFT_UPDATE: ["draft", "agentId"], ADVISOR_COPY: ["text"], ADVISOR_SELECT_MODEL: ["profileId"] };
+        ADVISOR_DRAFT_UPDATE: ["draft", "agentId"], ADVISOR_COPY: ["text"], ADVISOR_SELECT_MODEL: ["profileId"],
+        ADVISOR_OPEN_THREAD: ["threadId"], ADVISOR_HISTORY_REQUEST: [] };
       if (!allowed[data.type] || Object.keys(data.payload).some(key => !allowed[data.type].includes(key))) return false;
       if (data.type === "ADVISOR_FRAME_READY") return true;
       if (!object(data.scope) || !this.isCurrent(data.scope) ||
@@ -610,6 +643,8 @@
         } else if (type === "ADVISOR_SEND") void this.startRun(payload.text, payload.agentId);
         else if (type === "ADVISOR_SELECT_MODEL") void this.selectModelProfile(payload.profileId);
         else if (type === "ADVISOR_NEW_THREAD") void this.newThread();
+      else if (type === "ADVISOR_HISTORY_REQUEST") void this.loadThreads();
+        else if (type === "ADVISOR_OPEN_THREAD") void this.openThread(payload.threadId);
         else if (type === "ADVISOR_STOP") void this.stopRun();
         else if (type === "ADVISOR_DRAFT_UPDATE") this.setDraft(this.currentAccount, this.currentUser, this.activeAgentId, payload.draft);
         else if (type === "ADVISOR_RETRY") {

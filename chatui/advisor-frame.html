@@ -39,6 +39,14 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="4"/><path d="M12 8.5v7M8.5 12h7"/></svg>
           <span id="newThreadLabel">新建</span>
         </button>
+        <div class="advisor-history-control">
+          <button type="button" class="advisor-history-btn" id="btnHistory" aria-expanded="false" aria-controls="historyMenu"
+            aria-haspopup="menu" title="历史会话">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5l3 2"/><circle cx="12" cy="12" r="8"/></svg>
+            <span id="historyLabel">历史</span>
+          </button>
+          <div class="advisor-history-menu" id="historyMenu" role="menu" aria-label="历史会话" hidden></div>
+        </div>
         <div class="advisor-model-control">
           <button type="button" class="advisor-model-chip" id="btnModelMenu" aria-expanded="false" aria-controls="modelMenu"
             aria-haspopup="menu" title="选择聊天助手使用的模型">

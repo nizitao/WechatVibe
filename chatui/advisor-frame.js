@@ -8,6 +8,7 @@
   const agentName = byId("agentName"), agentMenu = byId("agentMenu"), menuButton = byId("btnAgentMenu");
   const modelName = byId("modelName"), modelMenu = byId("modelMenu"), modelButton = byId("btnModelMenu");
   const newThread = byId("btnNewThread"), newThreadLabel = byId("newThreadLabel");
+  const historyButton = byId("btnHistory"), historyMenu = byId("historyMenu");
   const timeline = byId("advisorTimeline"), welcome = byId("advisorWelcome"), welcomeText = byId("welcomeText");
   const input = byId("advisorInput"), send = byId("btnAdvisorSend"), stop = byId("btnStopRun"), retry = byId("btnRetryRun");
   const note = byId("advisorComposerNote");
@@ -20,6 +21,7 @@
   let modelProfiles = [], assistantProfileId = "", analysisLabel = "", modelSignature = "";
   let modelPending = false, modelPendingTimer = 0, modelsLoaded = false;
   let newThreadConfirm = false, newThreadTimer = 0;
+  let threads = [], activeThreadId = "";
   const messageNodes = new Map();
   function transientMessage(message) {
     if (message.role !== "status") return false;
@@ -252,6 +254,7 @@
       for (const node of messageNodes.values()) disposeNode(node);
       timeline.replaceChildren(); messageNodes.clear();
       threadId = thread.id; renderedScope = nextScope; problem = "";
+      if (activeThreadId !== thread.id) { activeThreadId = thread.id; renderThreads(); }
       resetNewThreadConfirm();
     }
     currentRun = run || null; submitting = false; stopping = false;
@@ -271,6 +274,57 @@
     updateControls(); updateLayout();
     if (nearBottom || changed) timeline.scrollTop = timeline.scrollHeight;
   }
+  function formatThreadTime(ms) {
+    if (!ms) return "";
+    const when = new Date(ms), now = new Date();
+    const sameDay = when.toDateString() === now.toDateString();
+    const yesterday = new Date(now.getTime() - 86400000).toDateString() === when.toDateString();
+    const clock = String(when.getHours()).padStart(2, "0") + ":" + String(when.getMinutes()).padStart(2, "0");
+    if (sameDay) return "今天 " + clock;
+    if (yesterday) return "昨天 " + clock;
+    if (when.getFullYear() === now.getFullYear()) return (when.getMonth() + 1) + "月" + when.getDate() + "日";
+    return when.getFullYear() + "年" + (when.getMonth() + 1) + "月" + when.getDate() + "日";
+  }
+  function renderThreads() {
+    historyButton.title = threads.length ? "历史会话（" + threads.length + " 段）" : "历史会话";
+    if (!threads.length) {
+      historyMenu.replaceChildren();
+      const empty = document.createElement("div");
+      empty.className = "advisor-history-empty";
+      empty.textContent = "还没有历史会话";
+      historyMenu.appendChild(empty);
+      return;
+    }
+    const nodes = threads.map(thread => {
+      const row = document.createElement("button");
+      row.type = "button"; row.className = "advisor-history-row"; row.setAttribute("role", "menuitem");
+      row.dataset.threadId = thread.id;
+      if (thread.id === activeThreadId) { row.classList.add("is-active"); row.setAttribute("aria-current", "true"); }
+      const head = document.createElement("span");
+      head.className = "advisor-history-title"; head.textContent = thread.title || "新对话";
+      const meta = document.createElement("span");
+      meta.className = "advisor-history-meta";
+      meta.textContent = [formatThreadTime(thread.updatedAtMs), thread.messageCount + " 条消息"].filter(Boolean).join(" · ");
+      const preview = document.createElement("span");
+      preview.className = "advisor-history-preview";
+      preview.textContent = (thread.previewRole === "assistant" ? "助手：" : "") + (thread.preview || "");
+      row.append(head, meta, preview);
+      row.addEventListener("click", () => {
+        closeHistoryMenu();
+        if (thread.id !== activeThreadId) sendToParent("ADVISOR_OPEN_THREAD", { threadId: thread.id });
+      });
+      return row;
+    });
+    historyMenu.replaceChildren(...nodes);
+  }
+  function openHistoryMenu() {
+    historyMenu.hidden = false; historyButton.setAttribute("aria-expanded", "true");
+    sendToParent("ADVISOR_HISTORY_REQUEST");
+    renderThreads();
+  }
+  function closeHistoryMenu() {
+    historyMenu.hidden = true; historyButton.setAttribute("aria-expanded", "false");
+  }
   // The one reason the composer cannot send, ordered by what the user can act on first.
   function composerBlocker() {
     // Before the first handshake nothing is known yet; a hint here would be a guess.
@@ -282,6 +336,12 @@
     // so the hint names both remedies instead of guessing which one it is.
     if (engineState === "missing") return "助手引擎不可用：运行 npm run setup:advisor-engine，或检查所选模型的 API Key 是否已保存";
     return "";
+  }
+  function validThreadSummary(value) {
+    return object(value) && text(value.id, 240) && text(value.title, 60) && text(value.preview, 60) &&
+      ["", "user", "assistant", "status"].includes(value.previewRole) &&
+      Number.isSafeInteger(value.messageCount) && value.messageCount >= 0 &&
+      Number.isSafeInteger(value.createdAtMs) && Number.isSafeInteger(value.updatedAtMs);
   }
   function threadHasMessages() {
     return [...messageNodes.keys()].some(key => !key.startsWith("ui:"));
@@ -395,6 +455,10 @@
     if (type === "ADVISOR_PROBLEM" && (!text(payload.error, 20000) || !["send", "poll", "load", "catalog"].includes(payload.retryKind))) return false;
     if (["ADVISOR_SUBMIT_STATE", "ADVISOR_STOP_STATE"].includes(type) && typeof payload.pending !== "boolean") return false;
     if (type === "ADVISOR_COPY_RESULT" && typeof payload.copied !== "boolean") return false;
+    if (type === "ADVISOR_SET_THREADS") {
+      if (!Array.isArray(payload.threads) || payload.threads.length > 200 ||
+        !payload.threads.every(validThreadSummary) || !text(payload.activeThreadId, 240)) return false;
+    }
     if (type === "ADVISOR_SET_MODELS") {
       if (!Array.isArray(payload.profiles) || payload.profiles.length > 200 ||
         !payload.profiles.every(item => object(item) && text(item.id, 240) && text(item.name, 64) &&
@@ -448,6 +512,19 @@
     resetNewThreadConfirm();
     sendToParent("ADVISOR_NEW_THREAD");
   });
+  historyButton.addEventListener("click", () => { if (historyMenu.hidden) openHistoryMenu(); else closeHistoryMenu(); });
+  historyButton.addEventListener("keydown", event => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault?.();
+    if (historyMenu.hidden) openHistoryMenu();
+    historyMenu.querySelector(".advisor-history-row")?.focus?.();
+  });
+  document.addEventListener("click", event => {
+    if (historyMenu.hidden) return;
+    const target = event.target;
+    if (target !== historyButton && !historyMenu.contains(target)) closeHistoryMenu();
+  });
+  document.addEventListener("keydown", event => { if (event.key === "Escape" && !historyMenu.hidden) closeHistoryMenu(); });
   stop.addEventListener("click", () => sendToParent("ADVISOR_STOP"));
   retry.addEventListener("click", () => sendToParent("ADVISOR_RETRY", { retryKind: currentRun?.state === "error" ? "send" : retryKind }));
   function submitMessage() {
@@ -490,6 +567,8 @@
       modelProfiles = payload.profiles; assistantProfileId = payload.assistantProfileId || "";
       analysisLabel = payload.analysisLabel || ""; modelsLoaded = true;
       clearModelPending(); renderModels();
+    } else if (data.type === "ADVISOR_SET_THREADS") {
+      threads = payload.threads; activeThreadId = payload.activeThreadId; renderThreads();
     } else if (data.type === "ADVISOR_SET_THREAD") {
       renderTemplates(); renderThread(payload.thread, payload.run, payload.draft);
     } else if (data.type === "ADVISOR_STREAM_UPDATE") applyStream(payload);
@@ -506,5 +585,5 @@
       submitting = payload.pending; if (submitting) { problem = ""; statusRow("ui:problem", ""); } updateControls();
     } else if (data.type === "ADVISOR_STOP_STATE") { stopping = payload.pending; updateControls(); }
   });
-  renderModels(); renderNewThread(); updateControls(); updateLayout();
+  renderModels(); renderNewThread(); renderThreads(); updateControls(); updateLayout();
 })();
