@@ -464,7 +464,7 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                         user_value(member) if member is not None else None,
                         refresh_axes=refresh_axes))
                 if endpoint == "/api/model-guidance":
-                    if not set(request) <= {"account", "user", "member", "scenario", "analyzeSelf", "feedback", "draft", "replyOptions", "sourceId", "agentId", "agentRevision"} or "account" not in request:
+                    if not set(request) <= {"account", "user", "member", "scenario", "analyzeSelf", "feedback", "draft", "replyOptions", "sourceId", "agentId", "agentRevision", "windowMinutes"} or "account" not in request:
                         raise ValueError("invalid guidance request")
                     member = request.get("member")
                     analyze_self = request.get("analyzeSelf", False)
@@ -478,7 +478,8 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                             feedback=request.get("feedback"), draft=request.get("draft"),
                             reply_options=request.get("replyOptions", False),
                             agent_id=request.get("agentId"), agent_revision=request.get("agentRevision"),
-                            expected_source_id=user_value(request["sourceId"]) if "sourceId" in request else None))
+                            expected_source_id=user_value(request["sourceId"]) if "sourceId" in request else None,
+                            window_minutes=request.get("windowMinutes")))
                     except RuntimeError as exc:
                         if str(exc) == "model-source-changed":
                             return self.send(409, {"error": "model-source-changed",

@@ -47,7 +47,7 @@ from data_root_source import DataRootSource
 from guidance_contracts import (GUIDANCE_CONTEXT_CHARACTERS, GUIDANCE_DRAFT_MAX, GUIDANCE_FEEDBACK_MAX,
                                 GUIDANCE_PORTRAIT_CONTEXT_MAX, GUIDANCE_REVISION,
                                 GUIDANCE_SCENARIOS, GUIDANCE_SUMMARY_CONTEXT_MAX,
-                                GUIDANCE_WINDOW_MESSAGES, MAX_SUBTEXTS, guidance_scope,
+                                GUIDANCE_WINDOW_MESSAGES, MAX_SUBTEXTS, guidance_scope, guidance_window_minutes,
                                 REPLY_OPTIONS_REVISION, normalize_guidance, normalize_reply_options)
 from history_browser import browse as browse_history, saved_results as saved_history_results, search as search_history
 from message_results import validate_fine_result, validate_portrait_result
@@ -1082,18 +1082,23 @@ class Backend:
     def model_source_select(self, request):
         """Point the assistant at one saved profile; the analysis line keeps running as it is.
 
-        Unlike ``model_source_activate`` this never flips ``active_model_source_mode`` and never
-        touches the active API source, so local analysis stays local and API analysis keeps its
-        own profile.
+        A ``null`` profile means "follow the analysis selection": it drops the assistant's own
+        pin so both lines read one source again. Unlike ``model_source_activate`` this never
+        flips ``active_model_source_mode`` and never touches the active API source, so local
+        analysis stays local and API analysis keeps its own profile.
         """
         if not isinstance(request, dict) or set(request) != {"profileId"}:
             raise ValueError("invalid model source request")
         profile_id = request["profileId"]
-        if not isinstance(profile_id, str) or not profile_id:
+        if profile_id is not None and (not isinstance(profile_id, str) or not profile_id):
             raise ValueError("invalid model source request")
         with self.api_lock:
-            self.model_source_store.select_assistant_profile(profile_id)
-            source_id = self.model_source_store.profile_source_id(profile_id)
+            if profile_id is None:
+                self.model_source_store.clear_assistant_profile()
+                source_id = self.model_source_store.saved_selection().get("sourceId")
+            else:
+                self.model_source_store.select_assistant_profile(profile_id)
+                source_id = self.model_source_store.profile_source_id(profile_id)
             revision = self.model_source_revision
         return {"profileId": profile_id, "sourceId": source_id, "revision": revision}
 
@@ -1241,9 +1246,20 @@ class Backend:
                 "guidance": saved["guidance"] if saved else None, "job": job,
                 "suspended": store.cache_suspended(account, source_id) if mode == "api" else False}
 
+    def _guidance_window(self, user, minutes):
+        """Newest messages inside the chosen window, still capped by the message ceiling."""
+        window = self.source.messages(user, GUIDANCE_WINDOW_MESSAGES)
+        # A source without timestamps keeps the old newest-messages behaviour instead of
+        # silently producing an empty window.
+        if not any(type(item.get("time")) is int for item in window):
+            return window
+        cutoff = int(time.time() * 1000) - minutes * 60_000
+        return [item for item in window if type(item.get("time")) is int and item["time"] >= cutoff]
+
     def start_guidance(self, requested_account, user, member=None, scenario="auto",
                        analyze_self=False, feedback=None, draft=None, reply_options=False,
-                       expected_source_id=None, agent_id=None, agent_revision=None):
+                       expected_source_id=None, agent_id=None, agent_revision=None,
+                       window_minutes=None):
         if expected_source_id is not None and (
                 not isinstance(expected_source_id, str) or not 1 <= len(expected_source_id) <= 256 or
                 any(ord(char) < 32 or ord(char) == 127 for char in expected_source_id)):
@@ -1257,6 +1273,7 @@ class Backend:
         if member is not None and (not user.endswith("@chatroom") or
                                    not isinstance(member, str) or not 1 <= len(member) <= 256):
             raise ValueError("invalid guidance subject")
+        window_minutes = guidance_window_minutes(window_minutes)
         if scenario not in GUIDANCE_SCENARIOS:
             raise ValueError("invalid guidance scenario")
         if type(analyze_self) is not bool:
@@ -1306,7 +1323,7 @@ class Backend:
                 return {"account": account, "sourceId": source_id, "subject": subject,
                         **response_identity,
                         "job": {"id": None, "status": "suspended"}}
-        window = self.source.messages(user, GUIDANCE_WINDOW_MESSAGES)
+        window = self._guidance_window(user, window_minutes)
         self._assert_scope(scope)
         group = user.endswith("@chatroom")
         wire = []

@@ -61,7 +61,8 @@ function getVisibleUnreadCount(session) {
   if (hasNewTime || hasNewPreview) return serverUnread;
   return 0;
 }
-const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false };
+const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false,
+  guidanceWindowMinutes: 1440 };
 const CURRENT_LABEL_SCHEMA = "generic-v11";
 const GENERIC_INTENT_LABELS = Object.freeze({
   small_talk: "闲聊", share_news: "分享", ask_question: "提问", seek_help: "求助", deny: "否认",
@@ -4074,6 +4075,7 @@ function applySettings() {
   window.desktopHost?.setTheme?.(settingsState.settings.theme);
   byId("selectThemeMode").value = settingsState.settings.theme;
   byId("selectZoomLevel").value = settingsState.settings.zoom;
+  if (typeof applyGuidanceWindow === "function") applyGuidanceWindow();
   setIntentActionState(labelState.intentActionState);
   byId("btnToggleBackgroundAnalyze").classList.toggle("active", settingsState.settings.backgroundAnalyze);
   byId("btnToggleBackgroundAnalyze").setAttribute("aria-pressed", String(settingsState.settings.backgroundAnalyze));
@@ -4090,6 +4092,24 @@ function applySettings() {
 // Contextual reply choices use a dedicated result revision and share only the
 // existing request, source and cache infrastructure with the legacy guidance API.
 const GUIDANCE_VERSION = "api-reply-options-v2";
+// Reply generation uploads only recent chat. Keep the list in step with the backend's
+// GUIDANCE_WINDOW_CHOICES so the label always describes what is actually sent.
+// The user types an amount and picks hours or days; the range is clamped here too, so a
+// stale saved value can never widen what gets uploaded.
+const GUIDANCE_WINDOW_MIN = 60, GUIDANCE_WINDOW_MAX = 43200;
+const guidanceWindowMinutes = () => {
+  // Defensive: the settings object may not exist while the UI is still starting up.
+  const settings = (typeof settingsState !== "undefined" && settingsState.settings) || {};
+  const value = Math.round(Number(settings.guidanceWindowMinutes));
+  if (!Number.isFinite(value)) return 1440;
+  return Math.min(GUIDANCE_WINDOW_MAX, Math.max(GUIDANCE_WINDOW_MIN, value));
+};
+const guidanceWindowLabel = () => {
+  const minutes = guidanceWindowMinutes();
+  if (minutes % 1440 === 0) return `最近 ${minutes / 1440} 天`;
+  if (minutes % 60 === 0) return `最近 ${minutes / 60} 小时`;
+  return `最近 ${minutes} 分钟`;
+};
 const GUIDANCE_ERRORS = {
   "context-too-long": "当前上下文设置不足以容纳回复，请按模型实际容量调整",
   "invalid-output": "模型返回的回复选项不完整，请重试",
@@ -4200,9 +4220,14 @@ function syncGuidanceAction() {
     !assistant.agentId ? "请先在助手仓库启用助手" : busy ? "正在生成回复" :
     portraitState.guidanceRendered ? "重新生成三个回复选项" : "生成三个回复选项";
   button.setAttribute("aria-label", button.title);
-  if (apiMode && chatState.view === "chat" && chatState.currentUser && chatState.currentAccount && !assistant.agentId)
+  if (apiMode && chatState.view === "chat" && chatState.currentUser && chatState.currentAccount && !assistant.agentId) {
     text("guidanceStatus", button.title);
-byId("guidanceStatus")?.classList?.toggle?.("ai-busy", !!(false));
+    byId("guidanceStatus")?.classList?.toggle?.("ai-busy", !!(false));
+  } else {
+    // Keep the ring in sync with the run instead of clearing it: this function runs right after
+    // renderGuidance(), which just turned it on for a running generation.
+    byId("guidanceStatus")?.classList?.toggle?.("ai-busy", !!busy);
+  }
   for (let index = 0; index < 3; index++)
     byId("replyChoice" + index).disabled = !available || !portraitState.guidanceRendered?.replies[index];
 }
@@ -4283,10 +4308,11 @@ async function startGuidance() {
   portraitState.guidanceBusy = true;
   portraitState.guidanceSubmitError = "";
   syncGuidanceAction();
-  text("guidanceStatus", "正在生成回复…");
+  text("guidanceStatus", `正在生成回复 · ${guidanceWindowLabel()}`);
   try {
     const data = await api("/api/model-guidance", { method: "POST",
-      body: JSON.stringify({ account, user, sourceId, replyOptions: true, agentId, agentRevision }) }, undefined, true);
+      body: JSON.stringify({ account, user, sourceId, replyOptions: true, agentId, agentRevision,
+        windowMinutes: guidanceWindowMinutes() }) }, undefined, true);
     if (!current()) return;
     if (data?.account !== account || data.sourceId !== sourceId || data.subject !== user ||
         data.version !== GUIDANCE_VERSION || data.agentId !== agentId || data.agentRevision !== agentRevision)
@@ -6100,6 +6126,9 @@ function closeSettingsModal() {
   showApiProfileDeleteConfirm(false);
   closeModelBadgeMenu();
   byId("settingsModal").classList.remove("show");
+  // The assistant panel stays open behind this modal, so its cached profile list is now the
+  // only stale copy. Announce the close instead of letting it read yesterday's models.
+  window.dispatchEvent(new CustomEvent("model-source-settings-closed"));
   clearTimeout(settingsState.runtimePollTimer);
   ++analysisCacheRequest;
   pendingAnalysisCacheClear = null;
@@ -6618,6 +6647,31 @@ async function toggleIntentRecognition() {
   } else submitManualRecent(true);
 }
 byId("btnToggleIntent").addEventListener("click", () => { void toggleIntentRecognition(); });
+function guidanceWindowField() {
+  const field = byId("inputGuidanceWindow"), unit = byId("selectGuidanceWindowUnit");
+  const minutes = guidanceWindowMinutes();
+  if (!field || !unit) return;
+  unit.value = minutes >= 1440 && minutes % 1440 === 0 ? "days" : "hours";
+  field.value = String(unit.value === "days" ? minutes / 1440 :
+    (minutes % 60 === 0 ? minutes / 60 : Math.round(minutes / 6) / 10));
+}
+function applyGuidanceWindow() {
+  guidanceWindowField();
+  text("guidanceWindowHint", "只把" + guidanceWindowLabel() + "内的聊天发送给模型。");
+}
+function readGuidanceWindow() {
+  const field = byId("inputGuidanceWindow"), unit = byId("selectGuidanceWindowUnit");
+  const amount = Number(field && field.value);
+  if (!Number.isFinite(amount) || amount <= 0) return guidanceWindowMinutes();
+  const minutes = Math.round(amount * (unit && unit.value === "days" ? 1440 : 60));
+  return Math.min(GUIDANCE_WINDOW_MAX, Math.max(GUIDANCE_WINDOW_MIN, minutes));
+}
+for (const id of ["inputGuidanceWindow", "selectGuidanceWindowUnit"])
+  byId(id)?.addEventListener("change", () => {
+    settingsState.settings.guidanceWindowMinutes = readGuidanceWindow();
+    save();
+    applyGuidanceWindow();
+  });
 for (const [id, key] of [["selectThemeMode", "theme"], ["selectZoomLevel", "zoom"]]) byId(id).addEventListener("change", event => { settingsState.settings[key] = event.target.value; save(); applySettings(); });
 byId("selectRuntimeProvider").addEventListener("change", event => { void changeRuntime(event.target.value); });
 byId("selectModelSource").addEventListener("change", () => {

@@ -34,6 +34,22 @@ RESULT_OPTIONAL_FIELDS = {"usage", "responseId"}
 MAX_SUBTEXTS = 12
 # One guidance turn reasons over a bounded window, not the whole history.
 GUIDANCE_WINDOW_MESSAGES = 160
+#: Reply generation only uploads recent chat. The window is a user setting; the message
+#: ceiling above stays a hard cap so a wide window cannot balloon one request.
+GUIDANCE_WINDOW_MIN = 60
+GUIDANCE_WINDOW_MAX = 43200  # thirty days
+GUIDANCE_WINDOW_DEFAULT = 1440
+#: Quick presets offered by the UI; the field itself accepts any value in the range.
+GUIDANCE_WINDOW_CHOICES = (60, 120, 1440, 4320, 10080)
+
+
+def guidance_window_minutes(value=None):
+    """Clamp the requested window into [1 hour, 30 days]; unknown input uses one day."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return GUIDANCE_WINDOW_DEFAULT
+    if value != value:  # NaN
+        return GUIDANCE_WINDOW_DEFAULT
+    return max(GUIDANCE_WINDOW_MIN, min(GUIDANCE_WINDOW_MAX, int(value)))
 GUIDANCE_CONTEXT_CHARACTERS = 24_000
 GUIDANCE_FEEDBACK_MAX = 400
 GUIDANCE_DRAFT_MAX = 2000

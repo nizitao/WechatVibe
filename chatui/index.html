@@ -448,6 +448,20 @@
             <span id="backgroundAnalyzeHint" class="model-source-status" role="status" aria-live="polite">已关闭：不会自动在后台分析会话；仍可手动分析。API 分析会产生接口用量。</span>
           </div>
           <div class="settings-row">
+            <label for="inputGuidanceWindow">生成回复的聊天范围</label>
+            <span class="guidance-window-input">
+              <input type="number" id="inputGuidanceWindow" min="1" max="720" step="0.5"
+                     inputmode="decimal" aria-describedby="guidanceWindowHint" value="1">
+              <select id="selectGuidanceWindowUnit" aria-label="时间单位">
+                <option value="hours">小时</option>
+                <option value="days" selected>天</option>
+              </select>
+            </span>
+          </div>
+          <div class="settings-row settings-status-row">
+            <span id="guidanceWindowHint" class="model-source-status" role="status" aria-live="polite">只把最近 1 天内的聊天发送给模型。</span>
+          </div>
+          <div class="settings-row">
             <span>信息列表</span>
             <button type="button" class="settings-action-btn" id="btnManageConversations">管理会话</button>
           </div>

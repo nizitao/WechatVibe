@@ -3396,3 +3396,7 @@ body.theme-light .update-modal-card { border-color: var(--border-color); backgro
 .ai-busy::before { content: ""; display: inline-block; width: 11px; height: 11px; margin-right: 6px; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -1px; opacity: .7; animation: ai-busy-spin .8s linear infinite; }
 @keyframes ai-busy-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .ai-busy::before { animation: none; border-right-color: currentColor; } }
+
+/* While a reply is being generated the status must read as "working", not as a hint. */
+.guidance-status.ai-busy { flex-basis: auto; max-width: none; font-size: 13px; font-weight: 500;
+  color: inherit; white-space: normal; overflow: visible; text-overflow: clip; }
