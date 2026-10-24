@@ -5,7 +5,8 @@ from advisor_contracts import AdvisorError
 POST_PATHS = frozenset({"/api/advisor/templates", "/api/advisor/skills", "/api/advisor/context",
                         "/api/advisor/run", "/api/advisor/stop", "/api/advisor/new-thread",
                         "/api/advisor/import/preview", "/api/advisor/import/commit", "/api/advisor/import/cancel"})
-GET_PATHS = frozenset({"/api/advisor/catalog", "/api/advisor/thread", "/api/advisor/events"})
+GET_PATHS = frozenset({"/api/advisor/catalog", "/api/advisor/thread", "/api/advisor/threads",
+                       "/api/advisor/events"})
 
 
 def _shape(request, required, optional=()):
@@ -18,8 +19,14 @@ def get(service, path, query):
         _shape(query, ())
         return service.catalog()
     if path == "/api/advisor/thread":
+        _shape(query, ("account", "user", "agentId"), ("threadId",))
+        thread_id = query.get("threadId")
+        if thread_id is not None and not isinstance(thread_id, str):
+            raise AdvisorError("invalid-request", "会话编号不正确")
+        return service.thread(query["account"], query["user"], query["agentId"], thread_id)
+    if path == "/api/advisor/threads":
         _shape(query, ("account", "user", "agentId"))
-        return service.thread(query["account"], query["user"], query["agentId"])
+        return service.threads(query["account"], query["user"], query["agentId"])
     if path == "/api/advisor/events":
         _shape(query, ("account", "user", "runId"), ("after",))
         raw = query.get("after", "0")

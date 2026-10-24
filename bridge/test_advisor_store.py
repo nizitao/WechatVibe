@@ -233,6 +233,29 @@ class AccountDatabaseTests(unittest.TestCase):
         self.stores = AdvisorStoreRoot(self.root)
         self.addCleanup(self.stores.close)
 
+    def test_recent_contact_turns_carries_other_conversations_only(self):
+        database = self.stores.account("acct-a")
+        first = database.create_thread("user-a", "builtin:advisor", "source-1")
+        database.append_message(first["id"], "user", "第一次问")
+        database.append_message(first["id"], "assistant", "第一次答")
+        second = database.create_thread("user-a", "builtin:advisor", "source-1")
+        database.append_message(second["id"], "user", "第二次问")
+        database.append_message(second["id"], "assistant", "第二次答")
+        database.append_message(second["id"], "status", "中间状态不属于对话轮次")
+        other = database.create_thread("user-b", "builtin:advisor", "source-1")
+        database.append_message(other["id"], "user", "别人的对话")
+        turns = database.recent_contact_turns("user-a", "builtin:advisor")
+        self.assertEqual([(row["role"], row["text"]) for row in turns],
+                         [("user", "第一次问"), ("assistant", "第一次答"),
+                          ("user", "第二次问"), ("assistant", "第二次答")])
+        carried = database.recent_contact_turns("user-a", "builtin:advisor", second["id"])
+        self.assertEqual([(row["role"], row["text"]) for row in carried],
+                         [("user", "第一次问"), ("assistant", "第一次答")])
+        limited = database.recent_contact_turns("user-a", "builtin:advisor", None, 2)
+        self.assertEqual([(row["role"], row["text"]) for row in limited],
+                         [("user", "第二次问"), ("assistant", "第二次答")])
+        self.assertEqual(database.recent_contact_turns("user-c", "builtin:advisor"), [])
+
     def test_thread_projection_and_request_id_idempotency(self):
         database = self.stores.account("acct-a")
         thread = database.create_thread("user-a", "builtin:advisor", "source-1")

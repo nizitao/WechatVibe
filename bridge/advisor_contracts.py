@@ -54,6 +54,12 @@ MAX_SUMMARY_CHARS = 2000
 MAX_COMPRESSION_LEVELS = 8
 COMPRESSION_VERSION = "advisor-compress-v2"
 
+# --- Saved conversation history --------------------------------------------
+# One contact keeps a bounded list of conversations the user can return to. The
+# list is per account + contact + agent, so switching person or agent shows that
+# person's own history rather than one global stack.
+MAX_HISTORY_THREADS = 50
+
 # --- Runtime event/state vocabulary ----------------------------------------
 EVENT_TYPES = ("status", "text", "reasoning", "skill", "done", "error")
 RUN_STATES = ("running", "done", "stopped", "error")

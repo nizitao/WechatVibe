@@ -100,7 +100,7 @@
 
 回归：`bridge/test_message_input.py`（规则本身）、`bridge/test_real_backend.py`（本地链路跳过 + 送模型文本无链接）、`bridge/test_api_insights.py`（API 标签目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs`（前端判定与手选）。
 
-### 七、右键单条重算（工作区未提交）
+### 七、右键单条重算（`7e53041`，已推到 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)）
 
 在聊天里右键任意一条消息，弹出的小菜单里是「重新算」：只把**这一条**交给当前模型重新跑一遍，其它消息、分析进度和画像都不动。
 
@@ -111,7 +111,7 @@
 
 回归：`bridge/test_message_recompute.py`（只删这一条：相邻消息 / 另一会话 / 另一来源三组对照 + HTTP 200/400 与坏入参）、`tests/message-context-menu.test.cjs`（菜单接线、禁用原因、请求体、先忘后提交的时序、视图变化后不提交、并发只发一次）。
 
-### 八、模型配置单开一栏（工作区未提交）
+### 八、模型配置单开一栏（`7e53041`，已推到 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)）
 
 设置弹窗原本只有「通用设置 / 关于」两栏，模型那一整组（模型来源、本地模型与设备、模型文件下载、本地并行数、API 配置与密钥、API 并行数、模型来源状态）和主题、缩放、会话管理、数据目录、账号、分析缓存挤在同一栏里。现在它们单独成栏，侧栏顺序为 **通用设置 / 模型配置 / 关于**。
 
@@ -119,18 +119,48 @@
 - 从聊天标题栏的模型徽标点「管理配置」，会直接落在「模型配置」栏（不然会聚焦到一个隐藏面板里的输入框）。
 - 只是搬位置：行为、接口、本地/API 按 `hidden` 的切换规则都没变。
 
-### 九、助手窗口「切换模型档案」（工作区未提交）
+### 九、助手窗口「切换模型档案」（`87fbdee`，入口位置另有工作树改动，已推到 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)）
 
-聊天助手窗口的标题栏（模板名所在的那一行）多了一个「模型」按钮：点开是设置里已保存的全部 API 配置档案，正在使用的那项有选中态且不可重复点，点另一项就只把**助手**切到那条档案，分析模式完全不受影响。
+聊天助手窗口多了一个「模型」选择条：`87fbdee` 时在标题栏（模板名所在的那一行），工作树里已挪到输入框下方左侧，做成一颗小胶囊。点开是「跟随分析」加上设置里已保存的全部 API 配置档案，当前使用的那项有选中态、点它不会重复发请求；点另一项就只把**助手**切到那条档案，分析模式完全不受影响。
 
 - **只切助手，不动分析**：后端 `POST /api/model-source/select`（上一轮已加）只写配置文档的 `assistantProfileId`，`selectedMode` 与活动 `sourceId` 原样不动 —— 本地分析继续本地跑，API 分析继续用它自己那条档案。切换成功后宿主会重读 `/api/advisor/catalog`，因为军师引擎的「可用 / 未安装」状态跟着助手档案变。**不会**调用 `/api/model-source/activate`。
-- **档案列表来自本地配置**：宿主读 `GET /api/model-source`（该接口本就返回 `profiles` 与 `assistantProfileId`，后端零改动）下发给 iframe 渲染，iframe 自己不发任何网络请求；没有助手专属档案时按钮显示「跟随分析」。
+- **「跟随分析」是回头的路**：菜单第一项固定是「跟随分析」，发的是 `profileId:null`，清掉助手专属档案、让两条线重新读同一个来源；没有 pin 时胶囊文案是「跟随分析 · <分析线当前模型名>」，pin 了就显示档案名，一条档案都没有时显示「未配置模型」。
+- **档案列表来自本地配置**：宿主读 `GET /api/model-source`（该接口本就返回 `profiles`、`assistantProfileId` 与分析线当前档案 `api`）下发给 iframe 渲染，iframe 自己不发任何网络请求；切换中胶囊显示「切换中…」并禁用，避免连点。
 - **不产生 provider 调用**：列档案与切档案都不连接模型服务，本地模式下渲染菜单同样不触发 model-connectors 请求；未知或已删除的档案返回 400，界面给一句简短提示，菜单保持原来的选中项。
 - 隐私口径不变：这里切换的是「助手用哪条已保存配置」，不改变任何消息文本的去向。
 
-回归：`tests/advisor-ui.test.cjs`（菜单渲染与选中态、点击只发一次且 payload 恰为 `{profileId}`、成功后宿主请求序列固定为 `select → catalog`、失败保持原选中并提示、未知 id 在宿主侧即被拒、空档案时按钮禁用）；后端契约仍由 `bridge/test_model_source_select.py`（7 例）钉住。
+回归：`tests/advisor-ui.test.cjs`（菜单渲染与选中态、点击只发一次且 payload 恰为 `{profileId}`（或 `{profileId:null}`）、成功后宿主请求序列固定为 `select → catalog`、失败保持原选中并提示、未知 id 在宿主侧即被拒、空档案时胶囊仍可点并提示去设置添加、切换中显示「切换中…」且禁用）；后端契约仍由 `bridge/test_model_source_select.py`（8 例）钉住。
 
-### 十、与上游的已知分歧
+### 十、助手生成时实时展示执行步骤（`2134572`，已推到 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)）
+
+助手回答前不再是干等：界面上依次显示「正在读取会话资料 → 已读取 N 条消息，正在整理上下文 → 正在调用模型」，压缩较早历史时中间多一条「正在整理较早的聊天记录…」，让人知道它到底卡在哪一步。
+
+- **只报阶段，不泄内容**：步骤里只有阶段名和条数，不含聊天原文、提示词、工具参数，也没有模型推理过程 —— 这块是给「等得心慌」用的，不是给窥屏用的。
+- **有上限、有清洗**：最多显示 4 条；标签超长或状态值不在约定枚举里的直接丢弃，重复标签只留一次，避免桥接端异常时把界面撑坏。
+- **回答开始就收起**：正文一旦开始流式输出，整块步骤立刻移除，不跟回答抢位置；系统开了 `prefers-reduced-motion` 时不转圈。
+
+回归：`tests/advisor-steps.test.cjs`、`bridge/test_advisor_boundaries.py`。
+
+### 十一、等待 AI 时加转圈（`9db75cf`，已推到 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)）
+
+意图识别 / 逐条标签、人物画像、生成回复选项这三处的状态行，在文字前加了一个 11px 的圆环。以前只有一行静止的「正在分析…」，分不清是在跑还是卡住了。
+
+- **不新增元素、不改文案**：做法是给既有状态节点加一个 `ai-busy` class，由 CSS 画圆环，所以布局和文字一个字都没动。
+- **该停就停**：失败态和提示态会显式把这个 class 清掉，不会出现「已经报错了圆环还在转」。
+- **减弱动效下不转**：跟随 `prefers-reduced-motion`。
+
+回归：`tests/ai-busy-status.test.cjs`。
+
+### 十二、dev/venv 启动被身份校验误判（`8242ab5`，已推到 [PR #33](https://github.com/tswawa/WechatVibe/pull/33)）
+
+这条修的是自己开发时最烦的一个坑：`start-real-client.py` 原先用「shell pid == 直接父进程」判断自己是不是被桌面端拉起来的，而 venv 里的 `python.exe` 会多起一层解释器，父进程对不上，于是每次 `npm start` 都报 `Desktop startup identity is invalid`，界面上只剩一句「本地服务未就绪」。
+
+- **判断改成看祖先链**：现在要求 shell pid 出现在祖先链上（最多上溯 4 层）。安全意图没变 —— 仍然必须由本应用的 shell 拉起，随便一个进程启不来；打包版走的是原路径，行为不变。
+- **失败不再吞输出**：启动失败时把 launcher 的输出写进 `logs/desktop-launch.log`，弹窗里附最后一行。以前只看得到一个通用提示，完全不知道底下报了什么。
+
+验证：`start-real-client.py` 的 48 个端到端用例通过，`test-desktop-main` / `test-real-client-recovery` 退出码 0。
+
+### 十三、与上游的已知分歧
 
 保留自用判定逻辑会带来两处可预期的不一致，下次升级上游时需要留意：
 
@@ -160,7 +190,7 @@ v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github
 | 分支 | 内容 |
 | --- | --- |
 | `main` | 跟随上游 v1.3.0 + 「自用改动」 |
-| `perf/optimize-tokenizer` | 本轮分支：手选消息 / 模型来源多配置 / 助手切换模型档案 / MBTI 门槛修 / 链接不进分析 / 右键单条重算 + 分词优化，已合并上游 1.3.0（[PR #33](https://github.com/tswawa/WechatVibe/pull/33) 开放） |
+| `perf/optimize-tokenizer` | 本轮分支：手选消息 / 模型来源多配置 / 助手切换模型档案 / MBTI 门槛修 / 链接不进分析 / 右键单条重算 / 助手执行步骤 / AI 等待转圈 / dev-venv 启动修复 + 分词优化，已合并上游 1.3.0（[PR #33](https://github.com/tswawa/WechatVibe/pull/33) 开放） |
 | `feat/selfuse-on-1.2.4` | 上一轮升级分支（自用改动搬到 1.2.4） |
 | `feat/selfuse-on-1.2.3` | 上一轮升级分支（已并入 `main`，历史） |
 | `feat/selfuse-on-1.2.2` | 更早的升级分支（历史） |

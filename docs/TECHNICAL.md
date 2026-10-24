@@ -2,9 +2,9 @@
 
 > 目标读者：需要在本项目内做功能开发、修bug、扩展或代码审查的工程师与 AI 助手。
 > 本文档目标是：**读完后无需再打开任何源文件**，即可准确回答关于本项目的功能、实现细节、边界与扩展方式的问题。
-> 代码基线：`package.json` version `1.2.4`，分支 `perf/optimize-tokenizer`（fork 自 `nizitao/WechatVibe`，上游 `tswawa/WechatVibe`）。
+> 代码基线：`package.json` version `1.3.5`，分支 `perf/optimize-tokenizer`（fork 自 `nizitao/WechatVibe`，上游 `tswawa/WechatVibe`）。
 > 文档中所有 `路径:行号` 均以该基线为准；行号可能随改动漂移，以函数/符号名为准。
-> **当前工作区含未提交改动**：API 沟通建议（guidance）功能已接线并补齐测试，测试体系改为三套并行。本文档已按该状态撰写，差异见 §11.5。
+> **当前工作区含未提交改动**：助手模型选择条从标题栏移到输入栏左侧，并新增「跟随分析」（`profileId:null` 清除助手专属档案）。本文档按该工作树撰写，差异见 §11.5。
 
 ---
 
@@ -169,14 +169,14 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 
 | 目录/文件 | 作用 |
 | --- | --- |
-| `bridge/` | Python 后端（62 文件，约 20 240 行，含测试） |
-| `electron/` | TS 推理层（33 文件，约 6 094 行），`electron/laya/` 是 vendored + 本地改动的 Laya 运行时 |
-| `chatui/` | 前端静态页面（7 文件，约 9 663 行，其中 `app.js` 约 5 800 行、`style.css` 3 187 行） |
-| `native-reader/wr/` | 独立编写的微信只读底层库（15 文件，约 3 096 行）：SQLCipher 页解密、只读 SQLite 查询层、发现、快照、WAL 解析、窗口遥测 |
-| `shared/` | TS 契约（`contracts.ts` 377 行、`message-input.ts` 237 行） |
-| `src/lib/labels.ts` | 标签常量（81 行），供 TS 侧复用 |
+| `bridge/` | Python 后端（118 个 `.py`，约 41 300 行，其中 68 个 `test_*.py`） |
+| `electron/` | TS 推理层（35 个 `.ts`，约 7 500 行），`electron/laya/` 是 vendored + 本地改动的 Laya 运行时 |
+| `chatui/` | 前端静态页面（17 文件，约 13 470 行，其中 `app.js` 7 164 行、`style.css` 3 398 行） |
+| `native-reader/wr/` | 独立编写的微信只读底层库（15 个 `.py`，约 3 370 行）：SQLCipher 页解密、只读 SQLite 查询层、发现、快照、WAL 解析、窗口遥测 |
+| `shared/` | TS 契约（`contracts.ts` 419 行、`message-input.ts` 258 行） |
+| `src/lib/labels.ts` | 标签常量（90 行），供 TS 侧复用 |
 | `scripts/` | 桌面壳、启动器、构建/发布、更新、模型下载、目录白名单清单、各类回归测试 |
-| `tests/` | Node/TS 与前端逻辑测试（33 文件） |
+| `tests/` | Node/TS 与前端逻辑测试（61 文件：21 个 `*.test.ts` + 40 个 `*.test.cjs`） |
 | `docs/` | `backend-architecture.md`（分层与流程）、`startup-diagnostics.md`、`releases/` |
 | `licenses/` `THIRD_PARTY_NOTICES.md` | 第三方许可 |
 
@@ -391,7 +391,7 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | `/api/model-source/list` \| `test` \| `activate` \| `clear-key` | `{protocol,baseUrl,apiKey,model?,contextTokens?}` | 模型发现/探测/启用/清 key |
 | `/api/model-source/profiles` | `{profileId?,name?,protocol,baseUrl,apiKey?,model,contextTokens}` | 新建或更新一条 API 配置（**不切换**当前对话）；`activate` 额外接受 `name`/`profileId` 以便「保存并启用」同时落盘 |
 | `/api/model-source/profiles/delete` | `{profileId}` | 删除一条 API 配置；删掉正在使用的那条会切回本地模型 |
-| `/api/model-source/select` | `{profileId}` | 只把**助手**指到一条已保存配置：仅写配置文档的 `assistantProfileId`，不动 `selectedMode`/active `sourceId`，因此分析线（本地或已启用的 API 来源）原样运行；未知 id 返回 400 且不写盘；响应 `{profileId,sourceId,revision}` |
+| `/api/model-source/select` | `{profileId}` 或 `{profileId:null}` | 只把**助手**指到一条已保存配置：仅写配置文档的 `assistantProfileId`，不动 `selectedMode`/active `sourceId`，因此分析线（本地或已启用的 API 来源）原样运行；`null` 表示清除助手专属档案、回到「跟随分析」，此时响应里的 `sourceId` 回读分析选择；未知 id / 空串 / 非字符串返回 400 且不写盘；响应 `{profileId,sourceId,revision}` |
 
 `activate` 的三种入参互斥：`{mode:"local"}`、`{mode:"api",profileId}`（切换到已保存配置，**跳过探测**，因此是瞬时的）、`{mode:"api",...连接字段}`（必要时先探测再落盘）。带 `profileId` 时只允许 `mode`+`profileId` 两个键。
 
@@ -473,6 +473,8 @@ styleCount, style{6 维}, axes{EI,SN,TF,JP: [left,right,evidence,insufficient]},
 
 `chat` 域另有两个「选择消息」态字段：`messagePicking`（是否处于手选态）与 `selectedMessageIds`（勾选的消息 id 集合）。二者不落盘，只活在当前会话窗口内，见 §12.14。
 
+**AI 忙碌指示（`ai-busy`）**：三处长时间等待的状态行在文字前加转圈——逐条标签/意图识别的 `#analysisStatus`（排队 / 分析中 / 提交中）、API 画像的 `#apiPortraitStatus`（读取会话 / 排队 / 分析 / 提交）、生成回复选项的 `#guidanceStatus`（生成中）。实现是给既有状态节点 toggle `ai-busy` class，不新增元素，既有文案写法不变；`classList` 调用带可选链（`?.classList?.toggle?.` / `?.remove?.`）以兼容测试里的 DOM 桩。错误与提示态显式清除该 class（失败后不继续转圈）。样式是 11px 圆环（`chatui/style.css` 的 `.ai-busy::before`），`prefers-reduced-motion` 下不转。回归：`tests/ai-busy-status.test.cjs`（三处接线、清除逻辑、减弱动效）。
+
 ---
 
 ## 6. 主要业务流程与调用链路
@@ -480,7 +482,7 @@ styleCount, style{6 维}, axes{EI,SN,TF,JP: [left,right,evidence,insufficient]},
 ### 6.1 启动链路
 
 ```
-npm start / WechatVibe.exe
+npm start / Start.bat（直接调用 electron.exe，跳过 npm 包装）/ WechatVibe.exe
  → desktop-main.cjs：设 userData、解析 python/node 解释器、删除继承的 CHATUI_PORT
  → execFile(start-real-client.py --no-open --json)
      → launch_mutex（Windows 命名互斥，30 s）
@@ -495,6 +497,10 @@ npm start / WechatVibe.exe
 ```
 
 失败处理：launcher 启动失败会主动停止自己创建并记录在案的 bridge（仅按 PID 创建时间 + 镜像路径 + argv + instanceId + control token 校验，绝不按进程名或端口 sweep）；Electron 初始化失败时只关闭本次创建的 bridge（`bridgeCreated` 标志）；复用已有服务时不会把它当成本次新建去关闭。
+
+**启动身份校验（`8242ab5`）**：`scripts/start-real-client.py` 在 `WECHATVIBE_SHELL_PID` 存在时，要求该 pid 出现在当前进程的**祖先链**上（最多上溯 4 层），不再要求等于 `psutil.Process().ppid()`。原因：venv 的 `python.exe` / `py` launcher 会多起一层解释器，launcher 的直接父进程是中间 `python.exe` 而不是 Electron 主进程，旧判定会把正常的 `npm start` 误判成 `Desktop startup identity is invalid`，界面只显示通用的「本地服务未就绪」。安全意图不变（仍必须由本应用 shell 拉起），`InstallationGate.register(role="shell", pid=…)` 仍注册该 shell pid；非法 pid 字符串（`int()` 失败）同样报这个错。自带 `runtime/python` 的打包版没有中间层，行为不变。
+
+**失败可诊断**：`scripts/desktop-main.cjs` 的失败路径不再吞掉 launcher 输出。`recordLaunchFailure()` 把 `error.message` / stderr / stdout 以 `[ISO 时间戳]` 前缀追加写入 `<root>/logs/desktop-launch.log`，弹窗正文附最后一条非空行（截断 300 字符）；目录只读或写日志失败时仍弹窗，只是没有那一行。三条失败路径（`execFile` 报错、launcher JSON 不合法、shell 加载失败）都走这条记录。
 
 ### 6.2 本地消息标签 / 画像分析链路（主路径）
 
@@ -654,7 +660,11 @@ POST /api/model-guidance
 - **助手自己生成**：内置技能 `builtin-skill:guidance`（「潜台词与沟通建议」）+ 内置助手 `builtin:guidance`（「沟通参谋」），定义在 `bridge/advisor_contracts.py`；助手用自己的模型与托管资料产出解读与建议。因此 `POST /api/model-guidance` 目前**没有界面入口**。
 - **引用存量结果**：`result_store.api_guidance_latest(account, user)` 按会话取最新一条（不限模型来源；会话级 `subject` 优先于成员级；坏行直接删掉），`guidance_contracts.guidance_material(saved)` 把它渲染成一段参考文字，`advisor_service._guidance_material()` 附在托管资料末尾并从**同一 token 预算**里扣除。没有存量结果**且本轮选了该技能**时，改附一行 `GUIDANCE_MISSING_NOTE`，让助手直接分析当前会话。
 
-**助手进度提示**：`advisor_service._run_worker_bound()` 在「读取资料 → 整理上下文 → 调用模型」三处各发一条 `status` 事件（`state` 为 `reading` / `preparing` / `thinking`），文案只含阶段名和**已读取的消息条数**，不含聊天原文、提示词或模型推理。`chatui/advisor-steps.js` 负责校验、去重与截断（最多 4 条），`advisor-frame.js` 渲染到 `#advisorSteps`；收到首个 `text` 事件（`run.phase == "answering"`）后整块移除，避免和正文抢位置。
+**助手进度提示**：`advisor_service._run_worker_bound()` 在「读取资料 → 整理上下文 → 调用模型」各发一条 `status` 事件，`state` 依次为 `reading`（正在读取会话资料）/ `preparing`（已读取 N 条消息，正在整理上下文）/ `thinking`（正在调用模型）；压缩较早历史时 `_compactor` 额外发一条 `compacting`（正在整理较早的聊天记录…）。`_step()` 只发状态标签，`_on_event()` 按 `(state,text,attempt,next,skillId)` 去重。文案只含阶段名与已读取消息条数，不含聊天原文、提示词、工具参数与模型推理。
+
+前端 `chatui/advisor-steps.js` 是同一契约的 UI 侧复刻：`STEP_STATES` 白名单 `reading` / `preparing` / `compacting` / `thinking`，`MAX_STEPS=4`、`MAX_LABEL=120`；重复标签只保留一次，超长或非法状态直接丢弃。`chatui/advisor-frame.js` 渲染到 `#advisorSteps`（`role=status`、`aria-live="polite"`），最后一条标 `active` 并带 spinner；收到首个 `text` 事件（`run.phase == "answering"`）后整块移除。`prefers-reduced-motion` 下不转。
+
+测试：`tests/advisor-steps.test.cjs`（顺序 / 去重 / 上限 / 畸形输入 / 帧接线）与 `bridge/test_advisor_boundaries.py`（三段步骤存在且顺序为 reading → preparing → thinking，标签不回显用户消息与聊天正文）。
 
 ### 6.6 会话添加与「信息列表」
 
@@ -930,7 +940,7 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 | --- | --- |
 | `.local/real-client-data/accounts.json` | `{version:1, accounts:[{accountId, account, workdir, wechatId, nickname}]}`，按 accountId 排序，临时文件 + `os.replace` 原子写 |
 | `.local/real-client-data/<sha256(account)>.sqlite3` | 全部结果与进度 |
-| `.local/real-client-runtime/api-model-source.json` | `{version:2, sourceId, selectedMode, profiles:[{id,name,protocol,baseUrl,model,contextTokens,encryptedKey}], sourceIds{fingerprint→id}}`；`version:1` 的单个 `api` 对象读取时自动迁移为 `profiles` 的第一项 |</new_string>
+| `.local/real-client-runtime/api-model-source.json` | `{version:2, sourceId, selectedMode, profiles:[{id,name,protocol,baseUrl,model,contextTokens,encryptedKey}], sourceIds{fingerprint→id}}`；`version:1` 的单个 `api` 对象读取时自动迁移为 `profiles` 的第一项；`assistantProfileId` 可缺省，表示助手跟随分析选择 |
 | `.local/real-client-runtime/local-model-source.json` | `{schema:1, path}`（legacy: `model-source.json`） |
 | `.local/real-client-runtime/inference-settings.json` | `{"provider":"cpu"|"gpu"}`，默认 `gpu` |
 | `.local/real-client-runtime/analysis-workers.json` | `{workers, elastic}` |
@@ -1094,10 +1104,20 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 6. **潜台词与沟通建议并入助手**：新增内置技能 `builtin-skill:guidance` 与内置助手 `builtin:guidance`（`bridge/advisor_contracts.py`），助手可引用存量结果（`result_store.api_guidance_latest` → `guidance_contracts.guidance_material` → `advisor_service._guidance_material`，占同一 token 预算），画像页 `#guidanceCard` 及其控制、`analyzeSelfStyle` 开关与相关样式、脚本全部移除 —— 见 §6.5 与 §12.11。
 7. **链接不进分析**：`bridge/message_input.py` 新增 `strip_links` / `analysis_text` / `has_analysis_content`（只去 `http(s)://` 与 `www.` 开头的链接，**裸域名与纯标点照旧**），所有送模型的文本经 `prepare_item` / `to_wire` 剥离，四条链路（本地标签、API 标签、沟通建议、画像）与批处理引擎的「可分析」判定统一改用它；前端 `chatui/app.js` 复刻同一规则（`hasAnalyzableText`）。界面原文、已存结果与画像 digest 仍是原文 —— 见 §6.11 与 §12.15。
 
-核对过的一致性状态（截至 2026-10-10）：
+**2026-10-18 追加**（5 个提交，都不改分析结果口径）：
+
+8. **助手专用模型档案**（`16d9587`）：新增 `POST /api/model-source/select`，只写 `assistantProfileId`，不动 `selectedMode` 与活动 `sourceId` —— 见 §5.2、§12.13。
+9. **助手窗口「切换模型档案」入口**（`87fbdee`；工作树又把它从标题栏移到输入栏，并补了「跟随分析」回落）：模型选择条由宿主下发档案，切换后只重读 `/api/advisor/catalog` —— 见 §12.13。
+10. **dev/venv 启动身份误判修复**（`8242ab5`）：`WECHATVIBE_SHELL_PID` 改判祖先链（最多 4 层）；`desktop-main.cjs` 的失败输出写入 `logs/desktop-launch.log` 并在弹窗附最后一行 —— 见 §6.1。
+11. **助手生成时实时展示执行步骤**（`2134572`）：`reading` / `preparing` / `thinking`（压缩时 `compacting`）状态事件 + `chatui/advisor-steps.js` / `advisor-frame.js` —— 见 §6.5。
+12. **意图识别 / 人物画像 / 回复选项加载指示**（`9db75cf`）：三处状态行挂 `ai-busy` 圆环，不新增元素 —— 见 §5.7。
+
+发布状态：`0eb24bc` 已发布 reviewed 1.3.5（`package.json` version `1.3.5`）。
+
+核对过的一致性状态（截至 2026-10-18）：
 
 - 三块的回归都在：`tests/message-picking.test.cjs`、`tests/model-source-settings.test.cjs`、`tests/api-mbti-gate.test.cjs`、`bridge/test_model_source.py`、`bridge/test_real_backend.py`；`tests/api-persona-ui.test.cjs` 的 MBTI 夹具已改为提供 `mbtiEvidenceCount` 与 `mbtiBasis`。
-- `npm run typecheck` 干净、`npm run test:node` **596/596**；Python 侧除上游自带的 14 个 `test_advisor_*.py`（在纯净 `upstream/main` 上失败数完全相同，本机环境所致）外，43 个文件全过（含两个慢文件）。
+- `npm run typecheck` 干净、`npm run test:node` **793/793**（2026-10-24 在本工作树实测，含未提交改动）；Python 侧沿用 2026-10-10 的结论：除上游自带的 `test_advisor_*.py`（16 个，在纯净 `upstream/main` 上失败数完全相同，本机环境所致）外全过（含两个慢文件）。本轮只改文档，未复跑 Python 全量。
 - 新增运行时模块已在打包白名单里：`bridge/api_pool.py`、`bridge/guidance_contracts.py`（本 fork）与上游带来的 `bridge/advisor_*.py`、`bridge/api_portrait_ledger.py`，`scripts/stage-real-client.py` 已含这些名字。
 - tokenizer 性能优化（`f83513a` / `959b4e0`）已随上游 1.3.0 收编，本分支现取上游实现。
 
@@ -1217,8 +1237,15 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 - **密钥沿用**：`resolve_key(protocol, baseUrl, None)` 遍历所有档案，找**协议与 host/path 完全一致**的那条（活动档案优先）。`_upsert_profile` 只在 protocol 与 baseUrl 都未改变时才复用旧密钥，因此「留空沿用已保存密钥」不会把 A 站的密钥带到 B 站。
 - **删除活动档案必须回落本地**：`model_source_profile_delete` 发现删掉的正是 `sourceId` 时，要把 `active_*` 复位为 `LOCAL_SOURCE_ID` 并调 `_cancel_api_source_work_locked()`，否则 worker 会继续指向一份已不存在的配置。
 - **版本迁移**：`version:1` 的单个 `api` 对象在 `_decode_profiles` 中变成 `profiles` 的第一项，并沿用原 `sourceId`（历史缓存键因此不变），下次写入即升级为 `version:2`。
+- **助手专用档案（`16d9587`）**：新增 `POST /api/model-source/select`，body 只有 `{profileId}`；只写配置文档的 `assistantProfileId`，**不动** `selectedMode` 与活动 `sourceId`，因此分析线（本地或已启用的 API 来源）原样运行；未知或已删除 id 返回 400 且不写盘；响应 `{profileId,sourceId,revision}`。`profileId:null` 表示回到「跟随分析」（`clear_assistant_profile`，此时 `sourceId` 回读分析选择）。`assistant_selection()` 在没有 pin 或 pin 失效时回落到分析选择，`_read` 遇到失效的 `assistantProfileId` 只忽略，不让整份配置不可读。
+- **助手窗口的模型选择条（`87fbdee`，工作树已从标题栏移到输入栏左侧）**：文案回答「现在是谁在回答」——已 pin 档案显示档案名，否则显示「跟随分析 · <分析线当前模型名>」，都没有时显示「未配置模型」，切换中显示「切换中…」并禁用。宿主读 `GET /api/model-source`（返回 `profiles`、`assistantProfileId`，以及分析线当前档案 `api`；`api` 只有 `id/protocol/baseUrl/model/contextTokens/hasKey`，**没有 `name`**，跟随文案必须拿 `api.id` 去 `profiles` 里取 `name`）经 `ADVISOR_SET_MODELS` 下发给 iframe，iframe 不发网络请求；菜单第一项固定是「跟随分析」（发 `profileId:null`，清掉 pin），其余按 `name` / `model` / `protocol` 列出已保存档案，点当前项是 no-op。iframe 发 `ADVISOR_SELECT_MODEL {profileId}`，宿主 POST 上面的端点，成功后重读 `GET /api/advisor/catalog`（军师引擎可用性跟着助手档案变）并重新下发菜单；**不**调用 `/api/model-source/activate`，也不产生 provider 调用。
+- **新建对话**：输入框左下角的 `#btnNewThread` 发 `ADVISOR_NEW_THREAD`（payload 为空）→ `scripts/advisor-companion.cjs` 的 `INBOUND`（早已登记）→ 宿主 `validFrameRequest` 放行并调用 `newThread()` → `POST /api/advisor/new-thread`，与输入 `/reset` 走同一条路。当前对话已有消息时按钮先进入 `data-confirm="1"` 的「确认新建」态，4 秒后自动回退，第二次点击才真正提交；没有消息时一次点击即生效。
+- **聊天记录加密落盘**：`AccountDatabase` 持有 `payload_crypto.PayloadCipher`，`messages.text`、`requests.message`、`context_messages.text/raw`、`summaries.text` 一律先 `protect()` 再写库，读时 `_open()` 解密；带 `wv1:` 前缀的是密文，其余按旧明文照常返回。首次用密文打开旧库时 `_seal_existing_text()` 全表重写一遍，并在 `meta` 表写 `text-sealed=1`，之后不再扫描。密钥与分析结果同一个（`default_cipher(root)`），`_connect()` 里先 `warm()`，避免首条写入撞上 DPAPI + fsync。`PayloadCipher._load_key()` 增加「密钥文件与格式标记的 (size, mtime_ns) 未变就用内存密钥」的快速路径——否则每列都要走进程锁 + 祖先链 `stat`，单次 5ms，整轮直接慢一个数量级。
+- **带入此前的对话**：`POST /api/advisor/run` 接受可选布尔 `memory`（默认 false，由前端「记忆」胶囊显式给出）。`AdvisorService._memory_text()` 调 `AccountDatabase.recent_contact_turns(user, agent_id, exclude_thread_id)` 取该联系人**其它**线程最近的用户/助手轮次（按 `MEMORY_TURNS=20`、`MEMORY_CHARS=4000` 裁剪，超出丢最早一轮），拼成 `【此前的对话】…仅作背景参考` 块，放在 `contextFileText` 最前面，并从同一份预算里扣掉，不挤占当前聊天资料。iframe 的开关按 `advisor_memory_v1:<account>:<user>:<agentId>` 存在 localStorage。
+- **跨进程白名单必须同步**：主进程 `scripts/advisor-companion.cjs` 的 `OUTBOUND` / `INBOUND` 是 IPC 硬白名单，`ADVISOR_SET_MODELS`（主 → iframe）与 `ADVISOR_SELECT_MODEL`（iframe → 主）都必须登记。漏登记时消息被静默丢弃，表现是「菜单永远空的、点了也没反应」，而渲染层单测仍然全绿——这类问题只有 `tests/advisor-companion.test.cjs` 的双向用例能拦住。
+- **契约**：`bridge/model_source.py` 的 `select_assistant_profile` / `clear_assistant_profile` / `assistant_selection`、`backend_service.model_source_select`、`bridge/test_model_source_select.py`（8 例：分析模式与 sourceId 不变、分析档案不被顶掉、回落、引擎读到自己那份、选择不调用 provider、`profileId:null` 清 pin 后回到跟随分析、非法输入不写盘、HTTP 400/200）、`tests/advisor-ui.test.cjs`（请求序列与「不切分析模式」不变量）。
 
-**改动清单**：`bridge/model_source.py`（存储与校验）→ `backend_service.py` 的 `model_source_activate` / `model_source_profile_save` / `model_source_profile_delete` / `model_source_clear_key`（语义与原子性）→ `bridge/real_http.py`（路由白名单 + 分支）→ `chatui/index.html`（`#selectApiProfile`、`#inputApiProfileName`、`#modelBadge*`、`#apiProfileDeleteConfirm`）→ `chatui/app.js`（`modelProfiles()`、`resolveEditedProfileId()`、`postApiModelSource()`、`renderModelBadgeMenu()`）。前端仍禁止 innerHTML，菜单项用 `document.createElement` 逐个构造；删除沿用账号管理的「二次确认」交互而非 `window.confirm`。
+**改动清单**：`bridge/model_source.py`（存储与校验；`assistantProfileId` 与 `select_assistant_profile` / `clear_assistant_profile` / `assistant_selection`）→ `backend_service.py` 的 `model_source_select` / `model_source_activate` / `model_source_profile_save` / `model_source_profile_delete` / `model_source_clear_key`（语义与原子性）→ `bridge/real_http.py`（路由白名单 + 分支，含 `/api/model-source/select`）→ `chatui/index.html`（`#selectApiProfile`、`#inputApiProfileName`、`#modelBadge*`、`#apiProfileDeleteConfirm`）→ `chatui/app.js`（`modelProfiles()`、`resolveEditedProfileId()`、`postApiModelSource()`、`renderModelBadgeMenu()`）→ `chatui/advisor.js`（`loadModelProfiles()`、`selectModelProfile()`）→ `chatui/advisor-frame.js`（`renderModels()`、`chooseModel()`、`modelOptionRow()`）。前端仍禁止 innerHTML，菜单项用 `document.createElement` 逐个构造；删除沿用账号管理的「二次确认」交互而非 `window.confirm`。
 
 ### 12.14 修改「选择消息」分析（手选若干条只分析它们）
 
@@ -1231,36 +1258,6 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 - **选择态生命周期**：切换会话（`switchSession`）、账号重置（`resetAccountView`）、进入历史视图（`enterHistoryView`）都会退出并清空选择；退出选择态本身也会清空（选择属于当时那个窗口）。
 - **范围边界**：手选只产出逐条消息标签（本地 `fine_results_v1` / API `api_insights_v1`），不改画像累计与沟通建议；后台「分析已添加的会话」开关（`incremental` / 全程扫描）不受影响，要不要一起关是用户的设置，不是本功能能替用户决定的。
 - **回归**：`tests/message-picking.test.cjs`（前端行为 + 三处抑制的接线）、`bridge/test_real_backend.py` 的 `test_http_analyze_accepts_hand_picked_targets`（HTTP 边界 202/400）、`test_selected_targets_analyse_only_the_picked_ids` / `test_selected_targets_outside_the_window_are_rejected_before_queueing` / `test_selection_does_not_narrow_the_next_window_run`。
-
----
-
-## 13. 测试与验证
-
-| 命令 | 覆盖内容 |
-| --- | --- |
-| `npm test` | `node scripts/run-all-tests.cjs`：**先 typecheck，再三套测试并行**（node / scripts / python），输出按耗时排序的汇总；全部通过打印 `ALL_SUITES_PASSED` |
-| `npm run test:quick` | 同上但 `--skip-typecheck --only=node,scripts`，用于只改了运行路径时 |
-| `npm run test:serial` | 原串行链：`typecheck` → `test:node` → `test:scripts` → `test:python` |
-| `npm run typecheck` | `tsc --noEmit -p tsconfig.electron.json`（只含 `electron/**` 与 `shared/**`） |
-| `npm run test:node` | 33 个 TS/CJS 测试：分词器、模型连接器、分类器、契约、UI 逻辑 |
-| `npm run test:python` | `scripts/run-python-tests.py`：三组（`bridge` / `scripts` / `native-reader`）**并行**、组内文件串行（多个 bridge 测试共用项目 `.local` 目录，并行会互相竞争）；某组失败不掩盖其他组结果，全部通过打印 `ALL_PYTHON_TESTS_PASSED` |
-| `npm run test:scripts` | `scripts/run-node-script-tests.cjs`（桌面/更新/启动器脚本） |
-| `npm run test:model` | `tsx scripts/test-model.ts`，真实加载 ONNX 跑中文推理；**需先下载模型**，并设 `LAYA_MODEL_DIR` 指向已安装客户端的模型目录（如 `D:\program\wechat\win-unpacked\resources\client\.local\models\laya`）；基线输出 affinity 73 |
-| `npm run test:recovery` | 桌面、服务恢复、账号存储、启动器 |
-| `npm run build:portable` | 完整便携构建 |
-| `python scripts/run-project-python.py scripts/test-start-real-client.py` | launcher 单元测试 |
-
-本地环境注意：README 要求 Python 3.14，但本机只有 3.13；用 `py -3.13 -m venv .venv` + `pip install --no-deps -r python-requirements.lock.txt`，运行时设 `WECHATVIBE_PYTHON` 指向该解释器。
-
-合成测试覆盖账号作用域、任务失效、流式标签、纯标点、启动失败回收、静态 MIME、更新保留模型等路径；**它们不能替代真实服务商或用户设备的验收**。
-
-手选消息的范围与守卫由 `tests/message-picking.test.cjs`（前端行为 + `scheduleRecent`/`ensureApiInsights`/`submitManualRecent` 三处抑制的接线）与 `bridge/test_real_backend.py` 的 `test_http_analyze_accepts_hand_picked_targets` + 三个 `test_selected_targets_*` / `test_selection_does_not_narrow_the_next_window_run` 钉住（后者已用「关掉守卫」验证过确实会失败）。
-
-右键单条重算（§12.16）由 `bridge/test_message_recompute.py`（只删这一条：相邻消息 / 另一会话 / 另一来源三组对照 + HTTP 200/400）与 `tests/message-context-menu.test.cjs`（菜单接线、禁用原因、`/api/analysis-target/forget` 的请求体、**先忘后提交**的时序、视图变化后不提交、并发只发一次）钉住。把 `clear_message` 改成只清一张表、或去掉 forget 调用，两处都会失败。
-
-链接不进分析（§6.11）由四处钉住：`bridge/test_message_input.py` 的 `LinkAndPlaceholderTests`（纯规则：只去协议/www、保留尾部标点、裸域名不动、占位与纯标点的边界、投影副本与 `to_wire`）、`bridge/test_real_backend.py:test_a_message_that_is_only_a_link_is_not_analysed`（本地：链路目标跳过 + 送给模型的文本无链接）、`bridge/test_api_insights.py` 的 `test_a_message_that_is_only_a_link_is_not_a_target_or_sent` 与 `test_guidance_is_insufficient_when_the_window_only_holds_a_link`（API 标签目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs` 的 `keeps a message that is only a link out of every analysis path`（前端判定 + 手选）。把 `has_analysis_content` 改回旧行为可确认这四处确实会失败。
-
----
 
 ### 12.15 修改「链接是否参与分析」
 
@@ -1301,6 +1298,40 @@ POST /api/analysis-target/forget {account,user,sourceId,messageId}
 - **竞态**：请求期间 `chatState.generation` / 账号 / 会话 / 来源任一变化就放弃后续提交（那份结果已不属于当前视图）；`recomputeBusy` 保证同时只有一个 forget 请求。
 - **回归**：`bridge/test_message_recompute.py`（存储只删这一条 + HTTP 契约 200/400）、`tests/message-context-menu.test.cjs`（菜单接线、禁用原因、请求体、先忘后提交的时序、视图变化后不提交、并发只发一次）。把 `clear_message` 改成只清一张表、或去掉 forget 调用，两处测试都会失败。
 
+---
+
+## 13. 测试与验证
+
+| 命令 | 覆盖内容 |
+| --- | --- |
+| `npm test` | `node scripts/run-all-tests.cjs`：**先 typecheck，再三套测试并行**（node / scripts / python），输出按耗时排序的汇总；全部通过打印 `ALL_SUITES_PASSED` |
+| `npm run test:quick` | 同上但 `--skip-typecheck --only=node,scripts`，用于只改了运行路径时 |
+| `npm run test:serial` | 原串行链：`typecheck` → `test:node` → `test:scripts` → `test:python` |
+| `npm run typecheck` | `tsc --noEmit -p tsconfig.electron.json`（只含 `electron/**` 与 `shared/**`） |
+| `npm run test:node` | 61 个 TS/CJS 测试（`tests/` 下 21 个 `*.test.ts` + 40 个 `*.test.cjs`）：分词器、模型连接器、分类器、契约、UI 逻辑 |
+| `npm run test:python` | `scripts/run-python-tests.py`：三组（`bridge` / `scripts` / `native-reader`）**并行**、组内文件串行（多个 bridge 测试共用项目 `.local` 目录，并行会互相竞争）；某组失败不掩盖其他组结果，全部通过打印 `ALL_PYTHON_TESTS_PASSED` |
+| `npm run test:scripts` | `scripts/run-node-script-tests.cjs`（桌面/更新/启动器脚本） |
+| `npm run test:model` | `tsx scripts/test-model.ts`，真实加载 ONNX 跑中文推理；**需先下载模型**，并设 `LAYA_MODEL_DIR` 指向已安装客户端的模型目录（如 `D:\program\wechat\win-unpacked\resources\client\.local\models\laya`）；基线输出 affinity 73 |
+| `npm run test:recovery` | 桌面、服务恢复、账号存储、启动器 |
+| `npm run build:portable` | 完整便携构建 |
+| `python scripts/run-project-python.py scripts/test-start-real-client.py` | launcher 单元测试 |
+
+本地环境注意：README 要求 Python 3.14，但本机只有 3.13；用 `py -3.13 -m venv .venv` + `pip install --no-deps -r python-requirements.lock.txt`，运行时设 `WECHATVIBE_PYTHON` 指向该解释器。
+
+合成测试覆盖账号作用域、任务失效、流式标签、纯标点、启动失败回收、静态 MIME、更新保留模型等路径；**它们不能替代真实服务商或用户设备的验收**。
+
+手选消息的范围与守卫由 `tests/message-picking.test.cjs`（前端行为 + `scheduleRecent`/`ensureApiInsights`/`submitManualRecent` 三处抑制的接线）与 `bridge/test_real_backend.py` 的 `test_http_analyze_accepts_hand_picked_targets` + 三个 `test_selected_targets_*` / `test_selection_does_not_narrow_the_next_window_run` 钉住（后者已用「关掉守卫」验证过确实会失败）。
+
+右键单条重算（§12.16）由 `bridge/test_message_recompute.py`（只删这一条：相邻消息 / 另一会话 / 另一来源三组对照 + HTTP 200/400）与 `tests/message-context-menu.test.cjs`（菜单接线、禁用原因、`/api/analysis-target/forget` 的请求体、**先忘后提交**的时序、视图变化后不提交、并发只发一次）钉住。把 `clear_message` 改成只清一张表、或去掉 forget 调用，两处都会失败。
+
+链接不进分析（§6.11）由四处钉住：`bridge/test_message_input.py` 的 `LinkAndPlaceholderTests`（纯规则：只去协议/www、保留尾部标点、裸域名不动、占位与纯标点的边界、投影副本与 `to_wire`）、`bridge/test_real_backend.py:test_a_message_that_is_only_a_link_is_not_analysed`（本地：链路目标跳过 + 送给模型的文本无链接）、`bridge/test_api_insights.py` 的 `test_a_message_that_is_only_a_link_is_not_a_target_or_sent` 与 `test_guidance_is_insufficient_when_the_window_only_holds_a_link`（API 标签目标与 payload、沟通建议 `insufficient`）、`tests/message-picking.test.cjs` 的 `keeps a message that is only a link out of every analysis path`（前端判定 + 手选）。把 `has_analysis_content` 改回旧行为可确认这四处确实会失败。
+
+助手进度步骤（§6.5）由 `tests/advisor-steps.test.cjs`（顺序、去重、`MAX_STEPS` 上限、畸形输入、帧接线与「回答开始后移除」）与 `bridge/test_advisor_boundaries.py:test_progress_steps_are_published_without_echoing_the_message`（三段步骤存在且 reading → preparing → thinking 有序，标签既不含用户消息也不含聊天正文）钉住。删掉任一 `_step()` 调用、或让标签回显正文，两处都会失败。
+
+AI 忙碌指示（§5.7）由 `tests/ai-busy-status.test.cjs` 钉住：`#analysisStatus` / `#apiPortraitStatus` / `#guidanceStatus` 三处接线（含 `text(...)` 之后紧跟 toggle 的顺序）、错误与提示态显式清除、`prefers-reduced-motion` 下 `animation: none`。去掉任一处的 toggle 或清除调用，用例会失败。
+
+---
+
 ## 14. 快速索引：按问题查文件
 
 | 问题 | 去哪看 |
@@ -1335,3 +1366,6 @@ POST /api/analysis-target/forget {account,user,sourceId,messageId}
 | 分层约定（权威） | `docs/backend-architecture.md` |
 | 手选消息的分析范围 | `chatui/app.js`（`pickableMessage`/`pickedWindow`/`submitPickedMessages`）、`bridge/backend_service.py`（`_resolve_selected_targets`/`_run_selected_targets`）、`bridge/real_http.py`（`/api/analyze` 的 `targetIds`） |
 | 右键单条重算（忘掉一条结果再重算） | `chatui/app.js`（`messageMenuReason`/`recomputeMessage`/`forgetMessageAnalysis`）、`bridge/backend_service.py`（`forget_message_analysis`）、`bridge/result_store.py`（`clear_message`）、`bridge/real_http.py`（`/api/analysis-target/forget`） |
+| 助手进度步骤（reading / preparing / compacting / thinking） | `bridge/advisor_service.py`（`_run_worker_bound`/`_step`/`_compactor`/`_on_event`）、`chatui/advisor-steps.js`、`chatui/advisor-frame.js`（`renderSteps`）、`chatui/advisor.css`（`.advisor-step*`） |
+| AI 忙碌指示（`ai-busy` 圆环） | `chatui/app.js`（`renderApiInsightStatus`/`loadApiPortrait`/`startApiPortrait`/`renderGuidance`/`syncGuidanceAction`）、`chatui/style.css`（`.ai-busy`） |
+| 助手专用模型档案（只切助手，不动分析） | `bridge/model_source.py`（`select_assistant_profile`/`clear_assistant_profile`/`assistant_selection`）、`bridge/backend_service.py`（`model_source_select`）、`chatui/advisor.js`（`loadModelProfiles`/`selectModelProfile`）、`chatui/advisor-frame.js`（`renderModels`/`chooseModel`） |

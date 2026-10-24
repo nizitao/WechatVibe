@@ -24,7 +24,7 @@ from contextlib import contextmanager
 
 from advisor_contracts import (
     GUIDANCE_SKILL_ID, HISTORY_BUDGET_PERCENT, MAX_SKILL_CONTENT, MAX_USER_MESSAGE,
-    TERMINAL_RUN_STATES, AdvisorError, char_budget,
+    TERMINAL_RUN_STATES, AdvisorError, char_budget, single_line,
     model_fingerprint, normalize_event, public_run, safety_margin,
     terminal_event, valid_identifier, valid_request_id, valid_scope_value,
     valid_user_message,
@@ -36,6 +36,7 @@ from backend_contracts import (
     LOCAL_SOURCE_ID, ModelSourceUnavailable,
 )
 from guidance_contracts import GUIDANCE_MISSING_NOTE, guidance_material
+from payload_crypto import default_cipher
 
 MAX_EVENT_BATCH = 500
 MAX_RUNS_IN_MEMORY = 64
@@ -100,7 +101,9 @@ class AdvisorService:
         # conversation. Injected by the parent integration so this module never reaches into
         # the analysis result store itself.
         self.guidance_provider = guidance_provider
-        self.stores = AdvisorStoreRoot(self.root)
+        # Every chat-bearing column in the advisor projection is sealed with the runtime's
+        # DPAPI-protected key; a missing key is a loud error, never a silent plaintext write.
+        self.stores = AdvisorStoreRoot(self.root, cipher=default_cipher(self.root))
         self.context = ContextProjection(self.stores, source)
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
@@ -395,7 +398,39 @@ class AdvisorService:
         return {**self.catalog(), "importedAgentId": result["agent"]["id"], "created": result["created"]}
 
     # ------------------------------------------------------- threads/context
-    def thread(self, account, user, agent_id):
+    def thread(self, account, user, agent_id, thread_id=None):
+        account = self._require_scope(account)
+        user = valid_scope_value(user, "user")
+        if not valid_identifier(agent_id):
+            raise AdvisorError("invalid-request", "invalid agent id")
+        if self.stores.config.agent(agent_id) is None:
+            raise AdvisorError("agent-unknown", "Agent 不存在")
+        if thread_id is not None and not valid_identifier(thread_id):
+            raise AdvisorError("invalid-request", "invalid thread id")
+        database = self.stores.account(account)
+        with self.condition:
+            self._require_scope(account)
+            row = None
+            if thread_id is not None:
+                row = database.thread(thread_id)
+                # A saved conversation only ever belongs to one contact and one agent.
+                if row is not None and (row["user"] != user or row["agent_id"] != agent_id):
+                    row = None
+            if row is None:
+                if thread_id is not None:
+                    raise AdvisorError("thread-unknown", "会话不存在或不属于该 Agent")
+                row = database.latest_thread(user, agent_id)
+                if row is None:
+                    row = database.create_thread(user, agent_id, self._source_id())
+        run = database.latest_run(row["id"]) if row else None
+        with self.condition:
+            live_run = self._runs.get(run["id"]) if run else None
+        return {"thread": self._thread_payload(account, database, row),
+                "context": self._context_status(self.context.snapshot(account, user)),
+                "run": live_run.public() if live_run else self._public_run(run) if run else None}
+
+    def threads(self, account, user, agent_id):
+        """The contact's saved conversations, newest first, for the history picker."""
         account = self._require_scope(account)
         user = valid_scope_value(user, "user")
         if not valid_identifier(agent_id):
@@ -405,15 +440,19 @@ class AdvisorService:
         database = self.stores.account(account)
         with self.condition:
             self._require_scope(account)
-            row = database.latest_thread(user, agent_id)
-            if row is None:
-                row = database.create_thread(user, agent_id, self._source_id())
-        run = database.latest_run(row["id"]) if row else None
-        with self.condition:
-            live_run = self._runs.get(run["id"]) if run else None
-        return {"thread": self._thread_payload(account, database, row),
-                "context": self._context_status(self.context.snapshot(account, user)),
-                "run": live_run.public() if live_run else self._public_run(run) if run else None}
+            rows = database.list_threads(user, agent_id)
+        conversations = []
+        for row in rows:
+            title = row["title"] or row["preview"] or "新对话"
+            conversations.append({
+                "id": row["id"], "title": single_line(title, "title", 60, True) or "新对话",
+                "preview": single_line(row["preview"] or "", "preview", 60, True),
+                "previewRole": row["preview_role"] or "",
+                "messageCount": int(row["message_count"] or 0),
+                "createdAtMs": int(row["created_at_ms"] or 0),
+                "updatedAtMs": int(row["updated_at_ms"] or 0),
+            })
+        return {"threads": conversations}
 
     def prepare_context(self, account, user):
         account = self._require_scope(account)

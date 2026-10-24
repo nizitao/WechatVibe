@@ -25,17 +25,19 @@ echo ============================================================
 echo.
 
 rem ---------------------------------------------------------------- 1. Node
-where node >nul 2>nul
-if errorlevel 1 goto :no_node
-where npm >nul 2>nul
-if errorlevel 1 goto :no_npm
-for /f "usebackq delims=" %%v in (`node -v`) do set "NODE_VERSION=%%v"
-for /f "usebackq delims=" %%m in (`node -p "process.versions.node.split('.')[0]"`) do set "NODE_MAJOR=%%m"
-echo [1/4] Node.js %NODE_VERSION%、npm 已就绪
+rem One spawn instead of three: `node -v` + `node -p` + two `where` calls cost ~1 s here.
+for /f "usebackq tokens=1,2" %%a in (`node -p "process.versions.node + ' ' + process.versions.node.split('.')[0]" 2^>nul`) do (
+  set "NODE_VERSION=%%a"
+  set "NODE_MAJOR=%%b"
+)
+if not defined NODE_VERSION goto :no_node
+echo [1/4] Node.js %NODE_VERSION% 已就绪
 if defined NODE_MAJOR if %NODE_MAJOR% LSS 24 echo       [警告] 项目要求 Node.js 24.11.1，当前为 %NODE_VERSION%，可能出现异常。
 
 rem --------------------------------------------------------- 2. Node 依赖
 if exist "node_modules\" goto :node_modules_ok
+where npm >nul 2>nul
+if errorlevel 1 goto :no_npm
 echo [2/4] 未检测到 node_modules，正在执行 npm ci（首次运行约需数分钟）...
 call npm ci
 if errorlevel 1 goto :npm_failed
@@ -82,12 +84,14 @@ echo       已用 %PY_LAUNCH% 创建 .venv
 rem 固定使用项目虚拟环境，避免测试与构建误用系统 Python
 set "WECHATVIBE_PYTHON=%VENV_PY%"
 set "PATH=%VENV_DIR%\Scripts;%PATH%"
-"%VENV_PY%" -c "import sys;print('       Python','.'.join(map(str,sys.version_info[:3])),'(.venv)')"
+rem One interpreter start for both the version line and the dependency probe. find_spec()
+rem checks that the packages are importable without paying numpy's import cost on every start.
+"%VENV_PY%" -c "import sys,importlib.util as u;print('       Python','.'.join(map(str,sys.version_info[:3])),'(.venv)');sys.exit(0 if all(u.find_spec(m) for m in ('cffi','numpy','wechatauto')) else 3)"
+if errorlevel 3 goto :pip_install
 if errorlevel 1 goto :venv_broken
+goto :deps_ok
 
-rem 校验关键依赖，缺失时按锁文件补装
-"%VENV_PY%" -c "import cffi, numpy, wechatauto" >nul 2>nul
-if not errorlevel 1 goto :deps_ok
+:pip_install
 echo       正在安装 Python 依赖（pip install --no-deps -r %LOCK_FILE%）...
 "%VENV_PY%" -m pip install --no-deps -r "%LOCK_FILE%"
 if errorlevel 1 goto :pip_failed
@@ -115,18 +119,30 @@ if /i "%~1"=="--check" goto :check_only
 
 :launch
 echo.
-echo 正在启动 WechatVibe（npm start）...
+echo 正在启动 WechatVibe...
 echo 关闭应用窗口即结束本脚本。
 echo.
+rem Launch the Electron binary directly: the npm wrapper alone costs ~4 s on this machine
+rem (npm.cmd shim + CLI bootstrap) before Electron even starts.
+if not exist "node_modules\electron\dist\electron.exe" goto :launch_npm
+"node_modules\electron\dist\electron.exe" .
+set "EXIT_CODE=%ERRORLEVEL%"
+goto :launch_done
+
+:launch_npm
+where npm >nul 2>nul
+if errorlevel 1 goto :no_npm
 call npm start
 set "EXIT_CODE=%ERRORLEVEL%"
+:launch_done
 echo.
 if not "%EXIT_CODE%"=="0" (
-  echo [启动异常] npm start 退出码：%EXIT_CODE%
+  echo [启动异常] 客户端退出码：%EXIT_CODE%
   echo 可尝试：npm run start:service -- --no-open 单独启动本地服务查看日志。
   goto :finish
 )
 echo 客户端已退出。
+goto :finish
 
 :check_only
 echo 环境自检通过，未启动客户端（Start.bat --check）。

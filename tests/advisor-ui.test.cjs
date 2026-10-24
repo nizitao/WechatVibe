@@ -90,7 +90,8 @@ function host() {
 }
 function frame() {
   const env = environment(["agentName", "agentMenu", "btnAgentMenu", "advisorWelcome", "welcomeText", "advisorTimeline", "timelineControls",
-    "btnStopRun", "btnRetryRun", "advisorInput", "btnAdvisorSend", "btnModelMenu", "modelMenu", "modelName"]);
+    "btnStopRun", "btnRetryRun", "advisorInput", "btnAdvisorSend", "btnModelMenu", "modelMenu", "modelName", "advisorComposerNote",
+    "btnNewThread", "newThreadLabel", "btnMemory", "memoryLabel"]);
   env.window.parent = { postMessage: data => env.messages.push(json(data)) };
   vm.runInContext(frameSource, env.context);
   return env;
@@ -424,7 +425,9 @@ test("reset command only resets agent thread, bypasses model engine and preserve
   assert.equal(advisor.getDraft("account-a", "friend-a", "advisor"), "没有提交的普通草稿");
   assert.equal(advisor.getCachedThread("account-a", "friend-a", "advisor").id, "fresh-thread");
   assert.equal(advisor.currentRunId, null);
-  assert.ok(!frameHtml.includes("btnNewThread")); assert.ok(!frameHtml.includes("reset"));
+  // The composer now offers the same action as a button; the command must keep working too.
+  assert.ok(frameHtml.includes('id="btnNewThread"'));
+  assert.ok(!frameHtml.includes("reset"));
 });
 test("failed reset leaves command draft and previous content; successful reset clears only command", async () => {
   const env = host(), advisor = ready(env);
@@ -453,25 +456,53 @@ test("simple agent popover switches enabled template without management tabs or 
   assert.equal(advisor.activeAgentId, "empathy"); assert.equal(menu.hidden, true);
 });
 function modelProfiles() {
-  return [{ id: "a".repeat(32), name: "档案甲" }, { id: "b".repeat(32), name: "档案乙" }];
+  return [{ id: "a".repeat(32), name: "档案甲", model: "model-a" },
+    { id: "b".repeat(32), name: "档案乙", model: "model-b" }];
 }
-test("model menu renders host profiles, marks the assistant selection and ignores a repeat click", async () => {
+// Exactly what `ModelSourceStore.public()` returns: `api` carries no `name`, and the label
+// lives in `profiles[].name`. Fixtures that invented `api.name` hid a validator bug.
+function modelSourceDocument(overrides = {}) {
+  const [first, second] = modelProfiles();
+  const publicProfile = profile => ({ ...profile, label: profile.name, protocol: "chat_completions",
+    baseUrl: "https://api.test/v1", contextTokens: 8192, hasKey: true });
+  return { mode: "api", status: "active", sourceId: "source-a", label: "档案甲",
+    api: { id: first.id, protocol: "chat_completions", baseUrl: "https://api.test/v1",
+      model: "model-a", contextTokens: 8192, hasKey: true },
+    profiles: [publicProfile(first), publicProfile(second)],
+    assistantProfileId: null, ...overrides };
+}
+function modelRows(menu) {
+  return Array.from(menu.children).filter(child => child.dataset && child.dataset.modelOption);
+}
+function modelRowText(row) {
+  return [row.children[1].children[0].textContent, row.children[1].children[1].textContent];
+}
+test("composer picker lists follow-analysis and every saved model with its model id", async () => {
   const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
   advisor.modelProfiles = modelProfiles(); advisor.assistantProfileId = "b".repeat(32);
+  advisor.analysisLabel = "本地 Laya";
   const sent = [];
   hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
   advisor.initFrameHandshake(); advisor.syncModelsToFrame();
-  const menu = frameEnv.elements.get("modelMenu");
-  assert.equal(menu.children.length, 2);
-  assert.equal(menu.children[0].classList.contains("active"), false);
-  assert.equal(menu.children[1].classList.contains("active"), true);
-  assert.equal(menu.children[1].attributes["aria-checked"], "true");
-  assert.equal(frameEnv.elements.get("modelName").textContent, "档案乙");
+  const menu = frameEnv.elements.get("modelMenu"), chip = frameEnv.elements.get("modelName");
+  const rows = modelRows(menu);
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0].dataset.modelOption, "follow");
+  assert.deepEqual(modelRowText(rows[0]), ["跟随分析", "当前：本地 Laya"]);
+  assert.equal(rows[0].attributes["aria-checked"], "false");
+  assert.deepEqual(modelRowText(rows[1]), ["档案甲", "model-a"]);
+  assert.deepEqual(modelRowText(rows[2]), ["档案乙", "model-b"]);
+  assert.equal(rows[2].attributes["aria-checked"], "true");
+  assert.equal(rows[2].children[0].textContent, "✓");
+  assert.equal(chip.textContent, "档案乙");
+  assert.equal(frameEnv.elements.get("btnModelMenu").dataset.mode, "profile");
+  // The picker lives in the composer, not the title bar, so it is reachable while typing.
+  assert.ok(frameHtml.indexOf('id="btnModelMenu"') > frameHtml.indexOf('class="advisor-input-bar"'));
   await frameEnv.elements.get("btnModelMenu").dispatch("click"); assert.equal(menu.hidden, false);
-  await menu.children[1].dispatch("click"); assert.equal(menu.hidden, true);
+  await rows[2].dispatch("click"); assert.equal(menu.hidden, true);
   assert.equal(sent.filter(message => message.type === "ADVISOR_SELECT_MODEL").length, 0);
   await frameEnv.elements.get("btnModelMenu").dispatch("click");
-  await menu.children[0].dispatch("click");
+  await modelRows(menu)[1].dispatch("click");
   const selected = sent.filter(message => message.type === "ADVISOR_SELECT_MODEL");
   assert.equal(selected.length, 1);
   assert.deepEqual(selected[0].payload, { profileId: "a".repeat(32) });
@@ -493,9 +524,10 @@ test("profile switch posts select then refreshes the catalog and never touches t
   assert.deepEqual(calls[0].body, { profileId: "b".repeat(32) });
   assert.ok(!calls.some(call => call.url === "/api/model-source/activate"));
   assert.equal(advisor.assistantProfileId, "b".repeat(32));
-  const menu = frameEnv.elements.get("modelMenu");
-  assert.equal(menu.children[0].classList.contains("active"), false);
-  assert.equal(menu.children[1].classList.contains("active"), true);
+  const rows = modelRows(frameEnv.elements.get("modelMenu"));
+  assert.equal(rows[0].attributes["aria-checked"], "false");
+  assert.equal(rows[1].attributes["aria-checked"], "false");
+  assert.equal(rows[2].attributes["aria-checked"], "true");
   assert.equal(frameEnv.elements.get("modelName").textContent, "档案乙");
 });
 test("failed profile switch keeps the previous selection and reports a short error", async () => {
@@ -514,9 +546,9 @@ test("failed profile switch keeps the previous selection and reports a short err
   assert.deepEqual(calls, ["/api/model-source/select"]);
   assert.ok(!calls.includes("/api/model-source/activate"));
   assert.equal(advisor.assistantProfileId, "a".repeat(32));
-  const menu = frameEnv.elements.get("modelMenu");
-  assert.equal(menu.children[0].classList.contains("active"), true);
-  assert.equal(menu.children[1].classList.contains("active"), false);
+  const rows = modelRows(frameEnv.elements.get("modelMenu"));
+  assert.equal(rows[1].attributes["aria-checked"], "true");
+  assert.equal(rows[2].attributes["aria-checked"], "false");
   assert.equal(frameEnv.elements.get("modelName").textContent, "档案甲");
   assert.ok(hostEnv.messages.some(message => message.type === "ADVISOR_PROBLEM" &&
     message.payload.error === "模型档案不存在或已更改" && message.payload.retryKind === "catalog"));
@@ -531,28 +563,216 @@ test("an unknown or malformed profile switch is rejected before any request", as
   assert.equal(calls, 0);
   assert.equal(advisor.assistantProfileId, "");
 });
+test("the picker accepts the real model-source document and names the profile analysis would use", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.fetchJson = async () => modelSourceDocument();
+  advisor.initFrameHandshake();
+  assert.equal(await advisor.loadModelProfiles(), true);
+  assert.equal(advisor.modelProfiles.length, 2);
+  // `api` has no `name`; the label must come from the profile row with the same id.
+  assert.equal(advisor.analysisLabel, "档案甲");
+  const rows = modelRows(frameEnv.elements.get("modelMenu"));
+  assert.equal(rows.length, 3);
+  assert.deepEqual(modelRowText(rows[0]), ["跟随分析", "当前：档案甲"]);
+  assert.equal(frameEnv.elements.get("modelName").textContent, "跟随分析 · 档案甲");
+});
+test("a profile name at the store's 64-character cap still reaches the picker", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  const longName = "长".repeat(64);
+  const document = modelSourceDocument();
+  document.profiles[1].name = longName; document.profiles[1].label = longName;
+  advisor.fetchJson = async () => document;
+  advisor.initFrameHandshake();
+  assert.equal(await advisor.loadModelProfiles(), true);
+  assert.equal(advisor.modelProfiles.length, 2);
+  assert.equal(modelRowText(modelRows(frameEnv.elements.get("modelMenu"))[2])[0], longName);
+});
 test("the model menu follows the analysis selection until a profile is pinned", async () => {
   const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
-  advisor.fetchJson = async () => ({ mode: "api", api: { id: "a".repeat(32) }, profiles: modelProfiles(), assistantProfileId: null });
+  advisor.fetchJson = async () => modelSourceDocument({ assistantProfileId: null });
   advisor.initFrameHandshake();
   assert.equal(await advisor.loadModelProfiles(), true);
   assert.equal(advisor.assistantProfileId, "");
-  const menu = frameEnv.elements.get("modelMenu");
-  assert.equal(menu.children.length, 2);
-  assert.ok(menu.children.every(child => !child.classList.contains("active")));
-  assert.equal(frameEnv.elements.get("modelName").textContent, "跟随分析");
+  assert.equal(advisor.analysisLabel, "档案甲");
+  const rows = modelRows(frameEnv.elements.get("modelMenu"));
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0].attributes["aria-checked"], "true");
+  assert.ok(rows.slice(1).every(row => row.attributes["aria-checked"] === "false"));
+  assert.equal(frameEnv.elements.get("modelName").textContent, "跟随分析 · 档案甲");
+  assert.equal(frameEnv.elements.get("btnModelMenu").dataset.mode, "follow");
 });
-test("an empty profile list disables the model menu without any provider request", async () => {
+test("an empty profile list keeps the picker usable and explains where models come from", async () => {
   const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
   const calls = [];
-  advisor.fetchJson = async url => { calls.push(url); return { mode: "local", api: null, profiles: [], assistantProfileId: null }; };
+  advisor.fetchJson = async url => { calls.push(url); return { mode: "local", api: null, label: "本地 Laya", profiles: [], assistantProfileId: null }; };
   advisor.initFrameHandshake();
   assert.equal(await advisor.loadModelProfiles(), true);
   assert.deepEqual(calls, ["/api/model-source"]);
   assert.equal(advisor.modelProfiles.length, 0);
-  assert.equal(frameEnv.elements.get("btnModelMenu").disabled, true);
-  assert.equal(frameEnv.elements.get("modelName").textContent, "模型");
-  assert.equal(frameEnv.elements.get("modelMenu").children.length, 0);
+  // The chip stays clickable: a disabled control would hide the only explanation of why the
+  // list is empty and where the user adds models.
+  assert.equal(frameEnv.elements.get("btnModelMenu").disabled, false);
+  // Local analysis never becomes the assistant's model, so the chip must not claim "本地 Laya".
+  assert.equal(frameEnv.elements.get("modelName").textContent, "未配置模型");
+  const menu = frameEnv.elements.get("modelMenu");
+  assert.equal(modelRows(menu).length, 0);
+  assert.ok(Array.from(menu.children).some(child => /设置 → 模型配置/.test(child.textContent)));
+});
+test("a blocked composer explains itself instead of ignoring send", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.catalog.engine.state = "missing";
+  advisor.initFrameHandshake();
+  const note = frameEnv.elements.get("advisorComposerNote");
+  assert.equal(note.hidden, false);
+  assert.match(note.textContent, /助手引擎不可用/);
+  assert.match(note.textContent, /setup:advisor-engine/);
+  assert.equal(frameEnv.elements.get("btnAdvisorSend").disabled, true);
+  assert.match(frameEnv.elements.get("btnAdvisorSend").title, /助手引擎不可用/);
+});
+test("the composer asks for a conversation first and clears once everything is ready", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.currentAccount = ""; advisor.currentUser = "";
+  advisor.initFrameHandshake();
+  const note = frameEnv.elements.get("advisorComposerNote"), send = frameEnv.elements.get("btnAdvisorSend");
+  assert.equal(note.textContent, "先在左侧选择一个微信会话");
+  assert.equal(send.disabled, true);
+  advisor.currentAccount = "account-a"; advisor.currentUser = "friend-a";
+  advisor.initFrameHandshake();
+  assert.equal(note.hidden, true);
+  assert.equal(send.disabled, false);
+  assert.equal(send.title, "发送");
+});
+test("the memory chip is on by default and travels with the message", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const sent = [];
+  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
+  const chip = frameEnv.elements.get("btnMemory"), label = frameEnv.elements.get("memoryLabel");
+  assert.equal(label.textContent, "记忆");
+  assert.equal(chip.dataset.state, "on");
+  assert.equal(chip.attributes["aria-pressed"], "true");
+  frameEnv.elements.get("advisorInput").value = "在吗";
+  await frameEnv.elements.get("btnAdvisorSend").dispatch("click");
+  assert.deepEqual(sent.filter(message => message.type === "ADVISOR_SEND").at(-1).payload,
+    { text: "在吗", agentId: "advisor", memory: true });
+  advisor.postToFrame("ADVISOR_SUBMIT_STATE", { pending: false });
+  await chip.dispatch("click");
+  assert.equal(label.textContent, "记忆 关");
+  assert.equal(chip.attributes["aria-pressed"], "false");
+  frameEnv.elements.get("advisorInput").value = "还在吗";
+  await frameEnv.elements.get("btnAdvisorSend").dispatch("click");
+  assert.deepEqual(sent.filter(message => message.type === "ADVISOR_SEND").at(-1).payload,
+    { text: "还在吗", agentId: "advisor", memory: false });
+});
+test("the host sends the memory flag to the run endpoint", async () => {
+  const { hostEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const calls = [];
+  advisor.fetchJson = async (url, options) => {
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    return catalog();
+  };
+  hostEnv.nativeEmit(request(hostEnv, "ADVISOR_SEND", { text: "在吗", agentId: "advisor", memory: false }).data);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  const run = calls.find(call => call.url === "/api/advisor/run");
+  assert.equal(run.body.memory, false);
+});
+test("a non-boolean memory flag is rejected before any request", async () => {
+  const env = host(), advisor = ready(env);
+  let calls = 0;
+  advisor.fetchJson = async () => { calls++; return catalog(); };
+  env.nativeEmit(request(env, "ADVISOR_SEND", { text: "在吗", agentId: "advisor", memory: "yes" }).data);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 0);
+});
+test("new conversation asks for a second click before replacing an existing thread", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  const sent = [];
+  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
+  advisor.initFrameHandshake();
+  advisor.postToFrame("ADVISOR_SET_THREAD", { thread: thread("account-a", "friend-a", "advisor",
+    [{ id: "m1", role: "user", text: "你好" }]), run: null, draft: "" });
+  const button = frameEnv.elements.get("btnNewThread"), label = frameEnv.elements.get("newThreadLabel");
+  assert.equal(label.textContent, "新建");
+  await button.dispatch("click");
+  assert.equal(label.textContent, "确认新建");
+  assert.equal(button.dataset.confirm, "1");
+  assert.equal(sent.filter(message => message.type === "ADVISOR_NEW_THREAD").length, 0);
+  await button.dispatch("click");
+  assert.equal(label.textContent, "新建");
+  assert.equal(sent.filter(message => message.type === "ADVISOR_NEW_THREAD").length, 1);
+});
+test("an empty conversation starts a new thread on the first click", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  const sent = [];
+  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
+  advisor.initFrameHandshake();
+  await frameEnv.elements.get("btnNewThread").dispatch("click");
+  assert.equal(sent.filter(message => message.type === "ADVISOR_NEW_THREAD").length, 1);
+});
+test("the host turns the new-conversation button into a fresh thread request", async () => {
+  const { hostEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const calls = [];
+  advisor.fetchJson = async url => {
+    calls.push(url);
+    if (url === "/api/advisor/new-thread") return { thread: thread("account-a", "friend-a", "advisor", []) };
+    return catalog();
+  };
+  hostEnv.nativeEmit(request(hostEnv, "ADVISOR_NEW_THREAD").data);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls, ["/api/advisor/new-thread"]);
+});
+test("closing model settings refreshes the picker while the panel stays open", async () => {
+  const env = host(), advisor = ready(env);
+  advisor.panelVisible = true;
+  let calls = 0;
+  advisor.fetchJson = async url => { if (url === "/api/model-source") calls++; return modelSourceDocument(); };
+  env.window.dispatchEvent({ type: "model-source-settings-closed" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.equal(advisor.modelProfiles.length, 2);
+  advisor.panelVisible = false;
+  env.window.dispatchEvent({ type: "model-source-settings-closed" });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls, 1);
+});
+test("choosing follow analysis drops the assistant pin and reloads the catalog", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.modelProfiles = modelProfiles(); advisor.assistantProfileId = "a".repeat(32);
+  advisor.initFrameHandshake(); advisor.syncModelsToFrame();
+  const calls = [];
+  advisor.fetchJson = async (url, options) => {
+    calls.push({ url, body: options?.body ? JSON.parse(options.body) : null });
+    if (url === "/api/model-source/select") return { profileId: null, sourceId: "source-analysis", revision: 5 };
+    return catalog();
+  };
+  hostEnv.nativeEmit(request(hostEnv, "ADVISOR_SELECT_MODEL", { profileId: null }).data);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(calls.map(call => call.url), ["/api/model-source/select", "/api/advisor/catalog"]);
+  assert.deepEqual(calls[0].body, { profileId: null });
+  assert.equal(advisor.assistantProfileId, "");
+  const rows = modelRows(frameEnv.elements.get("modelMenu"));
+  assert.equal(rows[0].attributes["aria-checked"], "true");
+  assert.equal(frameEnv.elements.get("modelName").textContent, "跟随分析");
+});
+test("the chip shows a busy label until the host reports the new selection", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.modelProfiles = modelProfiles(); advisor.assistantProfileId = "";
+  advisor.initFrameHandshake(); advisor.syncModelsToFrame();
+  const menu = frameEnv.elements.get("modelMenu"), button = frameEnv.elements.get("btnModelMenu");
+  await button.dispatch("click");
+  await modelRows(menu)[1].dispatch("click");
+  assert.equal(frameEnv.elements.get("modelName").textContent, "切换中…");
+  assert.equal(button.disabled, true);
+  assert.equal(button.attributes["aria-busy"], "true");
+  advisor.assistantProfileId = "a".repeat(32); advisor.syncModelsToFrame();
+  assert.equal(frameEnv.elements.get("modelName").textContent, "档案甲");
+  assert.equal(button.disabled, false);
+  assert.equal(button.attributes["aria-busy"], "false");
 });
 test("communication advice replaces the emoji entry while the adviser keeps its own command", () => {
   const appSource = readFileSync(path.join(root, "app.js"), "utf8");

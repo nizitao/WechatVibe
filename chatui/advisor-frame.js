@@ -7,15 +7,19 @@
   const byId = id => document.getElementById(id);
   const agentName = byId("agentName"), agentMenu = byId("agentMenu"), menuButton = byId("btnAgentMenu");
   const modelName = byId("modelName"), modelMenu = byId("modelMenu"), modelButton = byId("btnModelMenu");
+  const newThread = byId("btnNewThread"), newThreadLabel = byId("newThreadLabel");
   const timeline = byId("advisorTimeline"), welcome = byId("advisorWelcome"), welcomeText = byId("welcomeText");
   const input = byId("advisorInput"), send = byId("btnAdvisorSend"), stop = byId("btnStopRun"), retry = byId("btnRetryRun");
+  const note = byId("advisorComposerNote");
   const controls = byId("timelineControls");
   let sessionNonce = null, scope = null, templates = [], catalogReady = false, engineState = "unknown";
   let threadId = null, renderedScope = "", currentRun = null, submitting = false, stopping = false, retryKind = "load", problem = "";
   let runSteps = [], stepRunId = "";
   let lastSavedMessage = null;
   let templateSignature = "";
-  let modelProfiles = [], assistantProfileId = "", modelSignature = "";
+  let modelProfiles = [], assistantProfileId = "", analysisLabel = "", modelSignature = "";
+  let modelPending = false, modelPendingTimer = 0, modelsLoaded = false;
+  let newThreadConfirm = false, newThreadTimer = 0;
   const messageNodes = new Map();
   function transientMessage(message) {
     if (message.role !== "status") return false;
@@ -137,25 +141,108 @@
     agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false");
     updateControls();
   }
+  function modelOptionRow({ option, name, meta, checked, profileId }) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "advisor-model-option" + (checked ? " active" : "");
+    button.dataset.modelOption = option;
+    if (profileId) button.dataset.profileId = profileId;
+    button.setAttribute("role", "menuitemradio");
+    button.setAttribute("aria-checked", String(checked));
+    button.title = meta ? `${name} · ${meta}` : name;
+    const tick = document.createElement("span");
+    tick.className = "advisor-model-tick"; tick.setAttribute("aria-hidden", "true");
+    tick.textContent = checked ? "✓" : "";
+    const body = document.createElement("span"); body.className = "advisor-model-text";
+    const label = document.createElement("span"); label.className = "advisor-model-option-name";
+    label.textContent = name;
+    const detail = document.createElement("span"); detail.className = "advisor-model-option-meta";
+    detail.textContent = meta;
+    body.appendChild(label); body.appendChild(detail);
+    button.appendChild(tick); button.appendChild(body);
+    button.addEventListener("click", () => {
+      closeModelMenu();
+      // Clicking the row that is already active is a no-op, so the menu never reposts a switch.
+      if (!checked) chooseModel(option === "follow" ? null : profileId);
+    });
+    return button;
+  }
+  function modelHintRow(textValue, className = "advisor-model-hint") {
+    const row = document.createElement("div");
+    row.className = className; row.textContent = textValue;
+    return row;
+  }
+  function modelOptions() {
+    return Array.from(modelMenu.children).filter(child => child.dataset && child.dataset.modelOption);
+  }
+  function closeModelMenu(focusTrigger = false) {
+    modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
+    if (focusTrigger && typeof modelButton.focus === "function") modelButton.focus();
+  }
+  function openModelMenu(focusLast = false) {
+    if (modelButton.disabled) return;
+    renderModels();
+    modelMenu.hidden = false; modelButton.setAttribute("aria-expanded", "true");
+    const options = modelOptions(), target = options[focusLast ? options.length - 1 : 0];
+    if (target && typeof target.focus === "function") target.focus();
+  }
+  function clearModelPending() {
+    if (!modelPending) return;
+    modelPending = false;
+    if (modelPendingTimer) { clearTimeout(modelPendingTimer); modelPendingTimer = 0; }
+    renderModels();
+  }
+  function chooseModel(profileId) {
+    if (modelPending) return;
+    modelPending = true; renderModels();
+    // The host answers with a fresh ADVISOR_SET_MODELS on success and ADVISOR_PROBLEM on
+    // failure; the timeout only keeps the chip from sticking if neither arrives.
+    modelPendingTimer = setTimeout(clearModelPending, 10000);
+    sendToParent("ADVISOR_SELECT_MODEL", { profileId });
+  }
+  function moveModelFocus(step) {
+    const options = modelOptions();
+    if (!options.length) return;
+    const index = options.indexOf(document.activeElement);
+    const next = index < 0 ? (step > 0 ? 0 : options.length - 1)
+      : (index + step + options.length) % options.length;
+    if (typeof options[next].focus === "function") options[next].focus();
+  }
   function renderModels() {
-    const signature = JSON.stringify([modelProfiles.map(profile => [profile.id, profile.name]), assistantProfileId]);
+    const signature = JSON.stringify([modelProfiles.map(profile => [profile.id, profile.name, profile.model]),
+      assistantProfileId, analysisLabel, modelPending, modelsLoaded]);
     if (signature === modelSignature) return;
     modelSignature = signature;
     const selected = modelProfiles.find(profile => profile.id === assistantProfileId);
-    modelName.textContent = selected?.name || (modelProfiles.length ? "跟随分析" : "模型");
-    modelButton.disabled = modelProfiles.length === 0;
+    // The chip always answers "which model is answering right now": a pinned profile by name,
+    // otherwise the analysis line it follows, so the two are never confusable.
+    let chipText = "未配置模型";
+    if (modelPending) chipText = "切换中…";
+    else if (selected) chipText = selected.name;
+    else if (!modelsLoaded) chipText = "模型";
+    else if (analysisLabel) chipText = `跟随分析 · ${analysisLabel}`;
+    else if (modelProfiles.length) chipText = "跟随分析";
+    modelName.textContent = chipText;
+    modelButton.dataset.mode = selected ? "profile" : modelProfiles.length ? "follow" : "empty";
+    modelButton.disabled = modelPending;
+    modelButton.setAttribute("aria-busy", String(modelPending));
     modelMenu.replaceChildren();
-    for (const profile of modelProfiles) {
-      const button = document.createElement("button"); button.type = "button";
-      button.className = "advisor-agent-choice" + (profile.id === assistantProfileId ? " active" : "");
-      button.setAttribute("role", "menuitemradio"); button.setAttribute("aria-checked", String(profile.id === assistantProfileId));
-      button.textContent = profile.name; button.title = profile.name;
-      button.addEventListener("click", () => {
-        modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
-        if (profile.id !== assistantProfileId) sendToParent("ADVISOR_SELECT_MODEL", { profileId: profile.id });
-      });
-      modelMenu.appendChild(button);
+    // Without a saved profile there is nothing to follow: the assistant needs an API model, so
+    // the only useful thing the menu can say is where models come from.
+    if (modelProfiles.length) {
+      modelMenu.appendChild(modelOptionRow({ option: "follow", name: "跟随分析",
+        meta: analysisLabel ? `当前：${analysisLabel}` : "使用分析所选的模型",
+        checked: !selected, profileId: "" }));
+      modelMenu.appendChild(modelHintRow("已保存的模型", "advisor-model-section"));
+      for (const profile of modelProfiles) {
+        modelMenu.appendChild(modelOptionRow({ option: "profile", name: profile.name,
+          meta: profile.model || profile.protocol || "", checked: profile.id === assistantProfileId,
+          profileId: profile.id }));
+      }
+    } else {
+      modelMenu.appendChild(modelHintRow("还没有添加模型，在「设置 → 模型配置」中添加后即可切换。"));
     }
+    modelMenu.appendChild(modelHintRow("只影响聊天助手，不改变分析所用的模型。", "advisor-model-foot"));
     modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
   }
   function renderThread(thread, run, draft) {
@@ -165,6 +252,7 @@
       for (const node of messageNodes.values()) disposeNode(node);
       timeline.replaceChildren(); messageNodes.clear();
       threadId = thread.id; renderedScope = nextScope; problem = "";
+      resetNewThreadConfirm();
     }
     currentRun = run || null; submitting = false; stopping = false;
     const messages = thread.messages.filter(message => !transientMessage(message));
@@ -183,6 +271,33 @@
     updateControls(); updateLayout();
     if (nearBottom || changed) timeline.scrollTop = timeline.scrollHeight;
   }
+  // The one reason the composer cannot send, ordered by what the user can act on first.
+  function composerBlocker() {
+    // Before the first handshake nothing is known yet; a hint here would be a guess.
+    if (!sessionNonce) return "";
+    if (!scope?.account || !scope?.user) return "先在左侧选择一个微信会话";
+    if (!scope?.agentId) return "还没有启用的助手模板";
+    if (!catalogReady) return "助手模板还没读取完，请稍后重试";
+    // `engineState` covers both a missing runtime and a selected profile without a usable key,
+    // so the hint names both remedies instead of guessing which one it is.
+    if (engineState === "missing") return "助手引擎不可用：运行 npm run setup:advisor-engine，或检查所选模型的 API Key 是否已保存";
+    return "";
+  }
+  function threadHasMessages() {
+    return [...messageNodes.keys()].some(key => !key.startsWith("ui:"));
+  }
+  function renderNewThread() {
+    newThread.dataset.confirm = newThreadConfirm ? "1" : "0";
+    newThreadLabel.textContent = newThreadConfirm ? "确认新建" : "新建";
+    const title = newThreadConfirm ? "再次点击确认：当前对话会被清空" : "新建对话";
+    newThread.title = title; newThread.setAttribute("aria-label", title);
+  }
+  function resetNewThreadConfirm() {
+    if (!newThreadConfirm) return;
+    newThreadConfirm = false;
+    if (newThreadTimer) { clearTimeout(newThreadTimer); newThreadTimer = 0; }
+    renderNewThread();
+  }
   function updateControls() {
     const running = !!currentRun && !terminal.has(currentRun.state);
     // The host forwards one coarse status at a time (`run.phaseEvent`), so the list grows here
@@ -191,7 +306,12 @@
     if (running && currentRun?.phaseEvent) runSteps = collectStep(runSteps, currentRun.phaseEvent);
     const resetCommand = /^\s*\/reset\s*$/.test(input.value);
     send.disabled = submitting || (!resetCommand && (running || !catalogReady || engineState !== "available")) || !scope?.account || !scope?.user || !scope?.agentId;
+    // A disabled send button with no explanation reads as a broken app: say what is missing.
+    const blocker = !running && !submitting && !resetCommand ? composerBlocker() : "";
+    note.hidden = !blocker; note.textContent = blocker;
+    send.title = blocker || "发送";
     stop.hidden = !running || resetCommand; send.hidden = running && !resetCommand;
+    newThread.disabled = submitting;
     stop.disabled = stopping; stop.setAttribute("aria-label", stopping ? "正在停止" : "停止生成");
     stop.title = stopping ? "正在停止" : "停止生成";
     retry.hidden = !problem && currentRun?.state !== "error";
@@ -254,7 +374,7 @@
       ADVISOR_SET_THREAD: ["thread", "run", "agentId", "draft"],
       ADVISOR_STREAM_UPDATE: ["threadId", "run", "messages"],
       ADVISOR_PROBLEM: ["error", "retryKind"], ADVISOR_SUBMIT_STATE: ["pending"], ADVISOR_STOP_STATE: ["pending"],
-      ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId"]
+      ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId", "analysisLabel"]
     };
     if (!permitted[type] || Object.keys(payload).some(key => !permitted[type].includes(key))) return false;
     if (type === "ADVISOR_INIT" || type === "ADVISOR_SET_TEMPLATES") {
@@ -277,7 +397,10 @@
     if (type === "ADVISOR_COPY_RESULT" && typeof payload.copied !== "boolean") return false;
     if (type === "ADVISOR_SET_MODELS") {
       if (!Array.isArray(payload.profiles) || payload.profiles.length > 200 ||
-        !payload.profiles.every(item => object(item) && text(item.id, 240) && text(item.name, 60)) ||
+        !payload.profiles.every(item => object(item) && text(item.id, 240) && text(item.name, 64) &&
+          (item.model === undefined || text(item.model, 256)) &&
+          (item.protocol === undefined || text(item.protocol, 40))) ||
+        (payload.analysisLabel !== undefined && !text(payload.analysisLabel, 64)) ||
         !(payload.assistantProfileId === null || text(payload.assistantProfileId, 240))) return false;
     }
     return true;
@@ -286,7 +409,21 @@
     agentMenu.hidden = !agentMenu.hidden; menuButton.setAttribute("aria-expanded", String(!agentMenu.hidden));
   });
   modelButton.addEventListener("click", () => {
-    modelMenu.hidden = !modelMenu.hidden; modelButton.setAttribute("aria-expanded", String(!modelMenu.hidden));
+    if (modelMenu.hidden) openModelMenu(); else closeModelMenu();
+  });
+  modelButton.addEventListener("keydown", event => {
+    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+    event.preventDefault?.();
+    openModelMenu(event.key === "ArrowUp");
+  });
+  modelMenu.addEventListener("keydown", event => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault?.(); moveModelFocus(event.key === "ArrowDown" ? 1 : -1);
+    } else if (event.key === "Home" || event.key === "End") {
+      event.preventDefault?.(); openModelMenu(event.key === "End");
+    } else if (event.key === "Escape") {
+      event.preventDefault?.(); closeModelMenu(true);
+    } else if (event.key === "Tab") closeModelMenu();
   });
   document.addEventListener("click", event => {
     if (!event.target.closest?.(".advisor-agent-control, .advisor-model-control")) {
@@ -299,6 +436,17 @@
       agentMenu.hidden = true; menuButton.setAttribute("aria-expanded", "false");
       modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
     }
+  });
+  newThread.addEventListener("click", () => {
+    if (newThread.disabled) return;
+    // A replaced conversation has no list to restore it from, so it takes a second click.
+    if (!newThreadConfirm && threadHasMessages()) {
+      newThreadConfirm = true; renderNewThread();
+      newThreadTimer = setTimeout(resetNewThreadConfirm, 4000);
+      return;
+    }
+    resetNewThreadConfirm();
+    sendToParent("ADVISOR_NEW_THREAD");
   });
   stop.addEventListener("click", () => sendToParent("ADVISOR_STOP"));
   retry.addEventListener("click", () => sendToParent("ADVISOR_RETRY", { retryKind: currentRun?.state === "error" ? "send" : retryKind }));
@@ -339,7 +487,9 @@
     if (data.type === "ADVISOR_SET_TEMPLATES") {
       templates = payload.enabledTemplates; catalogReady = payload.catalogReady; engineState = payload.engineState; renderTemplates();
     } else if (data.type === "ADVISOR_SET_MODELS") {
-      modelProfiles = payload.profiles; assistantProfileId = payload.assistantProfileId || ""; renderModels();
+      modelProfiles = payload.profiles; assistantProfileId = payload.assistantProfileId || "";
+      analysisLabel = payload.analysisLabel || ""; modelsLoaded = true;
+      clearModelPending(); renderModels();
     } else if (data.type === "ADVISOR_SET_THREAD") {
       renderTemplates(); renderThread(payload.thread, payload.run, payload.draft);
     } else if (data.type === "ADVISOR_STREAM_UPDATE") applyStream(payload);
@@ -348,10 +498,13 @@
       document.body.classList.toggle("theme-dark", payload.theme === "dark");
     }
     else if (data.type === "ADVISOR_PROBLEM") {
-      problem = payload.error; retryKind = payload.retryKind; updateControls();
+      problem = payload.error; retryKind = payload.retryKind;
+      // A failed switch never sends new models, so this is what releases the busy chip.
+      if (payload.error) clearModelPending();
+      updateControls();
     } else if (data.type === "ADVISOR_SUBMIT_STATE") {
       submitting = payload.pending; if (submitting) { problem = ""; statusRow("ui:problem", ""); } updateControls();
     } else if (data.type === "ADVISOR_STOP_STATE") { stopping = payload.pending; updateControls(); }
   });
-  renderModels(); updateControls(); updateLayout();
+  renderModels(); renderNewThread(); updateControls(); updateLayout();
 })();
