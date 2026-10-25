@@ -512,9 +512,12 @@ function validThread(value, scope) {
       if (this.getCachedThread(scope.account, scope.user, scope.agentId).id === threadId) return;
       // Leaving a conversation that is still generating stops it, exactly like switching person.
       this.generation++; this.abortCurrentPoll();
-      await this.loadThread(scope, threadId);
-      if (!this.isCurrent(scope)) return;
-      await this.loadThreads(scope);
+      // The bump above invalidates the captured scope, so the load runs under a fresh one;
+      // reusing `scope` made every history switch stop the run and then load nothing.
+      const next = this.captureScope();
+      await this.loadThread(next, threadId);
+      if (!this.isCurrent(next)) return;
+      await this.loadThreads(next);
     },
     async loadThreads(scope = this.captureScope()) {
       if (!this.isCurrent(scope) || !scope.account || !scope.user || !scope.agentId || !this.catalogReady) return;

@@ -1226,3 +1226,98 @@ test("catalog edits, disabled fallbacks and deletion invalidate the reply contex
   ]);
   assert.deepEqual(calls, ["/api/advisor/templates", "/api/advisor/templates", "/api/advisor/templates"]);
 });
+
+test("history menu asks the host for the list and renders each conversation", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const sent = [];
+  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
+  const button = frameEnv.elements.get("btnHistory"), menu = frameEnv.elements.get("historyMenu");
+  // The real markup ships the menu hidden; the stub starts every node visible.
+  menu.hidden = true;
+  await button.dispatch("click");
+  assert.equal(menu.hidden, false);
+  assert.equal(button.attributes["aria-expanded"], "true");
+  assert.equal(sent.filter(message => message.type === "ADVISOR_HISTORY_REQUEST").length, 1);
+
+  advisor.postToFrame("ADVISOR_SET_THREADS", {
+    threads: [
+      { id: "t-now", title: "今天的对话", preview: "好的，我明白了", previewRole: "assistant",
+        messageCount: 4, createdAtMs: Date.now() - 1000, updatedAtMs: Date.now() - 500 },
+      { id: "t-old", title: "上周的对话", preview: "明天见", previewRole: "user",
+        messageCount: 2, createdAtMs: Date.now() - 86400000, updatedAtMs: Date.now() - 86400000 },
+    ],
+    activeThreadId: "t-now",
+  });
+  assert.equal(button.title, "历史会话（2 段）");
+  const rows = menu.children;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].dataset.threadId, "t-now");
+  assert.ok(rows[0].classList.contains("is-active"));
+  assert.equal(rows[0].attributes["aria-current"], "true");
+  assert.equal(rows[0].children[0].textContent, "今天的对话");
+  assert.match(rows[0].children[1].textContent, /条消息/);
+  assert.equal(rows[0].children[2].textContent, "助手：好的，我明白了");
+  assert.equal(rows[1].children[2].textContent, "明天见");
+  assert.equal(rows[1].attributes["aria-current"], undefined);
+});
+
+test("clicking an older conversation asks the host to open it; the current one stays put", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const sent = [];
+  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
+  advisor.postToFrame("ADVISOR_SET_THREADS", {
+    threads: [
+      { id: "t-now", title: "当前", preview: "", previewRole: "", messageCount: 1,
+        createdAtMs: 1, updatedAtMs: 2 },
+      { id: "t-old", title: "更早", preview: "", previewRole: "", messageCount: 1,
+        createdAtMs: 1, updatedAtMs: 1 },
+    ],
+    activeThreadId: "t-now",
+  });
+  const menu = frameEnv.elements.get("historyMenu");
+  await menu.children[0].dispatch("click");
+  assert.equal(sent.filter(message => message.type === "ADVISOR_OPEN_THREAD").length, 0,
+    "the conversation already open must not be requested again");
+  await menu.children[1].dispatch("click");
+  const opened = sent.filter(message => message.type === "ADVISOR_OPEN_THREAD");
+  assert.equal(opened.length, 1);
+  assert.deepEqual(json(opened[0].payload), { threadId: "t-old" });
+  assert.equal(menu.hidden, true);
+});
+
+test("a malformed thread list is ignored instead of blanking the menu", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  advisor.postToFrame("ADVISOR_SET_THREADS", {
+    threads: [{ id: "t-now", title: "保留", preview: "", previewRole: "", messageCount: 1,
+      createdAtMs: 1, updatedAtMs: 2 }],
+    activeThreadId: "t-now",
+  });
+  const button = frameEnv.elements.get("btnHistory"), menu = frameEnv.elements.get("historyMenu");
+  assert.equal(button.title, "历史会话（1 段）");
+  for (const bad of [{ threads: "nope" }, { threads: [{}] }, { threads: [{ id: "x" , title: "t" }] }]) {
+    advisor.postToFrame("ADVISOR_SET_THREADS", { ...bad, activeThreadId: "t-now" });
+    assert.equal(menu.children.length, 1);
+  }
+});
+
+test("opening a conversation reloads it by id and then refreshes the list", async () => {
+  const { hostEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const calls = [];
+  advisor.fetchJson = async (url, options) => {
+    calls.push(String(url));
+    if (String(url).startsWith("/api/advisor/threads")) return { threads: [] };
+    return { thread: thread(), run: null, draft: "" };
+  };
+  const generation = advisor.generation;
+  hostEnv.nativeEmit(request(hostEnv, "ADVISOR_OPEN_THREAD", { threadId: "t-old" }).data);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(calls[0], /^\/api\/advisor\/thread\?/);
+  assert.match(calls[0], /threadId=t-old/);
+  assert.equal(calls[1].startsWith("/api/advisor/threads"), true);
+  assert.ok(advisor.generation > generation, "switching conversations must stop the old run");
+});

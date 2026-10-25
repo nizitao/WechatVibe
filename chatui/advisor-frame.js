@@ -308,7 +308,7 @@
       const preview = document.createElement("span");
       preview.className = "advisor-history-preview";
       preview.textContent = (thread.previewRole === "assistant" ? "助手：" : "") + (thread.preview || "");
-      row.append(head, meta, preview);
+      row.appendChild(head); row.appendChild(meta); row.appendChild(preview);
       row.addEventListener("click", () => {
         closeHistoryMenu();
         if (thread.id !== activeThreadId) sendToParent("ADVISOR_OPEN_THREAD", { threadId: thread.id });
@@ -434,7 +434,8 @@
       ADVISOR_SET_THREAD: ["thread", "run", "agentId", "draft"],
       ADVISOR_STREAM_UPDATE: ["threadId", "run", "messages"],
       ADVISOR_PROBLEM: ["error", "retryKind"], ADVISOR_SUBMIT_STATE: ["pending"], ADVISOR_STOP_STATE: ["pending"],
-      ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId", "analysisLabel"]
+      ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId", "analysisLabel"],
+      ADVISOR_SET_THREADS: ["threads", "activeThreadId"]
     };
     if (!permitted[type] || Object.keys(payload).some(key => !permitted[type].includes(key))) return false;
     if (type === "ADVISOR_INIT" || type === "ADVISOR_SET_TEMPLATES") {
