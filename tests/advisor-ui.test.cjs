@@ -1357,3 +1357,11 @@ test("the host turns a transport failure into the retry state, not a lone banner
   assert.match(menu.children[0].textContent, /^历史读取失败/);
   assert.match(menu.children[0].textContent, /点此重试$/);
 });
+
+test("clicking the history button label keeps the menu open", () => {
+  const source = readFileSync(path.join(root, "advisor-frame.js"), "utf8");
+  // The click target is often the inner span/svg, so comparing it with the button node
+  // closed the menu in the same click that opened it.
+  assert.match(source, /if \(!historyButton\.contains\(target\) && !historyMenu\.contains\(target\)\) closeHistoryMenu\(\);/);
+  assert.doesNotMatch(source, /target !== historyButton/);
+});

@@ -548,7 +548,7 @@
   document.addEventListener("click", event => {
     if (historyMenu.hidden) return;
     const target = event.target;
-    if (target !== historyButton && !historyMenu.contains(target)) closeHistoryMenu();
+    if (!historyButton.contains(target) && !historyMenu.contains(target)) closeHistoryMenu();
   });
   document.addEventListener("keydown", event => { if (event.key === "Escape" && !historyMenu.hidden) closeHistoryMenu(); });
   stop.addEventListener("click", () => sendToParent("ADVISOR_STOP"));
