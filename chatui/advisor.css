@@ -176,3 +176,8 @@ body.theme-light .advisor-input,body.theme-light .advisor-textarea-form { backgr
   line-height: 1.5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .advisor-history-empty { padding: 14px 8px; color: var(--advisor-muted); font-size: 12px; text-align: center; }
 .advisor-frame-body.theme-light .advisor-history-menu { background: #fff; }
+
+.advisor-history-retry { width: 100%; padding: 12px 8px; border: 1px dashed var(--advisor-border);
+  border-radius: 7px; background: none; color: var(--advisor-muted); font: inherit; font-size: 12px;
+  cursor: pointer; }
+.advisor-history-retry:hover { background: rgba(127,127,127,.12); color: inherit; }

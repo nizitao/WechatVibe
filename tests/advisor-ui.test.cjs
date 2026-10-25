@@ -1321,3 +1321,38 @@ test("opening a conversation reloads it by id and then refreshes the list", asyn
   assert.equal(calls[1].startsWith("/api/advisor/threads"), true);
   assert.ok(advisor.generation > generation, "switching conversations must stop the old run");
 });
+
+test("a failed history load clears the rows and offers a retry", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const sent = [];
+  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
+  advisor.postToFrame("ADVISOR_SET_THREADS", {
+    threads: [{ id: "t-now", title: "旧对话", preview: "", previewRole: "", messageCount: 1,
+      createdAtMs: 1, updatedAtMs: 2 }],
+    activeThreadId: "t-now",
+  });
+  const menu = frameEnv.elements.get("historyMenu");
+  assert.equal(menu.children.length, 1);
+
+  advisor.postToFrame("ADVISOR_SET_THREADS", { threads: [], activeThreadId: "t-now",
+    error: "历史读取失败，点此重试" });
+  assert.equal(menu.children.length, 1, "stale rows must not survive a failed refresh");
+  assert.equal(menu.children[0].textContent, "历史读取失败，点此重试");
+  assert.match(menu.children[0].className, /advisor-history-retry/);
+
+  const before = sent.filter(message => message.type === "ADVISOR_HISTORY_REQUEST").length;
+  await menu.children[0].dispatch("click");
+  assert.equal(sent.filter(message => message.type === "ADVISOR_HISTORY_REQUEST").length, before + 1);
+});
+
+test("the host turns a transport failure into the retry state, not a lone banner", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  advisor.fetchJson = async () => { throw new Error("offline"); };
+  await advisor.loadThreads();
+  await new Promise(resolve => setImmediate(resolve));
+  const menu = frameEnv.elements.get("historyMenu");
+  assert.equal(menu.children.length, 1);
+  assert.equal(menu.children[0].textContent, "历史读取失败，点此重试");
+});

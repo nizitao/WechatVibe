@@ -523,9 +523,21 @@ function validThread(value, scope) {
       if (!this.isCurrent(scope) || !scope.account || !scope.user || !scope.agentId || !this.catalogReady) return;
       const serial = ++this.historySerial;
       const query = new URLSearchParams({ account: scope.account, user: scope.user, agentId: scope.agentId });
-      const data = await this.fetchJson(`/api/advisor/threads?${query}`);
+      let data = null;
+      try {
+        data = await this.fetchJson(`/api/advisor/threads?${query}`);
+      } catch (_) {
+        data = null;
+      }
       if (!this.isCurrent(scope) || serial !== this.historySerial) return;
-      if (!Array.isArray(data?.threads) || !data.threads.every(validThreadSummary)) return;
+      if (!data || !Array.isArray(data.threads) || !data.threads.every(validThreadSummary)) {
+        this.clearProblem("load", scope);
+        this.postToFrame("ADVISOR_SET_THREADS", {
+          threads: [], error: "历史读取失败，点此重试",
+          activeThreadId: this.getCachedThread(scope.account, scope.user, scope.agentId).id,
+        }, scope);
+        return;
+      }
       this.clearProblem("load", scope);
       this.postToFrame("ADVISOR_SET_THREADS", {
         threads: data.threads, activeThreadId: this.getCachedThread(scope.account, scope.user, scope.agentId).id,

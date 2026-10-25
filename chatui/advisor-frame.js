@@ -21,7 +21,7 @@
   let modelProfiles = [], assistantProfileId = "", analysisLabel = "", modelSignature = "";
   let modelPending = false, modelPendingTimer = 0, modelsLoaded = false;
   let newThreadConfirm = false, newThreadTimer = 0;
-  let threads = [], activeThreadId = "";
+  let threads = [], activeThreadId = "", threadsError = "";
   const messageNodes = new Map();
   function transientMessage(message) {
     if (message.role !== "status") return false;
@@ -287,6 +287,18 @@
   }
   function renderThreads() {
     historyButton.title = threads.length ? "历史会话（" + threads.length + " 段）" : "历史会话";
+    if (threadsError) {
+      // A failed load clears the row list: showing another contact's conversations would
+      // only fail later, with an error that points at the wrong place.
+      historyMenu.replaceChildren();
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "advisor-history-empty advisor-history-retry";
+      retry.textContent = threadsError;
+      retry.addEventListener("click", () => sendToParent("ADVISOR_HISTORY_REQUEST"));
+      historyMenu.appendChild(retry);
+      return;
+    }
     if (!threads.length) {
       historyMenu.replaceChildren();
       const empty = document.createElement("div");
@@ -435,7 +447,7 @@
       ADVISOR_STREAM_UPDATE: ["threadId", "run", "messages"],
       ADVISOR_PROBLEM: ["error", "retryKind"], ADVISOR_SUBMIT_STATE: ["pending"], ADVISOR_STOP_STATE: ["pending"],
       ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId", "analysisLabel"],
-      ADVISOR_SET_THREADS: ["threads", "activeThreadId"]
+      ADVISOR_SET_THREADS: ["threads", "activeThreadId", "error"]
     };
     if (!permitted[type] || Object.keys(payload).some(key => !permitted[type].includes(key))) return false;
     if (type === "ADVISOR_INIT" || type === "ADVISOR_SET_TEMPLATES") {
@@ -458,7 +470,8 @@
     if (type === "ADVISOR_COPY_RESULT" && typeof payload.copied !== "boolean") return false;
     if (type === "ADVISOR_SET_THREADS") {
       if (!Array.isArray(payload.threads) || payload.threads.length > 200 ||
-        !payload.threads.every(validThreadSummary) || !text(payload.activeThreadId, 240)) return false;
+        !payload.threads.every(validThreadSummary) || !text(payload.activeThreadId, 240) ||
+        (payload.error !== undefined && !text(payload.error, 120))) return false;
     }
     if (type === "ADVISOR_SET_MODELS") {
       if (!Array.isArray(payload.profiles) || payload.profiles.length > 200 ||
@@ -569,7 +582,8 @@
       analysisLabel = payload.analysisLabel || ""; modelsLoaded = true;
       clearModelPending(); renderModels();
     } else if (data.type === "ADVISOR_SET_THREADS") {
-      threads = payload.threads; activeThreadId = payload.activeThreadId; renderThreads();
+      threads = payload.threads; activeThreadId = payload.activeThreadId;
+      threadsError = payload.error || ""; renderThreads();
     } else if (data.type === "ADVISOR_SET_THREAD") {
       renderTemplates(); renderThread(payload.thread, payload.run, payload.draft);
     } else if (data.type === "ADVISOR_STREAM_UPDATE") applyStream(payload);
