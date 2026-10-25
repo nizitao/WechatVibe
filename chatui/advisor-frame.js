@@ -295,7 +295,13 @@
       retry.type = "button";
       retry.className = "advisor-history-empty advisor-history-retry";
       retry.textContent = threadsError;
-      retry.addEventListener("click", () => sendToParent("ADVISOR_HISTORY_REQUEST"));
+      retry.addEventListener("click", () => {
+        // Acknowledge the click before the round trip, otherwise a second failure looks
+        // exactly like the button doing nothing.
+        threadsError = "正在读取历史…";
+        renderThreads();
+        sendToParent("ADVISOR_HISTORY_REQUEST");
+      });
       historyMenu.appendChild(retry);
       return;
     }

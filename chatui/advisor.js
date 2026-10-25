@@ -523,17 +523,22 @@ function validThread(value, scope) {
       if (!this.isCurrent(scope) || !scope.account || !scope.user || !scope.agentId || !this.catalogReady) return;
       const serial = ++this.historySerial;
       const query = new URLSearchParams({ account: scope.account, user: scope.user, agentId: scope.agentId });
-      let data = null;
+      let data = null, failure = "";
       try {
         data = await this.fetchJson(`/api/advisor/threads?${query}`);
-      } catch (_) {
+      } catch (error) {
         data = null;
+        // Keep the reason: "读取失败" alone cannot be acted on, and the console is the only
+        // other place it would show up.
+        failure = String(error?.code || error?.message || error || "").slice(0, 40);
+        console.warn("advisor history load failed", error);
       }
       if (!this.isCurrent(scope) || serial !== this.historySerial) return;
       if (!data || !Array.isArray(data.threads) || !data.threads.every(validThreadSummary)) {
         this.clearProblem("load", scope);
         this.postToFrame("ADVISOR_SET_THREADS", {
-          threads: [], error: "历史读取失败，点此重试",
+          threads: [],
+          error: (failure ? `历史读取失败：${failure}，点此重试` : "历史读取失败，点此重试").slice(0, 120),
           activeThreadId: this.getCachedThread(scope.account, scope.user, scope.agentId).id,
         }, scope);
         return;

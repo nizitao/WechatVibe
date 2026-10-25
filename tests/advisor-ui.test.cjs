@@ -1354,5 +1354,6 @@ test("the host turns a transport failure into the retry state, not a lone banner
   await new Promise(resolve => setImmediate(resolve));
   const menu = frameEnv.elements.get("historyMenu");
   assert.equal(menu.children.length, 1);
-  assert.equal(menu.children[0].textContent, "历史读取失败，点此重试");
+  assert.match(menu.children[0].textContent, /^历史读取失败/);
+  assert.match(menu.children[0].textContent, /点此重试$/);
 });
