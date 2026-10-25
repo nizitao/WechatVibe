@@ -526,7 +526,10 @@
     resetNewThreadConfirm();
     sendToParent("ADVISOR_NEW_THREAD");
   });
-  historyButton.addEventListener("click", () => { if (historyMenu.hidden) openHistoryMenu(); else closeHistoryMenu(); });
+  // Always open and refresh instead of toggling: a menu can be left logically open but
+  // invisible (e.g. after the list failed and the composer moved on), and then every click
+  // only called closeHistoryMenu() -- which looked like the button did nothing at all.
+  historyButton.addEventListener("click", () => openHistoryMenu());
   historyButton.addEventListener("keydown", event => {
     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
     event.preventDefault?.();
@@ -585,6 +588,7 @@
       threads = payload.threads; activeThreadId = payload.activeThreadId;
       threadsError = payload.error || ""; renderThreads();
     } else if (data.type === "ADVISOR_SET_THREAD") {
+      closeHistoryMenu();
       renderTemplates(); renderThread(payload.thread, payload.run, payload.draft);
     } else if (data.type === "ADVISOR_STREAM_UPDATE") applyStream(payload);
     else if (data.type === "ADVISOR_THEME") {
