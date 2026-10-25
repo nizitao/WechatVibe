@@ -337,8 +337,11 @@
   }
   function openHistoryMenu() {
     historyMenu.hidden = false; historyButton.setAttribute("aria-expanded", "true");
-    sendToParent("ADVISOR_HISTORY_REQUEST");
+    // Nothing cached yet: show the loading row before the round trip, so opening the menu
+    // always produces visible feedback even when the previous request failed.
+    if (!threads.length) threadsError = "正在读取历史…";
     renderThreads();
+    sendToParent("ADVISOR_HISTORY_REQUEST");
   }
   function closeHistoryMenu() {
     historyMenu.hidden = true; historyButton.setAttribute("aria-expanded", "false");

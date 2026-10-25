@@ -523,6 +523,14 @@ function validThread(value, scope) {
       if (!this.isCurrent(scope) || !scope.account || !scope.user || !scope.agentId || !this.catalogReady) return;
       const serial = ++this.historySerial;
       const query = new URLSearchParams({ account: scope.account, user: scope.user, agentId: scope.agentId });
+      // Reading the cached thread must not be able to abort the refresh: without this the
+      // frame stayed on「正在读取历史…」for ever and the menu looked broken.
+      let activeId = "";
+      try {
+        activeId = this.getCachedThread(scope.account, scope.user, scope.agentId).id || "";
+      } catch (_) {
+        activeId = "";
+      }
       let data = null, failure = "";
       try {
         data = await this.fetchJson(`/api/advisor/threads?${query}`);
@@ -539,13 +547,13 @@ function validThread(value, scope) {
         this.postToFrame("ADVISOR_SET_THREADS", {
           threads: [],
           error: (failure ? `历史读取失败：${failure}，点此重试` : "历史读取失败，点此重试").slice(0, 120),
-          activeThreadId: this.getCachedThread(scope.account, scope.user, scope.agentId).id,
+          activeThreadId: activeId,
         }, scope);
         return;
       }
       this.clearProblem("load", scope);
       this.postToFrame("ADVISOR_SET_THREADS", {
-        threads: data.threads, activeThreadId: this.getCachedThread(scope.account, scope.user, scope.agentId).id,
+        threads: data.threads, activeThreadId: activeId,
       }, scope);
     },
     onSessionChanged(account, user) {
