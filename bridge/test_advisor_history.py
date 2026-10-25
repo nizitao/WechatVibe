@@ -69,7 +69,7 @@ class PickerLineTests(unittest.TestCase):
     def test_long_messages_are_truncated_instead_of_failing_the_list(self):
         from advisor_service import picker_line
         line = picker_line("长" * 200, 60)
-        self.assertEqual(len(line), 61)  # 60 characters plus the ellipsis
+        self.assertEqual(len(line), 60)  # the ellipsis counts toward the 60-character wire limit
         self.assertTrue(line.endswith("…"))
 
     def test_newlines_and_control_characters_collapse_to_one_line(self):

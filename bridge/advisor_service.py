@@ -1175,4 +1175,5 @@ def picker_line(value, maximum):
     """
     text = " ".join(str(value or "").split())
     text = "".join(char for char in text if ord(char) >= 32)
-    return text[:maximum] + ("…" if len(text) > maximum else "")
+    # The ellipsis counts toward the limit: the wire contract caps these fields at 60.
+    return text[:maximum - 1] + "…" if len(text) > maximum else text
