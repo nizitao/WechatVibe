@@ -65,6 +65,15 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertLessEqual(MAX_HISTORY_THREADS, 200)
 
 
+    def test_deleting_a_conversation_removes_its_messages_and_is_idempotent(self):
+        keep = self.seed(messages=[("user", "留下")])
+        gone = self.seed(messages=[("user", "删掉"), ("assistant", "好的")])
+        self.assertTrue(self.database.delete_thread(gone))
+        self.assertEqual([row["id"] for row in self.database.list_threads(USER, "builtin:advisor")], [keep])
+        self.assertIsNone(self.database.thread(gone))
+        self.assertEqual(self.database.thread_messages(gone), [])
+        self.assertFalse(self.database.delete_thread(gone))
+
 class PickerLineTests(unittest.TestCase):
     def test_long_messages_are_truncated_instead_of_failing_the_list(self):
         from advisor_service import picker_line

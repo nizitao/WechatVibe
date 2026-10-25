@@ -327,6 +327,25 @@
       preview.className = "advisor-history-preview";
       preview.textContent = (thread.previewRole === "assistant" ? "助手：" : "") + (thread.preview || "");
       row.appendChild(head); row.appendChild(meta); row.appendChild(preview);
+      // Deleting is a two-step action on the row itself: the first click arms it, the second
+      // removes the conversation. It never falls through to "open this conversation".
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "advisor-history-delete";
+      remove.textContent = "删除";
+      remove.setAttribute("aria-label", "删除这段会话");
+      remove.addEventListener("click", event => {
+        // The row would otherwise treat this click as "open this conversation".
+        event.stopPropagation?.();
+        if (row.dataset.confirmDelete !== "1") {
+          row.dataset.confirmDelete = "1";
+          remove.textContent = "确认删除";
+          return;
+        }
+        closeHistoryMenu();
+        sendToParent("ADVISOR_DELETE_THREAD", { threadId: thread.id });
+      });
+      row.appendChild(remove);
       row.addEventListener("click", () => {
         closeHistoryMenu();
         if (thread.id !== activeThreadId) sendToParent("ADVISOR_OPEN_THREAD", { threadId: thread.id });

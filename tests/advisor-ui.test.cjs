@@ -1365,3 +1365,54 @@ test("clicking the history button label keeps the menu open", () => {
   assert.match(source, /if \(!historyButton\.contains\(target\) && !historyMenu\.contains\(target\)\) closeHistoryMenu\(\);/);
   assert.doesNotMatch(source, /target !== historyButton/);
 });
+
+test("deleting needs a second click and never opens the conversation", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const sent = [];
+  hostEnv.window.postMessage = data => { sent.push(json(data)); hostEnv.nativeEmit(data); };
+  advisor.postToFrame("ADVISOR_SET_THREADS", {
+    threads: [
+      { id: "t-now", title: "当前", preview: "", previewRole: "", messageCount: 1,
+        createdAtMs: 1, updatedAtMs: 2 },
+      { id: "t-old", title: "更早", preview: "", previewRole: "", messageCount: 1,
+        createdAtMs: 1, updatedAtMs: 1 },
+    ],
+    activeThreadId: "t-now",
+  });
+  const menu = frameEnv.elements.get("historyMenu");
+  const row = menu.children[1];
+  const remove = row.children[3];
+  assert.equal(remove.className, "advisor-history-delete");
+  assert.equal(remove.textContent, "删除");
+
+  await remove.dispatch("click");
+  assert.equal(row.dataset.confirmDelete, "1");
+  assert.equal(remove.textContent, "确认删除");
+  assert.equal(sent.filter(message => message.type === "ADVISOR_DELETE_THREAD").length, 0);
+  assert.equal(sent.filter(message => message.type === "ADVISOR_OPEN_THREAD").length, 0,
+    "arming the delete must not open the conversation");
+
+  await remove.dispatch("click");
+  const deleted = sent.filter(message => message.type === "ADVISOR_DELETE_THREAD");
+  assert.equal(deleted.length, 1);
+  assert.deepEqual(json(deleted[0].payload), { threadId: "t-old" });
+  assert.equal(menu.hidden, true);
+});
+
+test("the host deletes through the endpoint and refreshes the list", async () => {
+  const { hostEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const calls = [];
+  advisor.fetchJson = async (url, options) => {
+    calls.push({ url: String(url), body: options?.body ? JSON.parse(options.body) : null });
+    if (String(url).startsWith("/api/advisor/threads")) return { threads: [] };
+    return { thread: thread(), run: null, draft: "" };
+  };
+  hostEnv.nativeEmit(request(hostEnv, "ADVISOR_DELETE_THREAD", { threadId: "t-old" }).data);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls[0].url, "/api/advisor/threads/delete");
+  assert.deepEqual(calls[0].body, { account: "account-a", user: "friend-a", agentId: "advisor", threadId: "t-old" });
+  assert.ok(calls.some(call => call.url.startsWith("/api/advisor/threads?")));
+});

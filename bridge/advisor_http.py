@@ -4,6 +4,7 @@ from advisor_contracts import AdvisorError
 
 POST_PATHS = frozenset({"/api/advisor/templates", "/api/advisor/skills", "/api/advisor/context",
                         "/api/advisor/run", "/api/advisor/stop", "/api/advisor/new-thread",
+                        "/api/advisor/threads/delete",
                         "/api/advisor/import/preview", "/api/advisor/import/commit", "/api/advisor/import/cancel"})
 GET_PATHS = frozenset({"/api/advisor/catalog", "/api/advisor/thread", "/api/advisor/threads",
                        "/api/advisor/events"})
@@ -79,6 +80,10 @@ def post(service, path, request):
     if path == "/api/advisor/new-thread":
         _shape(request, ("account", "user", "agentId"))
         return service.new_thread(request["account"], request["user"], request["agentId"])
+    if path == "/api/advisor/threads/delete":
+        _shape(request, ("account", "user", "agentId", "threadId"))
+        return service.delete_thread(request["account"], request["user"], request["agentId"],
+                                     request["threadId"])
     raise AdvisorError("invalid-request", "接口不存在")
 
 

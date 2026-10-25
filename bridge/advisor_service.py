@@ -429,6 +429,33 @@ class AdvisorService:
                 "context": self._context_status(self.context.snapshot(account, user)),
                 "run": live_run.public() if live_run else self._public_run(run) if run else None}
 
+    def delete_thread(self, account, user, agent_id, thread_id):
+        """Delete one saved conversation. Another contact's thread is reported as unknown."""
+        account = self._require_scope(account)
+        user = valid_scope_value(user, "user")
+        if not valid_identifier(agent_id):
+            raise AdvisorError("invalid-request", "invalid agent id")
+        if self.stores.config.agent(agent_id) is None:
+            raise AdvisorError("agent-unknown", "Agent 不存在")
+        if not valid_identifier(thread_id):
+            raise AdvisorError("invalid-request", "invalid thread id")
+        database = self.stores.account(account)
+        with self.condition:
+            self._require_scope(account)
+            row = database.thread(thread_id)
+            if row is None or row["user"] != user or row["agent_id"] != agent_id:
+                raise AdvisorError("thread-unknown", "会话不存在或不属于该 Agent")
+            run = database.latest_run(thread_id)
+            if run is not None:
+                with self.condition:
+                    live = self._runs.get(run["id"])
+                if live is not None and live.state == "running":
+                    raise AdvisorError("run-active", "该会话正在生成，请先停止")
+            if not database.delete_thread(thread_id):
+                raise AdvisorError("thread-unknown", "会话不存在或不属于该 Agent")
+            self._runs.pop(run["id"], None) if run is not None else None
+        return {"deleted": True, "threadId": thread_id}
+
     def threads(self, account, user, agent_id):
         """The contact's saved conversations, newest first, for the history picker."""
         account = self._require_scope(account)
