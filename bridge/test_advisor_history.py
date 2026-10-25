@@ -78,5 +78,12 @@ class PickerLineTests(unittest.TestCase):
         self.assertEqual(picker_line(None, 60), "")
 
 
+    def test_emoji_count_as_two_units_so_the_wire_limit_holds(self):
+        from advisor_service import picker_line
+        line = picker_line("😂" * 100, 60)
+        self.assertLessEqual(len(line.encode("utf-16-le")) // 2, 60)
+        self.assertTrue(line.endswith("…"))
+
+
 if __name__ == "__main__":
     unittest.main()

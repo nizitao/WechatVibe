@@ -1170,10 +1170,19 @@ class AdvisorService:
 def picker_line(value, maximum):
     """One line for the history picker: collapse whitespace, drop control characters, truncate.
 
-    `single_line` rejects text longer than its limit, and a chat message usually is, so one
-    long message used to fail the whole list with `invalid preview`.
+    The limit counts UTF-16 code units because the UI validates with JavaScript string
+    lengths; an emoji is two of them. Truncating by Python characters produced strings the
+    client rejected, which surfaced as a permanently failing history list.
     """
     text = " ".join(str(value or "").split())
     text = "".join(char for char in text if ord(char) >= 32)
-    # The ellipsis counts toward the limit: the wire contract caps these fields at 60.
-    return text[:maximum - 1] + "…" if len(text) > maximum else text
+    if len(text.encode("utf-16-le")) // 2 <= maximum:
+        return text
+    kept, used = [], 0
+    for char in text:
+        width = len(char.encode("utf-16-le")) // 2
+        if used + width > maximum - 1:
+            break
+        kept.append(char)
+        used += width
+    return "".join(kept) + "…"
