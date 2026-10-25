@@ -443,10 +443,10 @@ class AdvisorService:
             rows = database.list_threads(user, agent_id)
         conversations = []
         for row in rows:
-            title = row["title"] or row["preview"] or "新对话"
+            title = picker_line(row["title"] or row["preview"] or "", 60)
             conversations.append({
-                "id": row["id"], "title": single_line(title, "title", 60, True) or "新对话",
-                "preview": single_line(row["preview"] or "", "preview", 60, True),
+                "id": row["id"], "title": title or "新对话",
+                "preview": picker_line(row["preview"] or "", 60),
                 "previewRole": row["preview_role"] or "",
                 "messageCount": int(row["message_count"] or 0),
                 "createdAtMs": int(row["created_at_ms"] or 0),
@@ -1164,3 +1164,15 @@ class AdvisorService:
         with self.condition:
             self._runs.clear()
             self._active_by_thread.clear()
+
+
+
+def picker_line(value, maximum):
+    """One line for the history picker: collapse whitespace, drop control characters, truncate.
+
+    `single_line` rejects text longer than its limit, and a chat message usually is, so one
+    long message used to fail the whole list with `invalid preview`.
+    """
+    text = " ".join(str(value or "").split())
+    text = "".join(char for char in text if ord(char) >= 32)
+    return text[:maximum] + ("…" if len(text) > maximum else "")

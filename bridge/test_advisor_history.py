@@ -65,5 +65,18 @@ class HistoryStoreTests(unittest.TestCase):
         self.assertLessEqual(MAX_HISTORY_THREADS, 200)
 
 
+class PickerLineTests(unittest.TestCase):
+    def test_long_messages_are_truncated_instead_of_failing_the_list(self):
+        from advisor_service import picker_line
+        line = picker_line("长" * 200, 60)
+        self.assertEqual(len(line), 61)  # 60 characters plus the ellipsis
+        self.assertTrue(line.endswith("…"))
+
+    def test_newlines_and_control_characters_collapse_to_one_line(self):
+        from advisor_service import picker_line
+        self.assertEqual(picker_line("  第一行\n第二行\t第三行  ", 60), "第一行 第二行 第三行")
+        self.assertEqual(picker_line(None, 60), "")
+
+
 if __name__ == "__main__":
     unittest.main()
