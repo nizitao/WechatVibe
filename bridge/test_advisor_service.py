@@ -247,9 +247,9 @@ class ConfigurationTests(ServiceTestCase):
     def profiles_at_same_endpoint(self):
         store = ModelSourceStore(self.root / "synthetic-model-source.json", root=self.root,
                                  protect=lambda value: value.encode(), unprotect=lambda value: value.decode())
-        a = store.save_profile(None, "A", "chat_completions", "http://127.0.0.1:9",
+        a = store.save_profile(None, "A", "chat_completions", "https://synthetic-provider.invalid/v1",
                                "synthetic-model", "synthetic-key-A", 32768)
-        b = store.save_profile(None, "B", "chat_completions", "http://127.0.0.1:9",
+        b = store.save_profile(None, "B", "chat_completions", "https://synthetic-provider.invalid/v1",
                                "synthetic-model", "synthetic-key-B", 32768)
         store.select_profile(b)
         self.service.model_source_store = store
@@ -282,6 +282,9 @@ class ConfigurationTests(ServiceTestCase):
         self.assertIsNone(self.service.stores.account(ACCOUNT).latest_thread(USER, AGENT))
         self.model_store.mode = "api"
         self.model_store.key = None
+        remote_selection = self.model_store.saved_selection()
+        remote_selection["api"]["baseUrl"] = "https://synthetic-provider.invalid/v1"
+        self.model_store.saved_selection = lambda: remote_selection
         started = self.service.start(ACCOUNT, USER, AGENT, None, "你好", "req-nokey")
         finished = self.wait_run(started["run"]["id"])
         self.assertEqual(finished["run"]["state"], "error")

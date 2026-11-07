@@ -8,7 +8,7 @@ const source = fs.readFileSync(path.join(__dirname, 'desktop-main.cjs'), 'utf8')
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 async function launch(isPackaged, stdout, options = {}) {
-  const calls = { errors: [], launches: [], shellLoads: 0, profiles: [], quit: 0 };
+  const calls = { errors: [], launches: [], shellLoads: 0, profiles: [], quit: 0, diagnostics: [] };
   const env = { CHATUI_PORT: '8805', PATH: 'synthetic-path', ...(options.env || {}) };
   const processStub = {
     env, argv: options.argv || [], resourcesPath: path.join(__dirname, 'synthetic-resources'),
@@ -19,7 +19,14 @@ async function launch(isPackaged, stdout, options = {}) {
     whenReady: () => Promise.resolve(),
     quit: () => { calls.quit += 1; },
   };
-  const fakeFs = { existsSync: () => true, mkdirSync: () => {} };
+  const fakeFs = {
+    existsSync: name => name !== options.missingFile,
+    mkdirSync: () => {},
+    writeFileSync: (name, data) => {
+      if (options.writeFailure) throw new Error('synthetic read-only directory');
+      calls.diagnostics.push({ name, data });
+    },
+  };
   const fakeChild = {
     execFile: (python, args, execOptions, done) => {
       calls.launches.push({ python, args, options: execOptions });
@@ -141,6 +148,8 @@ async function main() {
   assert.deepEqual(Array.from(ownedCleanups[0].args).slice(-2), ['--stop-owned-bridge', '--json']);
   assert.equal(ownedCleanups[0].options.env.WECHATVIBE_CLIENT_ROOT,
     path.join(__dirname, 'synthetic-resources', 'client'));
+  assert.equal(ownedCleanups[0].options.env.CHATUI_PORT, undefined,
+    'cleanup must resolve the same installation port as the initial launch');
 
   const invalidReused = await launch(true, JSON.stringify({ version: 'real-ui-1',
     url: 'http://localhost:34567', instanceId, created: false }));
@@ -182,6 +191,37 @@ async function main() {
   const shellReused = await launch(true, validResult(false), { shellThrows: true });
   assert.equal(shellReused.calls.errors.length, 1);
   assert.equal(cleanupLaunches(shellReused.calls).length, 0);
+
+  // Diagnostics retain only bounded categories. Untrusted output and exceptions may
+  // contain local paths, bridge control tokens or credentials and must never be copied.
+  const secret = 'C:/Users/private-person/private-key-' + 'a'.repeat(10000);
+  const detailedFailure = await launch(true, JSON.stringify({ startupFailure: 'shell_identity' }),
+    { execError: new Error(secret) });
+  assert.match(detailedFailure.calls.errors[0][1], /shell_identity/);
+  assert.equal(detailedFailure.calls.diagnostics.length, 1);
+  const diagnostic = detailedFailure.calls.diagnostics[0];
+  assert.equal(diagnostic.name,
+    path.join(rootFor(true), '.local', 'real-client-shell', 'startup-failure.json'));
+  assert.equal(JSON.parse(diagnostic.data).code, 'shell_identity');
+  assert.ok(diagnostic.data.length < 256);
+  assert.ok(!diagnostic.data.includes('private-person'));
+  assert.ok(!detailedFailure.calls.errors[0][1].includes('private-person'));
+  const unknownFailure = await launch(true, JSON.stringify({ startupFailure: secret }),
+    { execError: new Error(secret) });
+  assert.match(unknownFailure.calls.errors[0][1], /launcher_failed/);
+  const corruptSecret = await launch(true, secret + ' "created": true');
+  assert.equal(cleanupLaunches(corruptSecret.calls).length, 1);
+  assert.ok(!JSON.stringify(corruptSecret.calls.errors).includes('private-person'));
+  assert.ok(!JSON.stringify(corruptSecret.calls.diagnostics).includes('private-person'));
+  const readOnly = await launch(true, '', { execError: new Error(secret), writeFailure: true });
+  assert.equal(readOnly.calls.quit, 1);
+  assert.equal(readOnly.calls.errors.length, 1);
+  const timeout = await launch(true, '', { execError: { killed: true, message: secret } });
+  assert.match(timeout.calls.errors[0][1], /launcher_timeout/);
+  const profiledFailure = await launch(true, '', { execError: new Error('synthetic'),
+    argv: ['electron', '.', '--profile', 'secondary'] });
+  assert.equal(profiledFailure.calls.diagnostics[0].name,
+    path.join(rootFor(true), '.local', 'real-client-shell', 'secondary', 'startup-failure.json'));
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1; });

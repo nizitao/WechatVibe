@@ -61,12 +61,13 @@ class PayloadCipher:
             return None
         return (stat.st_size, stat.st_mtime_ns)
 
-    def _read_key(self):
+    def _read_key(self, path=None):
         try:
-            checked_path(self.key_path)
-            if not self.key_path.is_file() or self.key_path.stat().st_size > 16384:
+            path = self.key_path if path is None else Path(path)
+            checked_path(path)
+            if not path.is_file() or path.stat().st_size > 16384:
                 raise ValueError("invalid key file")
-            key = self._unprotect(base64.b64decode(self.key_path.read_bytes(), validate=True))
+            key = self._unprotect(base64.b64decode(path.read_bytes(), validate=True))
             if not isinstance(key, bytes) or len(key) != KEY_BYTES:
                 raise ValueError("invalid key length")
             return key
@@ -180,18 +181,37 @@ class PayloadCipher:
         return self
 
     def backup_key(self):
-        """Retain one protected key backup; never replace an existing backup."""
+        """Repair an unreadable backup from the live key, retaining its original bytes.
+
+        A readable backup with a different actual key remains a conflict. Existing result-store
+        manifests still authenticate the repaired bytes; they are never rewritten to bless a
+        replacement live key.
+        """
         if self.key_path is None:
             return None
-        self._load_key(create=True)
+        key = self._load_key(create=True)
         path = checked_path(self.key_path)
         backup = path.with_name("analysis-key.backup.bin")
         with ProcessLock(path.with_name(path.name + ".lock")).acquire(timeout=10):
             checked_path(backup)
+            if self._read_key() != key:
+                raise PayloadUnreadable()
             if backup.exists():
-                if backup.read_bytes() != path.read_bytes():
-                    raise PayloadUnreadable("分析密钥备份与当前密钥不一致，已有文件已保留")
-                return backup
+                if backup.read_bytes() == path.read_bytes():
+                    return backup
+                try:
+                    backup_key = self._read_key(backup)
+                except PayloadUnreadable:
+                    # Keep the damaged bytes for recovery instead of deleting or overwriting them.
+                    stale = backup.with_name(backup.name + ".stale." + uuid.uuid4().hex)
+                    checked_path(stale)
+                    os.replace(backup, stale)
+                else:
+                    if backup_key != key:
+                        raise PayloadUnreadable("分析密钥备份与当前密钥不一致，已有文件已保留")
+                    # DPAPI may wrap the same key in different bytes. Preserve the backup so the
+                    # existing manifest digest remains valid.
+                    return backup
             temporary = backup.with_name(backup.name + "." + uuid.uuid4().hex + ".tmp")
             try:
                 with temporary.open("xb") as stream:

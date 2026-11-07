@@ -5,6 +5,7 @@
   const object = value => value !== null && typeof value === "object" && !Array.isArray(value);
   const text = (value, limit) => typeof value === "string" && value.length <= limit;
   const id = value => text(value, 240) && value.length > 0;
+  const profileId = value => typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
   function nonce(prefix) {
     const bytes = new Uint8Array(16);
     window.crypto.getRandomValues(bytes);
@@ -28,21 +29,6 @@
       value.skills.every(skill => object(skill) && id(skill.id) && text(skill.name, 60)) &&
       ["available", "missing"].includes(value.engine?.state);
   }
-  function validModelProfiles(value) {
-    return object(value) && Array.isArray(value.profiles) && value.profiles.length <= 200 &&
-      // 64 is `MAX_PROFILE_NAME` in bridge/model_source.py: a longer-than-60 name used to fail
-      // this check and discard the whole list, so the cap has to match the store.
-      value.profiles.every(profile => object(profile) && id(profile.id) && text(profile.name, 64) &&
-        (profile.model === undefined || text(profile.model, 256)) &&
-        (profile.protocol === undefined || text(profile.protocol, 40))) &&
-      (value.label === undefined || text(value.label, 60)) &&
-      // `api` is the analysis line's active profile: it carries `id`/`protocol`/`model`, but
-      // never a `name` — requiring one here rejected every real document and emptied the picker.
-      (value.api === undefined || value.api === null || (object(value.api) &&
-        (value.api.id === undefined || id(value.api.id)) &&
-        (value.api.name === undefined || text(value.api.name, 64)))) &&
-      (value.assistantProfileId === null || value.assistantProfileId === undefined || id(value.assistantProfileId));
-  }
   function validThreadSummary(value) {
   return object(value) && id(value.id) && text(value.title, 60) && text(value.preview, 60) &&
     (value.previewRole === "" || value.previewRole === "user" || value.previewRole === "assistant" ||
@@ -53,6 +39,12 @@ function validThread(value, scope) {
     return object(value) && id(value.id) && value.account === scope.account && value.user === scope.user &&
       value.agentId === scope.agentId && Array.isArray(value.messages) && value.messages.every(message =>
         object(message) && id(message.id) && ["user", "assistant", "status"].includes(message.role) && text(message.text, 2000000));
+  }
+  function validModelProfiles(value) {
+    return object(value) && Array.isArray(value.profiles) && value.profiles.length <= 20 &&
+      value.profiles.every(profile => object(profile) && profileId(profile.id) &&
+        text(profile.name, 64) && profile.name.trim().length > 0) &&
+      (value.assistantProfileId == null || profileId(value.assistantProfileId));
   }
   function errorText(value) {
     if (text(value?.message, 20000) && value.message) return value.message;
@@ -69,6 +61,7 @@ function validThread(value, scope) {
     catalog: { agents: [], skills: [], engine: { state: "missing" } },
     catalogReady: false, catalogError: "", catalogBusy: false,
     modelProfiles: [], assistantProfileId: "", analysisLabel: "", historySerial: 0,
+    modelLoadSerial: 0, modelSelectionPending: false,
     drafts: storedObject("advisor_drafts_v1"), threadCache: storedObject("advisor_threads_v1"),
     pendingRequests: storedObject("advisor_pending_v1"),
     pollAbortController: null, submitPending: false, stopPending: false,
@@ -102,7 +95,13 @@ function validThread(value, scope) {
     },
     flushThreadCache() {
       clearTimeout(this.cacheSaveTimer); this.cacheSaveTimer = null;
-      save("advisor_threads_v1", this.threadCache);
+      // A run is live backend state; restoring it from browser storage creates an unreachable stop action.
+      const persisted = {};
+      for (const [key, thread] of Object.entries(this.threadCache)) {
+        persisted[key] = { ...thread };
+        delete persisted[key]._advisorRun;
+      }
+      save("advisor_threads_v1", persisted);
     },
     getEnabledTemplates() { return this.catalogReady ? this.catalog.agents.filter(agent => agent.enabled) : []; },
     getReplyContext() {
@@ -155,7 +154,7 @@ function validThread(value, scope) {
           delivery: pending.delivery || "pending", createdAtMs: pending.createdAtMs || Date.now() });
       }
       const saved = this.threadProjection;
-      return { thread, run: saved && this.isCurrent(saved.scope) && saved.thread.id === thread.id ? saved.run : cached._advisorRun || null };
+      return { thread, run: saved && this.isCurrent(saved.scope) && saved.thread.id === thread.id ? saved.run : null };
     },
     syncThreadToFrame(thread, run = null, scope = this.captureScope()) {
       if (!this.isCurrent(scope)) return;
@@ -172,7 +171,7 @@ function validThread(value, scope) {
       const scope = this.captureScope(), projection = this.projectionForScope(scope);
       this.postToFrame("ADVISOR_SET_TEMPLATES", { enabledTemplates: this.getEnabledTemplates(), activeAgentId: scope.agentId,
         catalogReady: this.catalogReady, engineState: this.catalogReady ? this.catalog.engine.state : "unknown" }, scope);
-      this.postToFrame("ADVISOR_SET_MODELS", this.modelPayload(), scope);
+      this.syncModelsToFrame(scope);
       this.syncThreadToFrame(projection.thread, projection.run, scope);
       this.postToFrame("ADVISOR_SUBMIT_STATE", { pending: this.submitPending }, scope);
       this.postToFrame("ADVISOR_STOP_STATE", { pending: this.stopPending }, scope);
@@ -206,46 +205,44 @@ function validThread(value, scope) {
       this.syncTemplatesToFrame(); this.renderRepository(); return true;
     },
     async loadModelProfiles() {
-      // The assistant may pick its own saved profile while analysis keeps running as it is, so
-      // the menu reads the local model-source document instead of the catalog. This endpoint
-      // never contacts a provider, which keeps the local mode free of any model-connectors call.
+      if (this.modelSelectionPending) return false;
+      const serial = ++this.modelLoadSerial, scope = this.captureScope();
       const data = await this.fetchJson("/api/model-source");
+      if (serial !== this.modelLoadSerial || !this.isCurrent(scope)) return false;
       if (!validModelProfiles(data)) {
-        this.modelProfiles = []; this.assistantProfileId = ""; this.analysisLabel = ""; this.syncModelsToFrame(); return false;
+        this.problem(data, scope, "catalog"); return false;
       }
-      // `api` is the profile the analysis line would hand the assistant when it follows it.
-      // The stored `label` is not used here: in local mode it reads "本地 Laya", which the
-      // assistant can never run on — the last activated API profile is what it would inherit.
-      // `api` has no `name` of its own, so the label comes from the profile row with that id.
       this.modelProfiles = data.profiles.map(profile => ({ id: profile.id, name: profile.name,
         model: profile.model || "", protocol: profile.protocol || "" }));
       this.assistantProfileId = data.assistantProfileId || "";
-      this.analysisLabel = data.profiles.find(profile => profile.id === data.api?.id)?.name || "";
-      this.syncModelsToFrame(); return true;
+      this.syncModelsToFrame(scope); return true;
     },
     modelPayload() {
-      return { profiles: this.modelProfiles, assistantProfileId: this.assistantProfileId,
-        analysisLabel: this.analysisLabel };
+      return { profiles: this.modelProfiles, assistantProfileId: this.assistantProfileId || null,
+        analysisLabel: this.analysisLabel, pending: this.modelSelectionPending };
     },
-    syncModelsToFrame() {
-      this.postToFrame("ADVISOR_SET_MODELS", this.modelPayload());
+    syncModelsToFrame(scope = this.captureScope()) {
+      this.postToFrame("ADVISOR_SET_MODELS", this.modelPayload(), scope);
     },
-    async selectModelProfile(profileId) {
+    async selectModelProfile(selectedId) {
+      if (this.modelSelectionPending || this.submitPending || this.currentRunId ||
+        (selectedId !== null && (!profileId(selectedId) || !this.modelProfiles.some(profile => profile.id === selectedId))) ||
+        selectedId === (this.assistantProfileId || null)) return;
       const scope = this.captureScope();
-      // `null` means "follow analysis again"; it is the only way back from a pinned profile.
-      if (profileId !== null && (!id(profileId) || !this.modelProfiles.some(profile => profile.id === profileId))) return;
-      const result = await this.fetchJson("/api/model-source/select",
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profileId }) });
-      if (!this.isCurrent(scope)) return;
-      if (result?.error || (result?.profileId ?? null) !== profileId) {
-        this.problem({ error: result?.status === 400 ? "模型档案不存在或已更改" : errorText(result) }, scope, "catalog"); return;
+      this.modelLoadSerial++; this.modelSelectionPending = true; this.syncModelsToFrame();
+      try {
+        const result = await this.fetchJson("/api/model-source/select", { method: "POST",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify({ profileId: selectedId }) });
+        if (result?.profileId !== selectedId) {
+          this.problem({ error: result?.status === 400 ? "模型档案不存在或已更改" : errorText(result) }, scope, "catalog"); return;
+        }
+        this.modelLoadSerial++;
+        // Model selection belongs to the instance, including when the chat changed during the POST.
+        this.assistantProfileId = selectedId || "";
+        this.syncModelsToFrame(); await this.loadCatalog();
+      } finally {
+        this.modelSelectionPending = false; this.syncModelsToFrame();
       }
-      // Only the assistant selection moved; the engine state follows the profile, so the
-      // catalog has to be read again. The analysis mode is deliberately left untouched, and so
-      // is `analysisLabel`: the analysis line keeps whatever source it already had.
-      this.assistantProfileId = profileId || "";
-      this.syncModelsToFrame();
-      await this.loadCatalog();
     },
     async mutateCatalog(url, payload, onError) {
       const serial = ++this.catalogSerial;
@@ -326,13 +323,13 @@ function validThread(value, scope) {
     async startRun(message, agentId = this.activeAgentId) {
       const scope = this.captureScope();
       if (!this.isCurrent(scope) || !scope.account || !scope.user || !id(scope.agentId) || agentId !== scope.agentId ||
-        !text(message, 16000) || !message.trim() || this.submitPending) return;
+        !text(message, 16000) || !message.trim() || this.submitPending || this.modelSelectionPending) return;
       if (/^\s*\/reset\s*$/.test(message)) { await this.newThread(agentId, true); return; }
       if (this.currentRunId) return;
       if (!this.catalogReady || !this.catalog.agents.some(agent => agent.id === agentId && agent.enabled)) {
         this.problem({ error: "模板未启用" }, scope, "catalog"); return;
       }
-      if (this.catalog.engine.state !== "available") { this.problem({ error: "军师引擎未安装" }, scope, "catalog"); return; }
+      if (this.catalog.engine.state !== "available") { this.problem({ error: "请检查助手引擎和 API 模型配置" }, scope, "catalog"); return; }
       this.submitPending = true;
       this.clearProblem("send", scope);
       const key = this.scopeKey(scope.account, scope.user, scope.agentId);
@@ -685,8 +682,9 @@ function validThread(value, scope) {
       if (data.payload.agentId !== undefined && (!id(data.payload.agentId) ||
         (data.type !== "ADVISOR_SWITCH_TEMPLATE" && data.payload.agentId !== this.activeAgentId))) return false;
       if (data.type === "ADVISOR_SWITCH_TEMPLATE") return this.getEnabledTemplates().some(agent => agent.id === data.payload.agentId);
-      if (data.type === "ADVISOR_SELECT_MODEL") return data.payload.profileId === null ||
-        (id(data.payload.profileId) && this.modelProfiles.some(profile => profile.id === data.payload.profileId));
+      if (data.type === "ADVISOR_SELECT_MODEL") return Object.hasOwn(data.payload, "profileId") &&
+        (data.payload.profileId === null || profileId(data.payload.profileId) &&
+        this.modelProfiles.some(profile => profile.id === data.payload.profileId));
       if (data.type === "ADVISOR_SEND") return text(data.payload.text, 16000) && data.payload.text.trim().length > 0;
       if (data.type === "ADVISOR_DRAFT_UPDATE") return text(data.payload.draft, 16000);
       if (data.type === "ADVISOR_COPY") return text(data.payload.text, 2000000);
@@ -715,8 +713,8 @@ function validThread(value, scope) {
         } else if (type === "ADVISOR_SEND") void this.startRun(payload.text, payload.agentId);
         else if (type === "ADVISOR_SELECT_MODEL") void this.selectModelProfile(payload.profileId);
         else if (type === "ADVISOR_NEW_THREAD") void this.newThread();
-      else if (type === "ADVISOR_HISTORY_REQUEST") void this.loadThreads();
-      else if (type === "ADVISOR_DELETE_THREAD") void this.deleteThread(payload.threadId);
+        else if (type === "ADVISOR_HISTORY_REQUEST") void this.loadThreads();
+        else if (type === "ADVISOR_DELETE_THREAD") void this.deleteThread(payload.threadId);
         else if (type === "ADVISOR_OPEN_THREAD") void this.openThread(payload.threadId);
         else if (type === "ADVISOR_STOP") void this.stopRun();
         else if (type === "ADVISOR_DRAFT_UPDATE") this.setDraft(this.currentAccount, this.currentUser, this.activeAgentId, payload.draft);
@@ -932,6 +930,10 @@ function validThread(value, scope) {
       finally { submit.disabled = false; }
     }, "advisor-btn advisor-btn-primary"); actions.appendChild(submit); modal.card.appendChild(actions);
   }
+  window.addEventListener("model-source-updated", () => {
+    if (!Advisor.panelVisible || Advisor.modelSelectionPending) return;
+    void Advisor.loadModelProfiles(); void Advisor.loadCatalog();
+  });
   // Settings owns the saved profiles. The assistant panel keeps running behind that modal, so
   // closing it is the moment the cached list can be stale — re-read instead of waiting for the
   // next open.

@@ -188,6 +188,47 @@ def _digest(path: Path) -> str:
     return result.hexdigest()
 
 
+def _verify_model_pins(rows, source: Path) -> None:
+    """Require every included model file to match the manifest shipped beside it."""
+    manifest_path = source / "resources/client/scripts/model-files.json"
+    try:
+        if manifest_path.stat().st_size > 64 * 1024:
+            raise ValueError("manifest too large")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        pins = manifest["files"]
+        if (type(manifest.get("schema")) is not int or manifest["schema"] != 1 or
+                not isinstance(pins, dict) or not pins):
+            raise ValueError("invalid manifest")
+        seen = set()
+        for name, entry in pins.items():
+            if (not isinstance(name, str) or not name or "\\" in name or
+                    Path(name).is_absolute() or Path(name).as_posix() != name or
+                    any(part in ("", ".", "..") for part in name.split("/")) or
+                    name.casefold() in seen or not isinstance(entry, dict) or
+                    type(entry.get("bytes")) is not int or entry["bytes"] <= 0 or
+                    not isinstance(entry.get("sha256"), str) or
+                    re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None):
+                raise ValueError("invalid model pin")
+            seen.add(name.casefold())
+    except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+        raise ValueError("pinned model manifest is unreadable or invalid") from error
+    present = {}
+    for path, relative, directory, _info in rows:
+        if directory or relative.parts[:3] != ("resources", "client", ".models"):
+            continue
+        if relative.parts[:4] != ("resources", "client", ".models", "laya"):
+            raise ValueError("package holds files outside the pinned Laya model")
+        present[Path(*relative.parts[4:]).as_posix()] = path
+    if set(present) - set(pins):
+        raise ValueError("package holds unpinned model files")
+    for name, entry in pins.items():
+        model = present.get(name)
+        if model is None:
+            raise ValueError(f"pinned model file is missing from the package: {name}")
+        if model.stat().st_size != entry["bytes"] or _digest(model) != entry["sha256"]:
+            raise ValueError(f"pinned model hash differs: {name}")
+
+
 def _verify_asar(files: dict[str, tuple[Path, os.stat_result]], version: str,
                  node_exe: Path | None) -> None:
     node_source = node_exe or os.environ.get("WECHATVIBE_BUILD_NODE") or shutil.which("node")
@@ -304,6 +345,8 @@ def build_release(source: Path, output_dir: Path, version: str,
         raise ValueError("output directory cannot be inside package input")
     rows = _scan(source)
     _require_package(rows, version, node_exe)
+    if with_model:
+        _verify_model_pins(rows, source)
     included = (rows if with_model else
                 [row for row in rows if row[1].parts[:3] != ("resources", "client", ".models")])
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -37,7 +37,7 @@ Agent 使用 OpenCode `v1.18.34` 的官方 SDK 和独立 Windows 引擎。来源
 
 完整 Python 版本集合见 [python-requirements.lock.txt](python-requirements.lock.txt)，Node 直接及传递版本见 [package-lock.json](package-lock.json)。读取层的来源说明见 [native-reader/THIRD_PARTY_NOTICES.md](native-reader/THIRD_PARTY_NOTICES.md)。便携构建只复制所需的 Python 包与 Node 包闭包，并保留包内实际附带的许可文件；它不复制整个开发环境。
 
-`wechatauto-replica` 声明的 `winsdk`、`imageio-ffmpeg`、`pyautogui` 在已验证的只读运行集合中未安装，分别属于其可选 GUI、OCR 或媒体路径。这里不声称这些路径可用。客户端不会发送微信消息。默认 Laya 模式在本机分析；用户主动启用 API 模式后，消息分析所需的聊天片段会发送到所配置的服务地址。
+`wechatauto-replica` 声明的 `winsdk`、`imageio-ffmpeg`、`pyautogui` 只用于其可选 GUI、OCR 或媒体路径，本客户端不调用这些路径，打包时始终排除。1.3.0 和 1.3.5 的应用包误带了 `imageio-ffmpeg` 0.6.0 及其 ffmpeg 程序（GPL 3.0 或更高版本），程序从未调用它，1.3.6 起不再包含。这里不声称这些路径可用。客户端不会发送微信消息。默认 Laya 模式在本机分析；用户主动启用 API 模式后，消息分析所需的聊天片段会发送到所配置的服务地址。
 
 ## README 演示头像
 

@@ -356,3 +356,145 @@ it("stops before buffering a response larger than the connector limit", async ()
     });
   });
 });
+
+/**
+ * A stream request with no content-length, so the limit has to be enforced while reading. A gateway
+ * that ignores `stream:true` and answers with one complete JSON completion is exactly the case the
+ * compatibility branch exists for, and an error body never carries a stream either.
+ */
+function oversizedBody(status: number): Response {
+  const payload = new TextEncoder().encode(JSON.stringify({
+    id: "chat_oversized",
+    choices: [{ index: 0, message: { role: "assistant", content: "x".repeat(3 * 1024 * 1024) } }],
+  }));
+  return new Response(new ReadableStream<Uint8Array>({
+    start(controller) { controller.enqueue(payload); controller.close(); },
+  }), { status, headers: { "content-type": "application/json" } });
+}
+
+it("caps the compatibility body read on a stream request", async () => {
+  await withMockFetch(() => oversizedBody(200), async () => {
+    await assert.rejects(() => generateStructured(configs.chat_completions, {
+      system: "", prompt: "synthetic prompt", maxOutputTokens: 64, stream: true,
+    }), (error: unknown) => {
+      assert.ok(error instanceof ModelConnectorError);
+      assert.equal(error.code, "response-too-large");
+      return true;
+    });
+  });
+});
+
+it("caps an error body on a stream request too", async () => {
+  await withMockFetch(() => oversizedBody(500), async () => {
+    await assert.rejects(() => generateStructured(configs.chat_completions, {
+      system: "", prompt: "synthetic prompt", maxOutputTokens: 64, stream: true,
+    }), (error: unknown) => {
+      assert.ok(error instanceof ModelConnectorError);
+      assert.equal(error.code, "response-too-large");
+      return true;
+    });
+  });
+});
+
+for (const protocol of ["responses", "chat_completions"] as const) {
+  it(`${protocol} falls back once to ordinary bounded JSON when stream is rejected`, async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const result = await withMockFetch((_url, init) => {
+      bodies.push(JSON.parse(String(init?.body || "{}")));
+      return bodies.length === 1 ? json({ error: { message: "stream unsupported" } }, 400)
+        : json(generationFixture(protocol));
+    }, () => generateStructured(configs[protocol], {
+      system: "", prompt: "synthetic prompt", maxOutputTokens: 64, stream: true,
+    }));
+    assert.equal(result.text, '{"ok":true}');
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[0].stream, true);
+    assert.equal(bodies[1].stream, undefined);
+  });
+
+  it(`${protocol} adapts a gateway that ignores stream using the standard JSON completion`, async () => {
+    let calls = 0;
+    const deltas: string[] = [];
+    const result = await withMockFetch(() => {
+      calls++;
+      return json(generationFixture(protocol));
+    }, () => generateStructured(configs[protocol], {
+      system: "", prompt: "synthetic prompt", stream: true,
+      onTextDelta: delta => deltas.push(delta),
+    }));
+    assert.equal(calls, 1);
+    assert.equal(result.text, '{"ok":true}');
+    assert.equal(deltas.join(""), result.text);
+  });
+
+  it(`${protocol} keeps the two MiB limit on a non-stream fallback`, async () => {
+    let calls = 0;
+    await withMockFetch(() => ++calls === 1 ? json({ error: { message: "stream unsupported" } }, 400)
+      : oversizedBody(200), async () => {
+      await assert.rejects(() => generateStructured(configs[protocol], {
+        system: "", prompt: "synthetic prompt", stream: true,
+      }), (error: unknown) => error instanceof ModelConnectorError && error.code === "response-too-large");
+    });
+    assert.equal(calls, 2);
+  });
+}
+
+it("delivers a healthy SSE delta before the provider closes its response", async () => {
+  let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+  let firstDelta!: () => void;
+  const receivedDelta = new Promise<void>(resolve => { firstDelta = resolve; });
+  const encoder = new TextEncoder();
+  let timer: NodeJS.Timeout | undefined;
+  await withMockFetch(() => new Response(new ReadableStream<Uint8Array>({
+    start(controller) {
+      streamController = controller;
+      controller.enqueue(encoder.encode('data: {"choices":[{"index":0,"delta":{"content":"first"}}]}\n\n'));
+    },
+  }), { headers: { "content-type": "text/event-stream" } }), async () => {
+    const pending = generateStructured(configs.chat_completions, {
+      system: "", prompt: "synthetic prompt", stream: true,
+      onTextDelta: delta => { assert.equal(delta, "first"); firstDelta(); },
+    });
+    try {
+      await Promise.race([receivedDelta, new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("SSE was buffered until completion")), 2000);
+      })]);
+    } finally {
+      clearTimeout(timer);
+      streamController?.enqueue(encoder.encode("data: [DONE]\n\n"));
+      streamController?.close();
+    }
+    assert.equal((await pending).text, "first");
+  });
+});
+
+it("permits keyless local OpenAI-compatible endpoints across loopback addresses", async () => {
+  for (const address of ["127.0.0.1", "127.2.3.4", "127.255.255.254", "[::1]", "localhost"]) {
+    const config: ModelConfig = { protocol: "chat_completions", baseUrl: `http://${address}:1234/v1`,
+      model: "synthetic-local" };
+    const result = await withMockFetch(url => {
+      assert.equal(url.hostname, new URL(config.baseUrl).hostname);
+      return json(generationFixture("chat_completions"));
+    }, () => generateStructured(config, { system: "", prompt: "synthetic prompt" }));
+    assert.equal(result.text, '{"ok":true}');
+  }
+});
+
+it("does not mistake external hosts or private networks for loopback", () => {
+  for (const address of ["localhost.evil.invalid", "127.0.0.1.evil.invalid", "127.evil.invalid",
+    "192.168.1.2", "10.0.0.1", "[::ffff:7f00:1]", "[2001:db8::1]", "localhost."]) {
+    assert.throws(() => validateModelConfig({ protocol: "chat_completions",
+      baseUrl: `http://${address}:1234/v1`, model: "synthetic" }),
+    (error: unknown) => error instanceof ModelConnectorError && error.code === "invalid-url");
+  }
+});
+
+it("caps non-stream JSON from protocols without a streaming implementation", async () => {
+  for (const protocol of ["anthropic", "gemini", "ollama"] as const) {
+    await withMockFetch(() => oversizedBody(200), async () => {
+      await assert.rejects(() => generateStructured(configs[protocol], {
+        system: "", prompt: "synthetic prompt", stream: true,
+      }), (error: unknown) => error instanceof ModelConnectorError && error.code === "response-too-large");
+    });
+  }
+});

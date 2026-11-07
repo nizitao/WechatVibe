@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import threading
+import time
 import uuid
 from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -127,16 +128,30 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                     self.path.startswith("/") and not self.path.startswith("//"))
 
         def discard_body(self):
-            """Read a small request body the handler is about to ignore."""
+            """Drain only bounded rejected bodies; incomplete senders cannot hold a worker."""
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 return
-            if 0 < length <= 1 << 20:
-                try:
-                    self.rfile.read(length)
-                except OSError:
-                    pass
+            if not 0 < length <= 65536:
+                return
+            previous_timeout = self.connection.gettimeout()
+            deadline = time.monotonic() + 1
+            try:
+                while length:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.connection.settimeout(remaining)
+                    chunk = self.rfile.read1(min(length, 8192))
+                    if not chunk:
+                        break
+                    length -= len(chunk)
+            except OSError:
+                pass
+            finally:
+                self.close_connection = True
+                self.connection.settimeout(previous_timeout)
 
         def send(self, status, body, content_type="application/json; charset=utf-8", headers=None):
             payload = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -356,8 +371,8 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                                  "/api/analysis-workers", "/api/api-workers",
                                  *advisor_http.POST_PATHS,
                                  *model_endpoints):
-                                 self.discard_body()
-                                 return self.send(404, {"error": "not found"})
+                self.discard_body()
+                return self.send(404, {"error": "not found"})
             content_type = [part.strip().lower() for part in self.headers.get("Content-Type", "").split(";")]
             if content_type[0] != "application/json" or any(part != "charset=utf-8" for part in content_type[1:]):
                 return self.send(415, {"error": "application/json required"})

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import shutil
@@ -50,7 +51,18 @@ class BuildReleaseTests(unittest.TestCase):
         self.add_file("resources/client/scripts/real-client-update-extract.py")
         self.add_file("resources/client/bridge/chat_server.py")
         self.add_file("resources/client/chatui/index.html")
-        self.add_file("resources/client/.models/laya/model.onnx", b"synthetic model")
+        self.model_bytes = b"synthetic model"
+        self.add_file("resources/client/.models/laya/model.onnx", self.model_bytes)
+        self.write_model_manifest()
+
+    def write_model_manifest(self, *, files=None, schema=1):
+        self.add_file("resources/client/scripts/model-files.json", json.dumps({
+            "schema": schema,
+            "files": files if files is not None else {
+                "model.onnx": {"bytes": len(self.model_bytes),
+                               "sha256": hashlib.sha256(self.model_bytes).hexdigest()},
+            },
+        }).encode("utf-8"))
 
     def add_file(self, relative: str, payload: bytes = b"synthetic") -> Path:
         target = self.source / relative
@@ -95,6 +107,45 @@ class BuildReleaseTests(unittest.TestCase):
         with zipfile.ZipFile(archive_path) as archive:
             self.assertEqual(archive.read(
                 "win-unpacked/resources/client/.models/laya/model.onnx"), b"synthetic model")
+
+    def test_full_variant_checks_all_model_pins_before_creating_output(self):
+        for label, files, schema in (
+                ("hash", {"model.onnx": {"bytes": len(self.model_bytes), "sha256": "0" * 64}}, 1),
+                ("size", {"model.onnx": {"bytes": 1, "sha256": "0" * 64}}, 1),
+                ("empty", {}, 1),
+                ("schema", None, 2),
+                ("boolean-size", {"model.onnx": {"bytes": True, "sha256": "0" * 64}}, 1),
+                ("parent-path", {"../model.onnx": {"bytes": 3, "sha256": "0" * 64}}, 1),
+                ("missing", {"missing.onnx": {"bytes": 3, "sha256": "0" * 64}}, 1)):
+            with self.subTest(case=label):
+                self.write_model_manifest(files=files, schema=schema)
+                target = self.root / label
+                with self.assertRaises(ValueError):
+                    builder.build_release(self.source, target, "1.0.2", with_model=True)
+                self.assertFalse(target.exists())
+
+    def test_full_variant_rejects_unpinned_model_files_and_other_model_roots(self):
+        for index, relative in enumerate(("resources/client/.models/laya/unreviewed.bin",
+                                          "resources/client/.models/other/model.onnx")):
+            with self.subTest(relative=relative):
+                extra = self.add_file(relative)
+                with self.assertRaisesRegex(ValueError, "unpinned|outside the pinned"):
+                    builder.build_release(self.source, self.root / f"extra-{index}", "1.0.2", with_model=True)
+                extra.unlink()
+
+    def test_full_variant_requires_pinned_tokenizer_and_valid_manifest(self):
+        model_pin = {"bytes": len(self.model_bytes), "sha256": hashlib.sha256(self.model_bytes).hexdigest()}
+        self.write_model_manifest(files={"model.onnx": model_pin,
+            "tokenizer/tokenizer.json": {"bytes": 3, "sha256": hashlib.sha256(b"abc").hexdigest()}})
+        with self.assertRaisesRegex(ValueError, "missing"):
+            builder.build_release(self.source, self.root / "missing-tokenizer", "1.0.2", with_model=True)
+        self.add_file("resources/client/.models/laya/tokenizer/tokenizer.json", b"abc")
+        archive = builder.build_release(self.source, self.root / "valid-tokenizer", "1.0.2", with_model=True)
+        with zipfile.ZipFile(archive) as content:
+            self.assertEqual(content.read("win-unpacked/resources/client/.models/laya/tokenizer/tokenizer.json"), b"abc")
+        (self.source / "resources/client/scripts/model-files.json").write_text("{", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "manifest"):
+            builder.build_release(self.source, self.root / "invalid-manifest", "1.0.2", with_model=True)
 
     def test_version_and_required_artifacts(self):
         for version in ("1.0.2-preview.1", "v1.0.2", "01.0.2", "1.0.2+build", "1.0.2.3", "1.٠.2"):

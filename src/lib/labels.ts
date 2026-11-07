@@ -1,3 +1,4 @@
+// Resolve persisted model labels into the shared readable display names.
 import catalog from "../../chatui/data/analysis-catalog.json";
 
 const keyOf = (value: string): string => value.trim().toLowerCase().replace(/\s+/g, "_");
@@ -51,6 +52,8 @@ export const INTENT_LABELS: Record<string, string> = {
   reconcile: "缓和关系",
   show_material: "展示内容",
   offer_help: "提供帮助",
+  sarcasm: "讽刺",
+  criticize: "责备",
   tease: "调侃",
   close_chat: "告别",
   deny: "否认",

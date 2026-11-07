@@ -31,8 +31,10 @@ PYTHON_ROOT_PACKAGES = (
     "Pillow", "uiautomation", "pywin32", "pyperclip", "colorama",
     "opencv-python", "numpy", "comtypes", "setuptools", "tzdata", "packaging", "PyYAML",
 )
-# These are declared upstream but absent in the already-working read-only host.
-# Their imports are confined to optional GUI/OCR/media paths, not this bridge.
+# Declared by wechatauto-replica, but imported only by its optional GUI/OCR/media
+# paths, which this bridge never calls. They stay out of the package even when the
+# build host has them installed: imageio-ffmpeg would otherwise ship an unused GPL
+# ffmpeg executable that THIRD_PARTY_NOTICES does not cover.
 KNOWN_MISSING_OPTIONAL = {"winsdk", "imageio-ffmpeg", "pyautogui"}
 NODE_ROOT_PACKAGES = (
     "@anthropic-ai/sdk", "@google/genai", "@huggingface/tokenizers",
@@ -134,12 +136,12 @@ def python_distributions() -> tuple[list, list]:
         canonical = requested.lower().replace("_", "-")
         if canonical in chosen or canonical in omitted:
             continue
+        if canonical in KNOWN_MISSING_OPTIONAL:
+            omitted.add(canonical)
+            continue
         try:
             dist = metadata.distribution(requested)
         except metadata.PackageNotFoundError:
-            if canonical in KNOWN_MISSING_OPTIONAL:
-                omitted.add(canonical)
-                continue
             raise RuntimeError(f"required installed Python distribution missing: {requested}") from None
         if not dist.files:
             raise RuntimeError(f"distribution has no RECORD: {requested}")

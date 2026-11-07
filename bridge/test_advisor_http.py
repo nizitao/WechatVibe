@@ -1,5 +1,7 @@
 """Actual loopback HTTP tests with synthetic source and injected runtime."""
 import json
+import http.client
+import socket
 import tempfile
 import threading
 import unittest
@@ -102,6 +104,41 @@ class AdvisorHttpTests(unittest.TestCase):
             "action": "save", "agent": {"name": "Invalid", "prompt": "hi"},
             "permission": "allow", "apiKey": "synthetic-not-a-real-key",
         })[0], 400)
+
+    def test_rejected_post_returns_its_http_status_after_draining_a_complete_body(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=3)
+        self.addCleanup(connection.close)
+        connection.request("POST", "/api/advisor/run", body=b'{"synthetic":"body"}',
+                           headers={"Content-Type": "application/json", "Origin": "https://foreign.example"})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 403)
+        self.assertEqual(json.loads(response.read()), {"error": "forbidden"})
+
+    def test_rejected_post_cannot_extend_the_total_deadline_by_sending_one_byte_at_a_time(self):
+        socket_client = socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3)
+        self.addCleanup(socket_client.close)
+        socket_client.sendall(("POST /api/advisor/run HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                              "Origin: https://foreign.example\r\nContent-Length: 65536\r\n\r\n" %
+                              self.server.server_port).encode("ascii"))
+        stop = threading.Event()
+        def drip():
+            while not stop.wait(.2):
+                try:
+                    socket_client.sendall(b"x")
+                except OSError:
+                    return
+        sender = threading.Thread(target=drip, daemon=True)
+        sender.start()
+        try:
+            socket_client.settimeout(2.5)
+            received = b""
+            while b"\r\n\r\n" not in received:
+                chunk = socket_client.recv(4096)
+                self.assertTrue(chunk, "rejected request closed without a response")
+                received += chunk
+            self.assertIn(b" 403 ", received.split(b"\r\n", 1)[0])
+        finally:
+            stop.set(); sender.join(3)
 
     def test_initial_thread_has_a_stable_identity_without_model_work(self):
         url = "/api/advisor/thread?account=%s&user=synthetic-chat&agentId=builtin:advisor" % self.source.account

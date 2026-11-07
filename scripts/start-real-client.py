@@ -549,12 +549,31 @@ def wait_for_bridge_exit(record, deadline):
 
 
 def owned_model_children(config, bridge_process):
-    """Recognize only this verified bridge's direct analysis workers."""
+    """Recognize workers directly, or through one verified Python redirector."""
     import psutil
     expected_script = (config.root / "bridge" / "analysis_server.ts").resolve()
+    bridge_script = (config.root / "bridge" / "chat_server.py").resolve()
+    expected_python = str(config.python_exe.resolve()).casefold()
     children = []
     try:
-        for child in bridge_process.children():
+        direct = bridge_process.children()
+        candidates = list(direct)
+        interpreters = []
+        for child in direct:
+            try:
+                command = child.cmdline()
+                image = Path(child.exe()).resolve(strict=True)
+                if (image.name.casefold() in ("python.exe", "pythonw.exe") and
+                        len(command) == 2 and
+                        str(Path(command[0]).resolve()).casefold() == expected_python and
+                        Path(command[1]).resolve() == bridge_script):
+                    # Windows venv python.exe retains the launch PID and redirects to the
+                    # real interpreter with the same argv. Never recurse arbitrary children.
+                    candidates.extend(child.children())
+                    interpreters.append(child)
+            except psutil.NoSuchProcess:
+                continue
+        for child in candidates:
             try:
                 command = child.cmdline()
                 image = Path(child.exe()).resolve(strict=True)
@@ -566,7 +585,9 @@ def owned_model_children(config, bridge_process):
                 continue
     except (OSError, ValueError, psutil.Error) as error:
         raise LauncherError(f"Cannot inspect owned analysis workers: {error}") from error
-    return children
+    # Forced shutdown must also stop a verified redirected interpreter; killing only its
+    # wrapper can leave the actual service and its port alive.
+    return children + interpreters
 
 
 def finish_owned_shutdown(config, record, children, timeout=STOP_CLEANUP_TIMEOUT):
@@ -776,6 +797,27 @@ def open_client(url, root=PROJECT_ROOT, profile=None):
         raise LauncherError(f"Could not open dedicated Electron shell: {error}") from error
 
 
+def _spawned_by_shell(shell_pid):
+    """Accept the shell directly or through one Windows Python redirector."""
+    import psutil
+    if type(shell_pid) is not int or shell_pid <= 0:
+        return False
+    try:
+        process = psutil.Process()
+        for _ in range(2):
+            parent = process.parent()
+            if parent is None:
+                return False
+            if parent.pid == shell_pid:
+                return True
+            if (parent.name() or "").casefold() not in ("python.exe", "pythonw.exe"):
+                return False
+            process = parent
+    except psutil.Error:
+        return False
+    return False
+
+
 def run_command(args, config):
     if args.stop_owned_bridge:
         result = stop_owned_bridge(config)
@@ -797,24 +839,11 @@ def run_command(args, config):
     try:
         shell_pid = os.environ.get("WECHATVIBE_SHELL_PID")
         if shell_pid:
-            import psutil
             try:
                 expected = int(shell_pid)
             except ValueError:
                 raise LauncherError("Desktop startup identity is invalid") from None
-            # The shell must be an ancestor, not necessarily the direct parent: a virtual
-            # environment launcher (and some py launchers) run the interpreter one level
-            # deeper, so comparing only with ppid() rejected legitimate desktop starts.
-            ancestor = psutil.Process()
-            related = False
-            for _ in range(4):
-                ancestor = ancestor.parent()
-                if ancestor is None:
-                    break
-                if ancestor.pid == expected:
-                    related = True
-                    break
-            if not related:
+            if not _spawned_by_shell(expected):
                 raise LauncherError("Desktop startup identity is invalid")
             InstallationGate(config.root).register(role="shell", pid=expected)
         return _run_admitted(args, config)
@@ -834,6 +863,25 @@ def _run_admitted(args, config):
     if not args.no_open:
         open_client(config.url, config.root, config.profile)
     return 0
+
+
+def startup_failure_code(error):
+    """Return only fixed diagnostic categories, never paths or exception contents."""
+    if isinstance(error, InstallationBusy):
+        return "installation_busy"
+    message = str(error)
+    for prefix, code in (
+            ("Desktop startup identity", "shell_identity"),
+            ("Port ", "port_conflict"),
+            ("Bridge script not found", "runtime_missing"),
+            ("Python interpreter not found", "runtime_missing"),
+            ("Bridge exited with code", "bridge_exited"),
+            ("Bridge did not report", "bridge_timeout"),
+            ("Cannot protect bridge control record", "record_access"),
+            ("Cannot identify current Windows user", "record_access")):
+        if message.startswith(prefix):
+            return code
+    return "launcher_failed"
 
 
 def main(argv=None):
@@ -865,6 +913,8 @@ def main(argv=None):
     except (ValueError, LauncherError, InstallationBusy, OSError) as error:
         if args.stop_owned_bridge and args.json:
             print(json.dumps({"stopped": False, "error": str(error)}))
+        elif args.json:
+            print(json.dumps({"startupFailure": startup_failure_code(error)}))
         print(f"Real client launch failed: {error}", file=sys.stderr)
         return 1
 

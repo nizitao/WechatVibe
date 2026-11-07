@@ -56,6 +56,9 @@ async function fixture(t: TestContext) {
   let noTextTime = false;
   let noPrefaceTime = false;
   let equalNativeTime = false;
+  let pathFailure = "";
+  let subscriptionFails = false;
+  let closeFails = false;
   let streamed = "Hello";
   const pending = new Map<string, ServerResponse>();
   const emit = (event: unknown) => { for (const peer of peers) peer.write(`data: ${JSON.stringify(event)}\n\n`); };
@@ -74,7 +77,9 @@ async function fixture(t: TestContext) {
     }
     const json = (value: unknown, status = 200) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(value)); };
     if (pathname === "/path") {
+      if (pathFailure === "http") { json({ error: "synthetic control failure" }, 500); return; }
       const directory = new URL(req.url!, "http://localhost").searchParams.get("directory");
+      if (pathFailure === "scope") { json({ directory: path.join(root, "wrong-workspace"), worktree: directory }); return; }
       json({ directory, worktree: directory }); return;
     }
     if (pathname === "/session" && req.method === "POST") {
@@ -171,11 +176,18 @@ async function fixture(t: TestContext) {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address() as { port: number };
   const client = createOpencodeClient({ baseUrl: `http://127.0.0.1:${address.port}`, throwOnError: true });
+  const subscribe = client.event.subscribe.bind(client.event);
+  client.event.subscribe = (...args: Parameters<typeof subscribe>) => subscriptionFails ?
+    Promise.reject(new Error("synthetic subscription failure")) : subscribe(...args);
   const runtime = new AdvisorRuntime({ root, startEngine: async (spec) => {
     specs.push(spec);
-    return { client, close: async () => { engineClosed++; for (const peer of peers) peer.end(); } };
+    return { client, close: async () => {
+      engineClosed++; for (const peer of peers) peer.end();
+      if (closeFails) throw new Error("synthetic close failure");
+    } };
   } });
   t.after(async () => {
+    closeFails = false;
     await runtime.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -192,7 +204,30 @@ async function fixture(t: TestContext) {
     noPrefaceTime: () => { noPrefaceTime = true; },
     equalNativeTime: () => { equalNativeTime = true; },
     separateReadStep: () => { separateReadStep = true; },
-    setText: (value: string) => { streamed = value; }, getClosed: () => engineClosed };
+    setText: (value: string) => { streamed = value; }, getClosed: () => engineClosed,
+    setPathFailure: (value: string) => { pathFailure = value; },
+    setSubscriptionFails: (value: boolean) => { subscriptionFails = value; },
+    setCloseFails: (value: boolean) => { closeFails = value; } };
+}
+
+for (const failure of ["http", "scope", "subscription", "close"]) {
+  test(`a failed ${failure} initialization releases the engine and the next send succeeds`, async t => {
+    const f = await fixture(t);
+    if (failure === "subscription") f.setSubscriptionFails(true);
+    else f.setPathFailure(failure === "close" ? "http" : failure);
+    f.setCloseFails(failure === "close");
+    await assert.rejects(f.runtime.respond(config, request), error => error instanceof AdvisorRuntimeError &&
+      error.code === (failure === "scope" ? "scope-mismatch" : "engine-unavailable"));
+    assert.equal(f.specs.length, 1);
+    assert.equal(f.getClosed(), 1);
+    f.setPathFailure(""); f.setSubscriptionFails(false); f.setCloseFails(false);
+    const events: AdvisorRuntimeEvent[] = [];
+    const result = await f.runtime.respond(config, request, event => events.push(event));
+    assert.equal(result.text, "Hello");
+    assert.equal(f.specs.length, 2, "the failed engine must never be reused");
+    assert.equal(f.getClosed(), 1);
+    assert.ok(events.some(event => event.type === "text" && event.text === "Hello"));
+  });
 }
 
 test("engine pin verification checks binary hash and rejects tampering before launch", async (t) => {

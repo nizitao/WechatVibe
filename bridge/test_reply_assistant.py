@@ -9,8 +9,11 @@ from urllib.parse import urlencode
 from unittest.mock import patch
 
 from guidance_contracts import REPLY_OPTIONS_REVISION
+from backend_contracts import api_insight_scope
+from model_source import LOCAL_SOURCE_ID, ModelSourceUnavailable
 from node_analysis import NodeAnalysis
 from test_api_guidance import reply_options
+from test_advisor_support import FakeRuntime
 import test_guidance_lifecycle as lifecycle_fixture
 
 
@@ -154,6 +157,89 @@ class ReplyAssistantTests(unittest.TestCase):
             rows = connection.execute("SELECT source_id FROM api_guidance_v1").fetchall()
         self.assertEqual(len(rows), 2, "assistants must retain separate persistent results")
         self.assertNotEqual(rows[0][0], rows[1][0])
+
+    def save_independent_assistant_profile(self):
+        # Same endpoint, different credential: endpoint-only key reuse would select the wrong key.
+        saved = self.backend.model_source_profile_save({
+            "name": "Synthetic assistant B", "protocol": "responses",
+            "baseUrl": "https://example.test/v1", "model": "assistant-model-b",
+            "apiKey": "synthetic-assistant-key-b", "contextTokens": 32768})
+        return saved["profile"]
+
+    def test_independent_assistant_model_does_not_replace_the_reply_provider(self):
+        helper = self.save_independent_assistant_profile()
+        before = (self.backend.active_model_profile_id, self.backend.active_model_source_id,
+                  self.backend.model_source_revision)
+        self.backend.model_source_select({"profileId": helper})
+        assistant_config = self.advisor._resolve_config("account-a")
+        self.assertEqual(assistant_config["model"], "assistant-model-b")
+        self.assertEqual(assistant_config["apiKey"], "synthetic-assistant-key-b")
+        self.start(self.agent_a)
+        self.idle()
+        request = self.requests[-1]
+        self.assertEqual((request["protocol"], request["baseUrl"], request["model"], request["apiKey"]),
+                         ("responses", "https://example.test/v1", "test-model", "test-key"))
+        self.assertEqual(request["assistant"]["prompt"], self.agent_a["prompt"])
+        self.assertIn("A_SKILL_ONLY", json.dumps(request["assistant"]["skills"]))
+        self.assertNotIn("B_SKILL_ONLY", json.dumps(request["assistant"]["skills"]))
+        self.assertEqual((self.backend.active_model_profile_id, self.backend.active_model_source_id,
+                          self.backend.model_source_revision), before)
+        self.assertEqual(self.saved(self.agent_a)["job"]["status"], "done")
+
+    def test_local_analysis_keeps_independent_assistant_available_without_enabling_replies(self):
+        helper = self.save_independent_assistant_profile()
+        self.backend.model_source_select({"profileId": helper})
+        self.backend.model_source_activate({"mode": "local"})
+        runtime = FakeRuntime(text="Synthetic independent assistant answer.")
+        self.advisor.runtime_factory = lambda: runtime
+        started = self.advisor.start("account-a", "friend", self.agent_a["id"], None,
+                                     "Synthetic advice request")
+        run = self.advisor._runs[started["run"]["id"]]
+        run.worker.join(3)
+        self.assertFalse(run.worker.is_alive(), "synthetic assistant did not finish")
+        self.assertEqual(run.state, "done", run.error)
+        config, request = runtime.respond_calls[0]
+        self.assertEqual((config["model"], config["apiKey"]),
+                         ("assistant-model-b", "synthetic-assistant-key-b"))
+        self.assertIn(self.agent_a["prompt"], request["system"])
+        self.assertIn("A_SKILL_ONLY", json.dumps(request["skills"]))
+        with self.assertRaises(ModelSourceUnavailable):
+            self.start(self.agent_a)
+        self.assertEqual(self.requests, [])
+        self.assertEqual((self.backend.active_model_source_mode, self.backend.active_model_source_id),
+                         ("local", LOCAL_SOURCE_ID))
+        self.assertEqual(self.backend.model_insights("friend")["results"], {})
+
+    def test_assistant_model_switch_does_not_cancel_replies_or_mix_label_caches(self):
+        helper = self.save_independent_assistant_profile()
+        helper_source = self.store.profile_source_id(helper)
+        _, _, store = self.backend._scoped_identity()
+        message = self.source.rows[1]
+        original = {"id": message["id"], "status": "ok", "affect": {"feeling": "期待"},
+                    "intents": ["邀约"]}
+        other = {"id": message["id"], "status": "ok", "affect": {"feeling": "无奈"},
+                 "intents": ["婉拒"]}
+        store.save_api_insights("account-a", "friend", api_insight_scope(self.selection["sourceId"]),
+                                [(message, original)])
+        store.save_api_insights("account-a", "friend", api_insight_scope(helper_source),
+                                [(message, other)])
+        before = self.backend.model_insights("friend")["results"]
+        self.assertEqual(before[message["id"]], original)
+        gate = self.block(self.agent_a)
+        started = self.start(self.agent_a)
+        self.wait_requests(1)
+        revision = self.backend.model_source_revision
+        self.backend.model_source_select({"profileId": helper})
+        self.assertEqual(self.backend.model_source_revision, revision)
+        self.assertEqual(self.backend.model_insights("friend")["results"], before)
+        gate.set()
+        self.idle()
+        saved = self.saved(self.agent_a)
+        self.assertEqual(saved["job"]["id"], started["job"]["id"])
+        self.assertEqual(saved["job"]["status"], "done")
+        self.assertEqual((self.requests[-1]["model"], self.requests[-1]["apiKey"]),
+                         ("test-model", "test-key"))
+        self.assertEqual(self.backend.model_insights("friend")["results"], before)
 
     def test_two_assistants_can_generate_concurrently_and_same_assistant_deduplicates(self):
         gate_a, gate_b = self.block(self.agent_a), self.block(self.agent_b)

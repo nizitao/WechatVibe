@@ -10,7 +10,7 @@ simple mode.
 """
 from __future__ import annotations
 
-FINE_LABEL_SCHEMA = "generic-v11"
+FINE_LABEL_SCHEMA = "generic-v12"
 
 API_INSIGHT_REVISION = "free-label-v6-compact"
 

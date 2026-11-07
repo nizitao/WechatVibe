@@ -103,3 +103,23 @@ it("keeps the fine path unchanged when no bounded hint is available", async () =
   }, "other", "改天吧");
   assert.ok(!criteria.includes("拒绝"), "no hint means the old candidate menu");
 });
+
+it("a help request does not retrieve inspection just because its object contains 我看看", () => {
+  for (const message of ["你帮我看看。", "麻烦你帮我看看这个表格。", "您替我查一下。"])
+    assert.ok(!labels(message).includes("查看"), message);
+  assert.ok(labels("我先看看。").includes("查看"));
+  assert.ok(labels("你帮我看看。").includes("求助"));
+});
+
+it("calendar-only context cannot add refusal and recent context wins the hint budget", () => {
+  assert.ok(!labels("改天吧", "文档不急，客户下周才看。").includes("拒绝"));
+  const oldInvitation = "周六一起去看展吗？\n" + "这是已经结束的旧话题。".repeat(40);
+  assert.ok(!labels("改天吧", oldInvitation + "\n这个文档下周提交即可。").includes("拒绝"));
+});
+
+it("contextual thanks has a bounded alternative to literal gratitude", () => {
+  const criteria = labels("谢谢你啊。", "我把你准备的惊喜告诉他了。");
+  for (const label of ["感谢", "讽刺", "责备"]) assert.ok(criteria.includes(label));
+  assert.ok(criteria.length <= 10);
+  assert.ok(!labels("谢谢你啊。").includes("讽刺"));
+});

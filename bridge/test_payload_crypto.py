@@ -228,6 +228,27 @@ class PayloadCryptoTests(unittest.TestCase):
             self.assertEqual(json.loads(raw), [{"text": "restore this synthetic text"}])
         self.assertEqual((path.parent / manifest["keyBackup"]).read_bytes(), self.key_path.read_bytes())
 
+    def test_a_damaged_key_backup_no_longer_blocks_the_analysis_store(self):
+        """The live key decrypts the results; the backup copy is only its redundancy.
+
+        A damaged or foreign copy used to raise PayloadUnreadable for every ResultStore
+        construction, so the analysis feature answered 409 for good although the live key still
+        worked - and the offline recovery tool validated the same copy and refused too.
+        """
+        codec = cipher(self.key_path)
+        saved = codec.dumps({"synthetic": "text"})
+        backup = codec.backup_key()
+        self.assertEqual(backup.read_bytes(), self.key_path.read_bytes())
+        backup.write_bytes(b"damaged synthetic backup")
+
+        reopened = cipher(self.key_path)
+        self.assertEqual(reopened.backup_key(), backup)
+        self.assertEqual(backup.read_bytes(), self.key_path.read_bytes())
+        self.assertEqual(reopened.loads(saved), {"synthetic": "text"})
+        stale = sorted(backup.parent.glob("analysis-key.backup.bin.stale.*"))
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].read_bytes(), b"damaged synthetic backup")
+
     def test_backup_manifest_publish_failure_retries_without_replacing_snapshot(self):
         path = self.root / "synthetic.sqlite3"
         ResultStore(path).advance("acct", "friend", "v1", (1, "shard", 1), [{"text": "legacy"}])
@@ -252,6 +273,103 @@ class PayloadCryptoTests(unittest.TestCase):
         manifest.write_text(json.dumps(saved))
         with self.assertRaises(PayloadUnreadable):
             ResultStore(path, cipher=cipher(self.key_path))
+
+    def test_existing_result_store_reopens_after_its_key_backup_is_damaged(self):
+        path = self.root / "synthetic.sqlite3"
+        store = ResultStore(path, cipher=cipher(self.key_path))
+        context = [{"text": "synthetic encrypted progress"}]
+        store.advance("acct", "friend", "v1", (1, "shard", 1), context)
+        manifest = path.with_suffix(".pre-wv1.json")
+        manifest_before = manifest.read_bytes()
+        snapshot = path.with_suffix(".pre-wv1.sqlite3")
+        snapshot_before = snapshot.read_bytes()
+        backup = self.key_path.with_name("analysis-key.backup.bin")
+        backup.write_bytes(b"damaged synthetic backup")
+        reopened = ResultStore(path, cipher=cipher(self.key_path))
+        self.assertEqual(reopened.progress("acct", "friend", "v1")["context"], context)
+        self.assertEqual(backup.read_bytes(), self.key_path.read_bytes())
+        self.assertEqual(manifest.read_bytes(), manifest_before)
+        self.assertEqual(snapshot.read_bytes(), snapshot_before)
+        stale = list(backup.parent.glob("analysis-key.backup.bin.stale.*"))
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].read_bytes(), b"damaged synthetic backup")
+
+    def test_a_replacement_live_key_cannot_replace_a_readable_original_backup(self):
+        path = self.root / "synthetic.sqlite3"
+        store = ResultStore(path, cipher=cipher(self.key_path))
+        store.advance("acct", "friend", "v1", (1, "shard", 1), [{"text": "synthetic"}])
+        manifest = path.with_suffix(".pre-wv1.json")
+        manifest_before = manifest.read_bytes()
+        backup = self.key_path.with_name("analysis-key.backup.bin")
+        backup_before = backup.read_bytes()
+        self.key_path.write_bytes(base64.b64encode(synthetic_protect(b"z" * 32)))
+        replacement = self.key_path.read_bytes()
+        with self.assertRaises(PayloadUnreadable):
+            ResultStore(path, cipher=cipher(self.key_path))
+        self.assertEqual(manifest.read_bytes(), manifest_before)
+        self.assertEqual(backup.read_bytes(), backup_before)
+        self.assertEqual(self.key_path.read_bytes(), replacement)
+        self.assertEqual(list(backup.parent.glob("analysis-key.backup.bin.stale.*")), [])
+
+    def test_a_replacement_live_key_cannot_be_blessed_by_repairing_a_damaged_backup(self):
+        path = self.root / "synthetic.sqlite3"
+        store = ResultStore(path, cipher=cipher(self.key_path))
+        store.advance("acct", "friend", "v1", (1, "shard", 1), [{"text": "synthetic"}])
+        manifest = path.with_suffix(".pre-wv1.json")
+        manifest_before = manifest.read_bytes()
+        backup = self.key_path.with_name("analysis-key.backup.bin")
+        backup.write_bytes(b"damaged synthetic backup")
+        self.key_path.write_bytes(base64.b64encode(synthetic_protect(b"z" * 32)))
+        with self.assertRaises(PayloadUnreadable):
+            ResultStore(path, cipher=cipher(self.key_path))
+        self.assertEqual(manifest.read_bytes(), manifest_before)
+        stale = list(backup.parent.glob("analysis-key.backup.bin.stale.*"))
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].read_bytes(), b"damaged synthetic backup")
+
+    def test_an_equivalent_rewrapped_live_key_keeps_the_original_backup_bytes(self):
+        codec = cipher(self.key_path)
+        saved = codec.dumps({"synthetic": "text"})
+        backup = codec.backup_key()
+        before = backup.read_bytes()
+        key = synthetic_unprotect(base64.b64decode(self.key_path.read_bytes()))
+        self.key_path.write_bytes(base64.b64encode(b"rewrapped:" + key))
+        reopened = PayloadCipher(self.key_path, protect=synthetic_protect,
+                                 unprotect=lambda blob: blob.split(b":", 1)[1])
+        self.assertEqual(reopened.backup_key(), backup)
+        self.assertEqual(backup.read_bytes(), before)
+        self.assertEqual(reopened.loads(saved), {"synthetic": "text"})
+
+    def test_backup_repair_never_regenerates_a_missing_or_truncated_live_key(self):
+        for mode in ("missing", "truncated"):
+            with self.subTest(mode=mode):
+                key_path = self.key_path.parent / mode / self.key_path.name
+                codec = cipher(key_path)
+                codec.dumps({"synthetic": "text"})
+                backup = codec.backup_key()
+                backup.write_bytes(b"damaged synthetic backup")
+                if mode == "missing":
+                    key_path.unlink()
+                else:
+                    key_path.write_bytes(b"")
+                with self.assertRaises(PayloadUnreadable):
+                    cipher(key_path).backup_key()
+                self.assertEqual(backup.read_bytes(), b"damaged synthetic backup")
+                self.assertEqual(key_path.exists(), mode != "missing")
+                if key_path.exists():
+                    self.assertEqual(key_path.read_bytes(), b"")
+
+    def test_a_failed_backup_quarantine_preserves_both_files(self):
+        codec = cipher(self.key_path)
+        codec.dumps({"synthetic": "text"})
+        backup = codec.backup_key()
+        backup.write_bytes(b"damaged synthetic backup")
+        live_before = self.key_path.read_bytes()
+        with patch("payload_crypto.os.replace", side_effect=OSError("synthetic rename failure")):
+            with self.assertRaises(OSError):
+                cipher(self.key_path).backup_key()
+        self.assertEqual(backup.read_bytes(), b"damaged synthetic backup")
+        self.assertEqual(self.key_path.read_bytes(), live_before)
 
     def recovery_fixture(self):
         path = self.root / ".local" / "real-client-data" / ("a" * 64 + ".sqlite3")

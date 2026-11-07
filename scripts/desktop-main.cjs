@@ -16,6 +16,7 @@ const node = process.env.WECHATVIBE_NODE || (fs.existsSync(bundledNode) ? bundle
 const launcher = path.join(root, "scripts", "start-real-client.py");
 let profileReady = false;
 let instanceProfile = null;
+let failureDirectory = null;
 // True only when this launch created the bridge (not when it reused a ready one).
 let bridgeCreated = false;
 try {
@@ -23,6 +24,7 @@ try {
   // per installation: two profiles have to run side by side.
   instanceProfile = profileFromArgv(process.argv);
   const userData = shellDataDir(root, instanceProfile);
+  failureDirectory = userData;
   fs.mkdirSync(userData, { recursive: true });
   app.setPath("userData", userData);
   profileReady = true;
@@ -47,6 +49,8 @@ function stopOwnedBridge(callback) {
     // exists in argv has to be carried here or the cleanup would stop the default instance.
     ...(instanceProfile ? { [PROFILE_ENV]: instanceProfile } : {}),
   };
+  // Resolve this installation's saved port just as the initial launch does.
+  delete environment.CHATUI_PORT;
   try {
     execFile(python, [launcher, "--stop-owned-bridge", "--json"], {
       cwd: root, env: environment, windowsHide: true, timeout: 30000, maxBuffer: 65536,
@@ -56,8 +60,8 @@ function stopOwnedBridge(callback) {
   }
 }
 
-// The dialog text alone cannot explain a failed launch, so every failure writes what the
-// launcher printed into logs/desktop-launch.log and quotes its last line.
+// The reason-code dialog alone cannot explain a failed launch, so launcher failures also
+// append what the launcher printed into logs/desktop-launch.log.
 function recordLaunchFailure(reason) {
   const text = String(reason || "").trim();
   if (!text) return "";
@@ -74,10 +78,32 @@ function recordLaunchFailure(reason) {
   return lines.length ? lines[lines.length - 1].slice(0, 300) : "";
 }
 
+const failureMessages = Object.freeze({
+  profile_invalid: "实例配置无效。",
+  runtime_missing: "运行文件缺失，请重新完整解压程序。",
+  shell_identity: "启动进程身份校验失败。",
+  port_conflict: "本地服务端口被其他程序占用。",
+  installation_busy: "程序正在更新，请稍后重试。",
+  bridge_exited: "本地服务在启动期间退出。",
+  bridge_timeout: "本地服务未在规定时间内就绪。",
+  record_access: "无法创建受保护的服务控制记录，请检查目录权限。",
+  launcher_timeout: "启动器运行超时。",
+  launcher_failed: "本地服务启动器执行失败。",
+  launcher_result: "启动器返回了无效的服务信息。",
+  shell_failed: "桌面窗口初始化失败。",
+  desktop_failed: "桌面程序初始化失败。",
+});
+
 function fail(reason) {
-  const detail = recordLaunchFailure(reason);
-  dialog.showErrorBox("WechatVibe 启动失败",
-                      "本地服务未就绪，请检查运行文件是否完整。" + (detail ? `\n\n${detail}` : ""));
+  const code = Object.hasOwn(failureMessages, reason) ? reason : "desktop_failed";
+  try {
+    if (failureDirectory) {
+      // One bounded record per instance. Never persist raw output, paths or stack traces.
+      fs.writeFileSync(path.join(failureDirectory, "startup-failure.json"),
+        JSON.stringify({ schema: 1, time: new Date().toISOString(), code }) + "\n", "utf8");
+    }
+  } catch (_) {}
+  dialog.showErrorBox("WechatVibe 启动失败", `${failureMessages[code]}\n\n错误代码：${code}`);
   app.quit();
 }
 
@@ -86,9 +112,13 @@ function failAfterCleanup(reason) {
 }
 
 app.whenReady().then(() => {
-  if (!profileReady || !fs.existsSync(launcher) ||
+  if (!profileReady) {
+    fail("profile_invalid");
+    return;
+  }
+  if (!fs.existsSync(launcher) ||
       (app.isPackaged && (!fs.existsSync(python) || !fs.existsSync(node)))) {
-    fail();
+    fail("runtime_missing");
     return;
   }
   const environment = {
@@ -111,7 +141,13 @@ app.whenReady().then(() => {
   }, (error, stdout, stderr) => {
     if (error) {
       // The launcher stops a bridge it started before failing, so do not stop one here.
-      fail(["launcher failed:", error.message, stderr, stdout].filter(Boolean).join("\n"));
+      recordLaunchFailure(["launcher failed:", error.message, stderr, stdout].filter(Boolean).join("\n"));
+      let code = error.killed ? "launcher_timeout" : "launcher_failed";
+      try {
+        const reported = JSON.parse(stdout).startupFailure;
+        if (Object.hasOwn(failureMessages, reported)) code = reported;
+      } catch (_) {}
+      fail(code);
       return;
     }
     let result;
@@ -128,14 +164,19 @@ app.whenReady().then(() => {
       delete process.env.WECHATVIBE_SHELL_PID;
     } catch (invalid) {
       if (!bridgeCreated) bridgeCreated = /"created"\s*:\s*true/.test(String(stdout || ""));
-      failAfterCleanup(["invalid launcher result:", invalid.message, stderr, stdout].filter(Boolean).join("\n"));
+      recordLaunchFailure(["invalid launcher result:", invalid.message, stderr, stdout].filter(Boolean).join("\n"));
+      failAfterCleanup("launcher_result");
       return;
     }
     process.argv.push("--client-url", `${result.url}/`);
     try {
       require("./real-client-shell.cjs");
     } catch (shellError) {
-      failAfterCleanup(["shell failed:", shellError && shellError.stack || String(shellError)].join("\n"));
+      recordLaunchFailure(["shell failed:", shellError && shellError.stack || String(shellError)].join("\n"));
+      failAfterCleanup("shell_failed");
     }
   });
-}).catch(error => fail(["startup failed:", error && error.stack || String(error)].join("\n")));
+}).catch(error => {
+  recordLaunchFailure(["startup failed:", error && error.stack || String(error)].join("\n"));
+  fail("desktop_failed");
+});

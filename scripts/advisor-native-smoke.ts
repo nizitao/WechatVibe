@@ -8,6 +8,9 @@ import type { Protocol } from "../electron/model-connectors";
 
 // Optional native smoke test: only a loopback synthetic provider and owned fixture files.
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const syntheticNarration = "我先看看这轮聊天资料。";
+const syntheticAnswer = "A short synthetic reply.";
+const expectedAnswer = (readSteps: number) => [...Array<string>(readSteps).fill(syntheticNarration), syntheticAnswer].join("\n");
 const fixtureParent = path.join(root, ".local", "advisor-build", "runtime-native-tests");
 await mkdir(fixtureParent, { recursive: true });
 const fixtureRoot = await mkdtemp(path.join(fixtureParent, "case-"));
@@ -138,10 +141,12 @@ try {
     const before = providerCalls;
     let responsePending = true;
     let liveTextBeforeDone = false;
-    const result = await runtime.respond({ protocol, baseUrl, model: "synthetic-model", apiKey: "synthetic-provider-key", contextTokens: 8192 },
+    const keyless = protocol === "chat_completions" || protocol === "ollama";
+    const result = await runtime.respond({ protocol, baseUrl, model: "synthetic-model", apiKey: keyless ? "" : "synthetic-provider-key", contextTokens: 8192 },
       request, (event) => { events.push(event); if (event.type === "text" && event.nativeType?.startsWith("message.part.") && responsePending) liveTextBeforeDone = true; }, AbortSignal.timeout(60_000));
     responsePending = false;
-    assert.equal(result.text, "A short synthetic reply.");
+    const narrated = protocol === "chat_completions" || protocol === "ollama";
+    assert.equal(result.text, expectedAnswer(narrated ? 1 : 0));
     assert.equal(providerCalls - before, 2);
     const current = requests.at(-1).body;
     const toolNames = protocol === "gemini" ? current.tools?.flatMap((group: any) => group.functionDeclarations?.map((tool: any) => tool.name) ?? []) :
@@ -150,10 +155,11 @@ try {
     assert(JSON.stringify(current).includes(request.context.split("\n")[0]));
     assert(events.some((event) => event.type === "text"));
     assert(liveTextBeforeDone, JSON.stringify({ protocol, events: events.map(({ type, state, nativeType }) => ({ type, state, nativeType })) }));
-    assert.equal(events.filter((event) => event.type === "text").map((event) => event.text).join(""), "A short synthetic reply.");
+    assert.equal(events.filter((event) => event.type === "text").map((event) => event.text).join(""),
+      (narrated ? syntheticNarration : "") + syntheticAnswer);
     assert(events.some((event) => event.type === "status" && event.nativeType === "session.status"));
     assert.equal(events.filter((event) => event.state === "answering").length, 1);
-    process.stdout.write(JSON.stringify({ success: true, protocol, providerCalls: providerCalls - before,
+    process.stdout.write(JSON.stringify({ success: true, protocol, keyless, providerCalls: providerCalls - before,
       toolNames, textEvents: events.filter((event) => event.type === "text").length,
       usage: result.usage }) + "\n");
   }
@@ -162,13 +168,14 @@ try {
   const config = { protocol: "chat_completions" as const, baseUrl: `http://127.0.0.1:${address.port}/v1`,
     model: "synthetic-model", apiKey: "synthetic-provider-key", contextTokens: 8192 };
   const first = await runtime.respond(config, shared, () => {}, AbortSignal.timeout(60_000));
+  assert.equal(first.text, expectedAnswer(1));
   const controller = new AbortController();
   const stopped = runtime.respond(config, { ...shared, runtimeSessionId: first.runtimeSessionId, message: "Hold this attempt" },
     (event) => { if (event.type === "text") controller.abort(); }, controller.signal);
   await assert.rejects(stopped, (error) => error instanceof AdvisorRuntimeError && error.code === "cancelled");
   const retried = await runtime.respond(config, { ...shared, runtimeSessionId: first.runtimeSessionId, message: "Retry after stop" },
     () => {}, AbortSignal.timeout(60_000));
-  assert.equal(retried.text, "A short synthetic reply.");
+  assert.equal(retried.text, expectedAnswer(1));
   assert(!JSON.stringify(requests.at(-1).body.messages).includes("Hold this attempt"));
   assert(JSON.stringify(requests.at(-1).body.messages).includes("First successful turn"));
   process.stdout.write(JSON.stringify({ success: true, case: "native-stop-and-retry", retainedPriorTurn: true, excludedStoppedTurn: true }) + "\n");
@@ -176,7 +183,7 @@ try {
   const pageStart = providerCalls;
   const paged = await runtime.respond(config, { ...shared, threadId: "native-paged-thread", context: longContext,
     message: "Read every available line" }, () => {}, AbortSignal.timeout(60_000));
-  assert.equal(paged.text, "A short synthetic reply.");
+  assert.equal(paged.text, expectedAnswer(providerCalls - pageStart - 1));
   assert(providerCalls - pageStart > 2);
   assert(JSON.stringify(requests.at(-1).body.messages).includes("synthetic-2100"));
   process.stdout.write(JSON.stringify({ success: true, case: "native-full-read-pagination", providerCalls: providerCalls - pageStart }) + "\n");

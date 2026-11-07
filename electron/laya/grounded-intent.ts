@@ -3,6 +3,8 @@
  * This module does not read conversation history, call a model, or invent scores.
  * A null result means that the message does not supply enough unambiguous evidence.
  */
+import { hasInvitationContext, recentIntentContext } from "./intent-context";
+
 export type GroundedIntentLabel =
   | "greet"
   | "thank"
@@ -61,7 +63,6 @@ function result(label: GroundedIntentLabel, evidenceKind: IntentEvidenceKind): G
 
 // A quoted speech act belongs to its quoted speaker, not necessarily to this sender.
 const QUOTED = /“[^”]*”|「[^」]*」|『[^』]*』|‘[^’]*’|"[^"]*"|`[^`]*`/gu;
-const INVITATION_CONTEXT = /(?:要不要|一起|约|有空|安排|见面|出来|吃饭|看展|看电影|周六|周日|周末|明天|后天|下周)/u;
 const DEFERRAL_TEXT = /改天|以后再说|再说吧|再约|看情况|过(?:几|两)天|有空再说|晚点再说/u;
 const DENIAL_CONTEXT = /喜欢|爱|在乎|想我|暧昧|关系|要不要|是不是|会不会|是否/u;
 const CONCRETE_TIME = /今天|明天|后天|今晚|明早|周[一二三四五六日天]|周末|下周|下个月|\d{1,2}[号日点]|上午|下午|晚上/u;
@@ -169,8 +170,10 @@ export function groundedIntent(targetText: string): GroundedIntent | null {
       && !/[？?]$/u.test(text)) return result("correct", "explicit_correction");
 
   // Asking someone to act differs from asking for information.
-  const request = /(?:^|[，,。；;])\s*(?:请(?!问)|麻烦(?:你|您)?|帮我|请你|请您|(?:你|您)?能不能(?:帮我|替我|给我|把)|(?:你|您)?能否(?:帮我|替我|给我|把)|(?:你|您)?可以(?:帮我|替我|给我|把)|你能(?:帮我|替我|给我|把)|给我(?=(?:一|两|三|几|\d)[^。！？?]{1,30}))[^。！？?]{1,70}/u.exec(text);
-  if (request && !/(?:说|问我|让我|请求我|提到|转述)[：:，,。；;]\s*$/u.test(text.slice(0, request.index + 1))) {
+  const request = /(?:^|[，,。；;])\s*(?:请(?!问)|麻烦(?:你|您)?|(?:你|您)?(?:帮我|替我)|请你|请您|(?:你|您)?能不能(?:帮我|替我|给我|把)|(?:你|您)?能否(?:帮我|替我|给我|把)|(?:你|您)?可以(?:帮我|替我|给我|把)|你能(?:帮我|替我|给我|把)|给我(?=(?:一|两|三|几|\d)[^。！？?]{1,30}))[^。！？?]{1,70}/u.exec(text);
+  const completedHelp = /^(?:你|您)(?:帮我|替我).{0,30}(?:看过|查过|检查过|做过|处理过|修过|发过|做完了|处理完了|看完了)/u.test(text);
+  if (request && !completedHelp &&
+      !/(?:说|问我|让我|请求我|提到|转述)[：:，,。；;]\s*$/u.test(text.slice(0, request.index + 1))) {
     return result("seek_help", "action_request");
   }
 
@@ -263,9 +266,11 @@ export function groundedIntent(targetText: string): GroundedIntent | null {
 /** Context-aware fine-message evidence. Portrait analysis remains target-only. */
 export function groundedIntentWithContext(targetText: string, contextHint = ""): GroundedIntent | null {
   const target = normalizeIntentTarget(targetText);
-  const context = String(contextHint || "").replace(QUOTED, " ").trim();
+  const context = recentIntentContext(contextHint);
   if (!target || !context) return groundedIntent(targetText);
   const direct = groundedIntent(targetText);
+  // A courtesy phrase alone cannot settle whether the reply is sincere or sarcastic.
+  if (direct?.label === "thank") return null;
   if (direct && !["greet", "thank", "confirm", "agree", "status_report"].includes(direct.label)) return direct;
   if (direct?.evidenceKind === "conditional_acceptance") return direct;
   const latestContext = context.split(/\n/u).at(-1) || "";
@@ -277,7 +282,7 @@ export function groundedIntentWithContext(targetText: string, contextHint = ""):
       !/^(?:他说|她说|有人说|引用|比如|例如|假设|如果|假如)/u.test(latestContext)) {
     return result("deny", "contextual_denial");
   }
-  if (INVITATION_CONTEXT.test(context) && DEFERRAL_TEXT.test(target) &&
+  if (hasInvitationContext(context) && DEFERRAL_TEXT.test(target) &&
       !/(?:今天|明天|后天|周[一二三四五六日天]|周末|下周).{0,12}(?:请|一起|约|见面)/u.test(target)) {
     return result("reject", "contextual_deferral");
   }

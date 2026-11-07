@@ -19,7 +19,7 @@
   let lastSavedMessage = null;
   let templateSignature = "";
   let modelProfiles = [], assistantProfileId = "", analysisLabel = "", modelSignature = "";
-  let modelPending = false, modelPendingTimer = 0, modelsLoaded = false;
+  let modelPending = false, modelPendingTimer = 0, modelsLoaded = false, selectingModel = false;
   let newThreadConfirm = false, newThreadTimer = 0;
   let threads = [], activeThreadId = "", threadsError = "";
   const messageNodes = new Map();
@@ -99,7 +99,7 @@
       host.setAttribute("role", "status"); host.setAttribute("aria-live", "polite");
       host.setAttribute("aria-label", "执行步骤");
     }
-    host.textContent = "";
+    host.replaceChildren();
     runSteps.forEach((step, index) => {
       const row = document.createElement("div");
       row.className = "advisor-step";
@@ -111,8 +111,7 @@
       row.append(mark, label);
       host.appendChild(row);
     });
-    const anchor = messageNodes.get("ui:run");
-    timeline.insertBefore(host, anchor && anchor.parentNode === timeline ? anchor.nextSibling : null);
+    timeline.appendChild(host);
     updateLayout();
   }
   function updateLayout() {
@@ -169,11 +168,6 @@
     });
     return button;
   }
-  function modelHintRow(textValue, className = "advisor-model-hint") {
-    const row = document.createElement("div");
-    row.className = className; row.textContent = textValue;
-    return row;
-  }
   function modelOptions() {
     return Array.from(modelMenu.children).filter(child => child.dataset && child.dataset.modelOption);
   }
@@ -211,40 +205,41 @@
     if (typeof options[next].focus === "function") options[next].focus();
   }
   function renderModels() {
-    const signature = JSON.stringify([modelProfiles.map(profile => [profile.id, profile.name, profile.model]),
-      assistantProfileId, analysisLabel, modelPending, modelsLoaded]);
+    const signature = JSON.stringify([modelProfiles.map(profile => [profile.id, profile.name, profile.model, profile.protocol]),
+      assistantProfileId, analysisLabel, modelPending, selectingModel, modelsLoaded]);
     if (signature === modelSignature) return;
     modelSignature = signature;
     const selected = modelProfiles.find(profile => profile.id === assistantProfileId);
     // The chip always answers "which model is answering right now": a pinned profile by name,
     // otherwise the analysis line it follows, so the two are never confusable.
+    const busy = modelPending || selectingModel;
     let chipText = "未配置模型";
-    if (modelPending) chipText = "切换中…";
+    if (busy) chipText = "切换中…";
     else if (selected) chipText = selected.name;
     else if (!modelsLoaded) chipText = "模型";
     else if (analysisLabel) chipText = `跟随分析 · ${analysisLabel}`;
-    else if (modelProfiles.length) chipText = "跟随分析";
+    else if (modelProfiles.length) chipText = "默认 API";
+    else chipText = "模型";
     modelName.textContent = chipText;
     modelButton.dataset.mode = selected ? "profile" : modelProfiles.length ? "follow" : "empty";
-    modelButton.disabled = modelPending;
-    modelButton.setAttribute("aria-busy", String(modelPending));
+    modelButton.title = selected?.name || (modelProfiles.length ?
+      "使用保存的默认 API 档案 · 只影响聊天助手，不改变分析所用的模型。" :
+      "还没有添加模型，在「设置 → 模型配置」中添加后即可切换。");
+    modelButton.disabled = !modelProfiles.length || busy;
+    modelButton.setAttribute("aria-busy", String(busy));
     modelMenu.replaceChildren();
-    // Without a saved profile there is nothing to follow: the assistant needs an API model, so
-    // the only useful thing the menu can say is where models come from.
+    // Without a saved profile the menu stays empty; the button title above says where models
+    // come from. Follow-analysis and every saved profile keep their own name and model id.
     if (modelProfiles.length) {
       modelMenu.appendChild(modelOptionRow({ option: "follow", name: "跟随分析",
         meta: analysisLabel ? `当前：${analysisLabel}` : "使用分析所选的模型",
         checked: !selected, profileId: "" }));
-      modelMenu.appendChild(modelHintRow("已保存的模型", "advisor-model-section"));
       for (const profile of modelProfiles) {
         modelMenu.appendChild(modelOptionRow({ option: "profile", name: profile.name,
           meta: profile.model || profile.protocol || "", checked: profile.id === assistantProfileId,
           profileId: profile.id }));
       }
-    } else {
-      modelMenu.appendChild(modelHintRow("还没有添加模型，在「设置 → 模型配置」中添加后即可切换。"));
     }
-    modelMenu.appendChild(modelHintRow("只影响聊天助手，不改变分析所用的模型。", "advisor-model-foot"));
     modelMenu.hidden = true; modelButton.setAttribute("aria-expanded", "false");
   }
   function renderThread(thread, run, draft) {
@@ -400,16 +395,18 @@
   }
   function updateControls() {
     const running = !!currentRun && !terminal.has(currentRun.state);
+    modelButton.disabled = !modelProfiles.length || selectingModel || modelPending || submitting || running;
     // The host forwards one coarse status at a time (`run.phaseEvent`), so the list grows here
     // by remembering each distinct label this run has shown.
     if (currentRun?.id !== stepRunId) { stepRunId = currentRun?.id || ""; runSteps = []; }
     if (running && currentRun?.phaseEvent) runSteps = collectStep(runSteps, currentRun.phaseEvent);
     const resetCommand = /^\s*\/reset\s*$/.test(input.value);
-    send.disabled = submitting || (!resetCommand && (running || !catalogReady || engineState !== "available")) || !scope?.account || !scope?.user || !scope?.agentId;
+    send.disabled = submitting || selectingModel || modelPending || (!resetCommand && (running || !catalogReady || engineState !== "available")) || !scope?.account || !scope?.user || !scope?.agentId;
     // A disabled send button with no explanation reads as a broken app: say what is missing.
     const blocker = !running && !submitting && !resetCommand ? composerBlocker() : "";
     note.hidden = !blocker; note.textContent = blocker;
-    send.title = blocker || "发送";
+    send.title = blocker || (selectingModel || modelPending ? "正在切换模型" : !catalogReady ? "正在加载助手" :
+      engineState !== "available" && !resetCommand ? "请在模型菜单选择可用的 API 档案" : "发送");
     stop.hidden = !running || resetCommand; send.hidden = running && !resetCommand;
     newThread.disabled = submitting;
     stop.disabled = stopping; stop.setAttribute("aria-label", stopping ? "正在停止" : "停止生成");
@@ -426,7 +423,8 @@
       lastSavedMessage.text === "生成失败：" + currentRun.error;
     const content = submitting || stopping || problem ? event.text : running ? phase.text || labels[phase.state] || "正在准备" :
       currentRun?.state === "stopped" ? "已停止" : currentRun?.state === "error" && !savedError ? currentRun.error || "生成失败" : "";
-    statusRow("ui:run", content, event.state, event);
+    statusRow("ui:run", running && runSteps.length && currentRun?.phase !== "answering" && !problem && !stopping ? "" : content,
+      event.state, event);
     renderSteps();
   }
   function applyStream(payload) {
@@ -474,7 +472,7 @@
       ADVISOR_SET_THREAD: ["thread", "run", "agentId", "draft"],
       ADVISOR_STREAM_UPDATE: ["threadId", "run", "messages"],
       ADVISOR_PROBLEM: ["error", "retryKind"], ADVISOR_SUBMIT_STATE: ["pending"], ADVISOR_STOP_STATE: ["pending"],
-      ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId", "analysisLabel"],
+      ADVISOR_COPY_RESULT: ["copied"], ADVISOR_SET_MODELS: ["profiles", "assistantProfileId", "analysisLabel", "pending"],
       ADVISOR_SET_THREADS: ["threads", "activeThreadId", "error"]
     };
     if (!permitted[type] || Object.keys(payload).some(key => !permitted[type].includes(key))) return false;
@@ -502,12 +500,14 @@
         (payload.error !== undefined && !text(payload.error, 120))) return false;
     }
     if (type === "ADVISOR_SET_MODELS") {
-      if (!Array.isArray(payload.profiles) || payload.profiles.length > 200 ||
-        !payload.profiles.every(item => object(item) && text(item.id, 240) && text(item.name, 64) &&
+      if (!Array.isArray(payload.profiles) || payload.profiles.length > 20 ||
+        !payload.profiles.every(item => object(item) && /^[0-9a-f]{32}$/.test(item.id) &&
+          text(item.name, 64) && item.name.trim().length > 0 &&
           (item.model === undefined || text(item.model, 256)) &&
           (item.protocol === undefined || text(item.protocol, 40))) ||
         (payload.analysisLabel !== undefined && !text(payload.analysisLabel, 64)) ||
-        !(payload.assistantProfileId === null || text(payload.assistantProfileId, 240))) return false;
+        !(payload.assistantProfileId === null || /^[0-9a-f]{32}$/.test(payload.assistantProfileId)) ||
+        (payload.pending !== undefined && typeof payload.pending !== "boolean")) return false;
     }
     return true;
   }
@@ -515,6 +515,7 @@
     agentMenu.hidden = !agentMenu.hidden; menuButton.setAttribute("aria-expanded", String(!agentMenu.hidden));
   });
   modelButton.addEventListener("click", () => {
+    if (modelButton.disabled) return;
     if (modelMenu.hidden) openModelMenu(); else closeModelMenu();
   });
   modelButton.addEventListener("keydown", event => {
@@ -611,7 +612,8 @@
     } else if (data.type === "ADVISOR_SET_MODELS") {
       modelProfiles = payload.profiles; assistantProfileId = payload.assistantProfileId || "";
       analysisLabel = payload.analysisLabel || ""; modelsLoaded = true;
-      clearModelPending(); renderModels();
+      selectingModel = payload.pending === true;
+      clearModelPending(); renderModels(); updateControls();
     } else if (data.type === "ADVISOR_SET_THREADS") {
       threads = payload.threads; activeThreadId = payload.activeThreadId;
       threadsError = payload.error || ""; renderThreads();

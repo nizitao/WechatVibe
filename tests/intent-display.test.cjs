@@ -106,6 +106,20 @@ it("suppresses generic candidates for an ordinary factual sentence", () => {
   ] }, "请把通知发给我").length > 0);
 });
 
+it("a model fallback never becomes a meaningful label merely because the message contains a question", () => {
+  const fallback = { groundedIntent: null, intent: [
+    { rawLabel: "general_exchange", probability: 0.9 }, { rawLabel: "ask_question", probability: 0.1 },
+  ] };
+  for (const text of ["那怎么说呢？", "需要帮我看看吗？", "这个计划呢？"])
+    assert.deepEqual(plain(select(fallback, text)), [], text);
+  assert.deepEqual(plain(select({ ...fallback,
+    groundedIntent: { label: "seek_help", evidenceKind: "action_request" } }, "请帮我检查一下。")),
+  [{ label: "求助", probability: null }]);
+  assert.deepEqual(plain(select({ groundedIntent: null,
+    intent: [{ rawLabel: "ask_question", probability: 0.9 }] }, "几点出发？")),
+  [{ label: "提问", probability: 0.9 }]);
+});
+
 it("renders nuanced generic-v9 labels using their original model probabilities", () => {
   const result = select({ groundedIntent: null, intent: [
     { rawLabel: "confide", probability: 0.72 },

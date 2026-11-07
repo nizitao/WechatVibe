@@ -606,7 +606,7 @@ function fineContextHint(messages: readonly Message[], index: number): string {
     const text = messages[i]?.text;
     if (typeof text === "string" && text.trim()) parts.push(sanitizeContextText(text));
   }
-  return Array.from(parts.join("\n")).slice(0, FINE_HINT_CODEPOINTS).join("");
+  return Array.from(parts.join("\n")).slice(-FINE_HINT_CODEPOINTS).join("");
 }
 
 async function classifyMessage(engine: AnalysisEngine, state: State, side: Message["side"], targetText: string,

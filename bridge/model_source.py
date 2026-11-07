@@ -53,9 +53,10 @@ def _text(value, name, maximum):
 
 def profile_name(value, fallback):
     """A blank or missing name falls back to the model ID so every profile is labelable."""
+    derived = fallback[:MAX_PROFILE_NAME]
     if value is None or value == "":
-        return fallback
-    return _text(value, "name", MAX_PROFILE_NAME).strip() or fallback
+        return derived
+    return _text(value, "name", MAX_PROFILE_NAME).strip() or derived
 
 
 def connection_values(request, require_model=False):
@@ -182,8 +183,10 @@ class ModelSourceStore:
             api = raw.get("api")
             if not isinstance(api, dict):
                 raise ModelSourceUnavailable("model settings unavailable")
-            return [self._decode_profile({**api, "id": raw.get("sourceId"),
-                                          "name": api.get("name") or api.get("model")})]
+            entry = {**api, "id": raw.get("sourceId")}
+            if not entry.get("name"):
+                entry.pop("name", None)
+            return [self._decode_profile(entry)]
         profiles = raw.get("profiles")
         if not isinstance(profiles, list) or len(profiles) > MAX_PROFILES:
             raise ModelSourceUnavailable("model settings unavailable")
@@ -313,7 +316,7 @@ class ModelSourceStore:
                          "contextTokens": active["contextTokens"],
                          "hasKey": bool(active["encryptedKey"])} if active else None),
                 "profiles": [self._public_profile(item) for item in profiles],
-                "assistantProfileId": (saved["assistantProfileId"] if saved else None),
+                "assistantProfileId": saved["assistantProfileId"] if saved else None,
                 "label": active["name"] if mode == "api" and active else LOCAL_SOURCE_LABEL,
                 "sourceId": source_id, "status": status}
 
@@ -419,16 +422,14 @@ class ModelSourceStore:
                         assistant_profile_id=_MISSING):
         """Rewrite the whole document, carrying the assistant choice over unless replaced."""
         if assistant_profile_id is _MISSING:
-            assistant_profile_id = None
             previous = self._read_json(self.path)
-            if isinstance(previous, dict):
-                candidate = previous.get("assistantProfileId")
-                if _is_hex32(candidate):
-                    assistant_profile_id = candidate
+            assistant_profile_id = (previous.get("assistantProfileId")
+                                    if isinstance(previous, dict) else None)
         document = {"version": SCHEMA_VERSION, "sourceId": source_id,
                     "selectedMode": selected_mode, "profiles": profiles,
                     "sourceIds": source_ids}
-        if assistant_profile_id is not None:
+        if (_is_hex32(assistant_profile_id) and
+                any(item["id"] == assistant_profile_id for item in profiles)):
             document["assistantProfileId"] = assistant_profile_id
         self._write(document)
 
@@ -482,45 +483,6 @@ class ModelSourceStore:
                 raise ValueError("invalid profileId")
             self._write_document(saved["profiles"], profile_id, "api", self._source_ids(saved))
 
-    def select_assistant_profile(self, profile_id):
-        """Point only the assistant at an existing profile; analysis keeps its own selection.
-
-        ``selectedMode`` and the active ``sourceId`` are deliberately left untouched, so the
-        analysis line (local or the previously activated API source) keeps running as before.
-        """
-        if not _is_hex32(profile_id):
-            raise ValueError("invalid profileId")
-        with self.lock:
-            saved = self._read()
-            if not saved or not any(item["id"] == profile_id for item in saved["profiles"]):
-                raise ValueError("invalid profileId")
-            self._write_document(saved["profiles"], saved["sourceId"], saved["selectedMode"],
-                                 self._source_ids(saved), profile_id)
-
-    def clear_assistant_profile(self):
-        """Return the assistant to the analysis selection."""
-        with self.lock:
-            saved = self._read()
-            if saved:
-                self._write_document(saved["profiles"], saved["sourceId"], saved["selectedMode"],
-                                     self._source_ids(saved), None)
-
-    def assistant_selection(self):
-        """The assistant's own saved selection, or the analysis selection when it follows it."""
-        selected = self.saved_selection()
-        with self.lock:
-            saved = self._read()
-        if not saved:
-            return selected
-        assistant_id = saved.get("assistantProfileId")
-        profile = next((item for item in saved["profiles"] if item["id"] == assistant_id), None)
-        if profile is None:
-            return selected
-        fingerprint = _source_fingerprint(profile["protocol"], profile["baseUrl"], profile["model"])
-        return {**saved, "api": profile, "profileId": profile["id"],
-                "selectedMode": "api",
-                "sourceId": self._source_ids(saved).get(fingerprint, profile["id"])}
-
     def delete_profile(self, profile_id):
         """Remove one profile; report whether the active selection was removed too."""
         with self.lock:
@@ -534,6 +496,36 @@ class ModelSourceStore:
             self._write_document(profiles, saved["sourceId"],
                                  "local" if was_active else saved["selectedMode"], source_ids)
             return was_active
+
+    def select_assistant_profile(self, profile_id):
+        """Select the assistant model without activating an analysis source."""
+        if not _is_hex32(profile_id):
+            raise ValueError("invalid profileId")
+        with self.lock:
+            saved = self._read()
+            if not saved or not any(item["id"] == profile_id for item in saved["profiles"]):
+                raise ValueError("invalid profileId")
+            self._write_document(saved["profiles"], saved["sourceId"], saved["selectedMode"],
+                                 self._source_ids(saved), profile_id)
+
+    def clear_assistant_profile(self):
+        with self.lock:
+            saved = self._read()
+            if saved:
+                self._write_document(saved["profiles"], saved["sourceId"], saved["selectedMode"],
+                                     self._source_ids(saved), None)
+
+    def assistant_selection(self):
+        """Use one consistent snapshot for the dedicated model or the analysis fallback."""
+        with self.lock:
+            selected = self.saved_selection()
+            assistant_id = selected.get("assistantProfileId")
+            profile = next((item for item in selected["profiles"] if item["id"] == assistant_id), None)
+            if profile is None:
+                return selected
+            fingerprint = _source_fingerprint(profile["protocol"], profile["baseUrl"], profile["model"])
+            return {**selected, "api": profile, "profileId": profile["id"], "selectedMode": "api",
+                    "sourceId": self._source_ids(selected).get(fingerprint, profile["id"])}
 
     def save_local(self):
         """Remember local selection while retaining every encrypted API profile."""

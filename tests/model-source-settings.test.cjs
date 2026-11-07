@@ -43,6 +43,7 @@ function makeNode() {
 }
 function harness(fetchImpl) {
   const nodes = new Map();
+  const modelEvents = [];
   const cardClasses = new Set();
   const byId = id => {
     if (!nodes.has(id)) nodes.set(id, makeNode());
@@ -58,6 +59,8 @@ function harness(fetchImpl) {
     AbortController,
     setTimeout,
     clearTimeout,
+    Event: class Event { constructor(type) { this.type = type; } },
+    dispatchEvent(event) { modelEvents.push(event); return true; },
     document: { createElement: () => makeNode() },
     byId,
     text: (id, value) => { byId(id).textContent = value == null ? "" : String(value); },
@@ -80,7 +83,7 @@ function harness(fetchImpl) {
     localModelResolved: false, localModelReady: false,
   });
   vm.runInContext(settingsCode, context);
-  return { ui: context.ui, byId, cardClasses, context };
+  return { ui: context.ui, byId, cardClasses, context, modelEvents };
 }
 const response = body => ({ ok: true, json: async () => body });
 const id = letter => letter.repeat(32);
@@ -115,6 +118,19 @@ it("loads the active source and disables local device changes while API is activ
   assert.equal(byId("apiKeySaved").hidden, false);
   assert.equal(byId("selectRuntimeProvider").disabled, true);
   assert.equal(byId("localModelSettings").hidden, true);
+});
+
+it("notifies open assistant metadata on every successful central snapshot without sending configuration data", () => {
+  const { ui, modelEvents } = harness(async () => response(apiState));
+  ui.showModelSource(apiState);
+  ui.showModelSource({ ...apiState, profiles: [profile("a", "Renamed synthetic profile", "model-a")] });
+  assert.equal(modelEvents.length, 2);
+  assert.equal(ui.getSnapshot().profiles[0].name, "Renamed synthetic profile");
+  for (const event of modelEvents) {
+    assert.equal(event.type, "model-source-updated");
+    assert.equal(event.detail, undefined);
+    assert.deepEqual(Object.keys(event), ["type"]);
+  }
 });
 
 it("keeps the settings window the same size for local and API sources", async () => {

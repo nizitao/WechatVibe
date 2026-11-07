@@ -146,6 +146,32 @@ it("uses invitation context to ground a deferral without changing target-only ru
   assert.equal(groundedIntentWithContext("木有", "今天吃什么？"), null);
 });
 
+it("calendar or work scheduling words do not establish an invitation", () => {
+  for (const context of ["客户下周才看。", "明天交的文档，今天必须改完吗？",
+    "会议安排发给你了。", "今天忙吗？", "他说周六一起去看展。"])
+    assert.equal(groundedIntentWithContext("改天[笑脸]", context), null, context);
+  for (const context of ["今晚一起吃个饭？", "晚上咋说？", "明天一起去吗？"])
+    assert.deepEqual(groundedIntentWithContext("改天吧", context),
+      { label: "reject", evidenceKind: "contextual_deferral" }, context);
+});
+
+it("an explicit second-person help request is not a first-person inspection", () => {
+  for (const message of ["你帮我看看。", "您替我查一下。", "这个太复杂，你帮我检查一下吧。"])
+    assert.deepEqual(groundedIntent(message), { label: "seek_help", evidenceKind: "action_request" }, message);
+  for (const message of ["我帮你看看。", "你帮我看过了。", "昨天你帮我看看就好了。",
+    "他说你帮我看看。", "如果你帮我看看，我再决定。"])
+    assert.notEqual(groundedIntent(message)?.label, "seek_help", message);
+});
+
+it("contextual courtesy remains a model judgment while isolated thanks keep literal grounding", () => {
+  for (const context of ["药给你放门口了。", "我把你准备的惊喜告诉他了。"])
+    assert.equal(groundedIntentWithContext("谢谢你啊。", context), null, context);
+  assert.deepEqual(groundedIntentWithContext("谢谢你啊。", ""),
+    { label: "thank", evidenceKind: "thanks_phrase" });
+  assert.deepEqual(groundedIntentWithContext("谢谢，不过我不去。", "今晚一起吃饭？"),
+    { label: "reject", evidenceKind: "explicit_refusal" });
+});
+
 it("grounds first-person corrections without mistaking a qualified denial for refusal", () => {
   for (const message of ["我没有说不去，只是需要晚一点。", "我没说不参加，只是要晚到十分钟。",
     "我不是生你的气，是觉得沟通有点累。", "我们并不是不愿意，而是时间不合适。"])

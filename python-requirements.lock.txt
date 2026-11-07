@@ -12,6 +12,7 @@ pycparser==2.23
 pyperclip==1.11.0
 pyyaml==6.0.2
 pywin32==311
+pyyaml==6.0.3
 setuptools==80.9.0
 tzdata==2025.2
 uiautomation==2.0.29

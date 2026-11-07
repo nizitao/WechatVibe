@@ -34,6 +34,8 @@ IMPORT_PAGE_SIZE = 256
 MAX_CONTEXT_MESSAGE_CHARS = 16000
 MAX_CONTEXT_ERROR_CHARS = 300
 MAX_RAW_FIELD_CHARS = 2048
+# Limit retained decoded windows, not the full conversation projection stored on disk.
+MAX_PENDING_WINDOWS = 64
 VALID_SIDES = ("self", "other")
 
 
@@ -162,7 +164,7 @@ class ContextProjection:
             database = self.stores.account(account)
             entry = self._imports.get(key)
             if entry is not None and entry.thread.is_alive():
-                self._pending_windows[key] = observation
+                self._remember_pending_locked(key, observation)
                 self._observed.pop(key, None)
                 if entry.binding != binding:
                     entry.cancel.set()
@@ -221,7 +223,7 @@ class ContextProjection:
             self.condition.notify_all()
             return True
         self._observed.pop(key, None)
-        self._pending_windows[key] = observation
+        self._remember_pending_locked(key, observation)
         if row is not None:
             # Only an already-managed conversation is repaired proactively; first windows are seeds.
             reset = scope_changed or changed_facts or rollback or prefix_unknown
@@ -229,6 +231,24 @@ class ContextProjection:
             database.context_begin(user, _encode_position(ceiling), fingerprint, reset=reset)
             self._start_worker(account, user, binding)
         return True
+
+    def _remember_pending_locked(self, key, observation):
+        self._pending_windows.pop(key, None)
+        self._pending_windows[key] = observation
+        self._trim_pending_locked()
+
+    def _trim_pending_locked(self):
+        """Evict the least recently used hint; running imports retain their late window."""
+        while len(self._pending_windows) > MAX_PENDING_WINDOWS:
+            for key in self._pending_windows:
+                worker = self._imports.get(key)
+                if worker is not None and worker.thread.is_alive():
+                    continue
+                del self._pending_windows[key]
+                break
+            else:
+                # Active imports may temporarily exceed the hint limit; their finalizers trim again.
+                break
 
     def invalidate_window(self, account, user):
         with self.lock:
@@ -259,6 +279,9 @@ class ContextProjection:
         # Source discovery may block; never hold the projection lock while it runs.
         with self.lock:
             pending = self._pending_windows.get(key)
+            if pending is not None:
+                self._pending_windows.pop(key)
+                self._pending_windows[key] = pending
         current = (pending["latest"] if pending is not None and pending["binding"] == binding and
                    pending["latest"] is not None else self.highwater(account, user, binding))
         with self.lock, self.source.lock:
@@ -459,6 +482,7 @@ class ContextProjection:
                             self._apply_window_locked(account, user, pending, after_import=True)
                     except (AccountChangedError, AccountUnavailableError, MessagesUnavailableError):
                         self._pending_windows.pop(key, None)
+                self._trim_pending_locked()
                 self.condition.notify_all()
 
     def _page_rows(self, user, page, read_count, trusted_identity=None):

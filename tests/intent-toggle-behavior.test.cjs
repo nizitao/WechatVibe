@@ -33,7 +33,7 @@ const source = linkFilter + "\n" + [
 ].map(body).join("\n") + "\nlet recentIntentController = null;\n" + app.slice(actionStart, actionEnd);
 
 function harness(mode = "local", apiOverride, options = {}) {
-  const nodes = new Map(), posts = [], requests = [], effects = [];
+  const nodes = new Map(), posts = [], requests = [], effects = [], modelEvents = [];
   const candidates = options.noCandidates ? [] : options.messages ||
     ["m1", "m2"].map(id => ({ id, side: "other", kind: "text", text: `Synthetic ${id}` }));
   const viewport = { top: Math.max(0, candidates.length - 4) * 100, height: 400 };
@@ -54,6 +54,8 @@ function harness(mode = "local", apiOverride, options = {}) {
     return nodes.get(id);
   }
   const context = vm.createContext({ AbortController, AbortSignal, URLSearchParams, byId,
+    Event: class Event { constructor(type) { this.type = type; } },
+    window: { dispatchEvent(event) { modelEvents.push(event); return true; } },
     setTimeout: () => 1, clearTimeout() {},
     CURRENT_LABEL_SCHEMA: "generic-v11", document: { hidden: false }, startupActive: false,
     chatState: { currentAccount: "acct", currentUser: "friend", generation: 1, view: "chat",
@@ -117,7 +119,7 @@ function harness(mode = "local", apiOverride, options = {}) {
   vm.runInContext(source, context);
   context.setIntentActionState("idle");
   const flush = () => new Promise(resolve => setImmediate(resolve));
-  return { context, posts, requests, effects, byId, flush, options, viewport,
+  return { context, posts, requests, effects, byId, flush, options, viewport, modelEvents,
     async click() { byId("btnToggleIntent").listeners.click(); await flush(); await flush(); } };
 }
 
@@ -289,6 +291,8 @@ it("a local to API to local switch clears label scope and discards the old local
   const request = run.posts[0];
   run.context.applyActiveModelSource({ mode: "api", sourceId: "api-a" });
   run.context.applyActiveModelSource({ mode: "local", sourceId: "local" });
+  assert.equal(run.modelEvents.length, 2);
+  assert.ok(run.modelEvents.every(event => event.type === "model-source-updated" && event.detail === undefined));
   assert.equal(run.context.labelState.intentRequestScope, null);
   assert.equal(run.context.currentIntentRequestScope(), null);
   assert.equal(request.signal.aborted, true);

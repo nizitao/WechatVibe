@@ -141,8 +141,8 @@ it("offers negation and clarification candidates before filling routine defaults
   assert.ok(!generalIntentQuestion("让我再想想，我暂时没有把握。").question.criteria.includes("拒绝"));
 });
 
-it("generic-v11 offers bounded, readable candidate menus instead of the same four defaults", () => {
-  assert.equal(GENERAL_LABEL_SCHEMA, "generic-v11");
+it("generic-v12 offers bounded, readable candidate menus instead of the same four defaults", () => {
+  assert.equal(GENERAL_LABEL_SCHEMA, "generic-v12");
   assert.ok(INTENTS.length >= 35 && INTENTS.length <= 50);
   const cases: Array<[string, string[]]> = [
     ["截图", ["展示内容"]],

@@ -1,6 +1,8 @@
 // Network model adapters. The local Laya engine remains the application's default.
 // Provider SDKs own their wire formats; this file owns validation and the network boundary.
 
+import { isIP } from "node:net";
+
 export type Protocol = "anthropic" | "responses" | "chat_completions" | "gemini" | "ollama";
 
 export interface ModelConfig {
@@ -96,7 +98,9 @@ function invalid(message: string, code: ConnectorErrorCode = "invalid-request"):
 }
 
 function isLoopback(host: string): boolean {
-  return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+  const address = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  return address === "localhost" || address === "::1" ||
+    (isIP(address) === 4 && address.split(".")[0] === "127");
 }
 
 /** Validates a user-supplied endpoint before any SDK can send a request. */
@@ -194,13 +198,23 @@ function guardedFetch(config: SafeConfig, callerSignal?: AbortSignal,
     }
     const signal = checkedSignal(init?.signal ?? (input instanceof Request ? input.signal : undefined),
       callerSignal, timeoutMs);
+    let requestedStream = false;
+    if (!bounded) {
+      const body = init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
+      if (typeof body === "string") {
+        try {
+          requestedStream = JSON.parse(body)?.stream === true;
+        } catch {}
+      }
+    }
     const response = await globalThis.fetch(input, { ...init, redirect: "error", signal });
-    if (!bounded && response.ok && streamProtocol &&
-        !/text\/event-stream|application\/x-ndjson/iu.test(response.headers.get("content-type") || "")) {
+    const streamingBody = /text\/event-stream|application\/x-ndjson/iu.test(
+      response.headers.get("content-type") || "");
+    if (!bounded && requestedStream && response.ok && streamProtocol && !streamingBody) {
       // Some compatible gateways ignore stream:true but still return a complete
       // JSON completion. Turn that one body into a local SSE envelope so the
       // caller observes one request and the normal incremental parser can run.
-      const raw = await response.text();
+      const raw = await (await boundedResponse(response)).text();
       const headers = new Headers(response.headers);
       headers.set("content-type", "text/event-stream");
       headers.delete("content-length");
@@ -216,6 +230,10 @@ function guardedFetch(config: SafeConfig, callerSignal?: AbortSignal,
             })}\n\ndata: [DONE]\n\n`;
           }
         } else {
+          if (typeof parsed.output_text !== "string" && Array.isArray(parsed.output)) {
+            const { addOutputText } = await import("openai/lib/ResponsesParser");
+            addOutputText(parsed as Parameters<typeof addOutputText>[0]);
+          }
           const content = typeof parsed.output_text === "string" ? parsed.output_text : "";
           if (content) {
             body = `event: response.output_text.delta\ndata: ${JSON.stringify({
@@ -234,7 +252,8 @@ function guardedFetch(config: SafeConfig, callerSignal?: AbortSignal,
       }
       return new Response(body, { status: response.status, statusText: response.statusText, headers });
     }
-    return bounded ? boundedResponse(response) : response;
+    return !bounded && requestedStream && response.ok && streamingBody
+      ? response : boundedResponse(response);
   };
 }
 

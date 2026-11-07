@@ -63,7 +63,7 @@ function getVisibleUnreadCount(session) {
 }
 const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false,
   guidanceWindowMinutes: 1440 };
-const CURRENT_LABEL_SCHEMA = "generic-v11";
+const CURRENT_LABEL_SCHEMA = "generic-v12";
 const GENERIC_INTENT_LABELS = Object.freeze({
   small_talk: "闲聊", share_news: "分享", ask_question: "提问", seek_help: "求助", deny: "否认",
   give_comfort: "安慰", agree: "同意", invite: "邀约", show_affection: "表达好感",
@@ -76,6 +76,7 @@ const GENERIC_INTENT_LABELS = Object.freeze({
   encourage: "鼓励", praise: "称赞", celebrate: "祝贺", miss_you: "表达想念",
   test_feelings: "探询心意", set_boundary: "设定边界", reconcile: "缓和关系",
   show_material: "展示内容", offer_help: "提供帮助", tease: "调侃", close_chat: "告别",
+  sarcasm: "讽刺", criticize: "责备",
   general_exchange: "一般交流",
 });
 const GROUNDED_EVIDENCE = Object.freeze({
@@ -105,7 +106,11 @@ if (typeof settingsState.settings.intent !== "boolean") settingsState.settings.i
 if (typeof settingsState.settings.backgroundAnalyze !== "boolean") settingsState.settings.backgroundAnalyze = false;
 // Reading and advising on the user's own dialogue style costs an extra judgement and
 // is opt-in; when it is off the advice only ever describes the other person.
-const save = () => localStorage.setItem("real-ui-settings-1", JSON.stringify(settingsState.settings));
+// Storage can fail (quota, a blocked or corrupt partition). Every other write in this file is
+// wrapped, and an unguarded one here threw out of the caller: the settings switch kept rendering
+// its old value, and a follow-list write inside loadConversationSelection was reported as a failed
+// WeChat session even though the bridge had answered.
+const save = () => { try { localStorage.setItem("real-ui-settings-1", JSON.stringify(settingsState.settings)); } catch { } };
 chatState.sessions = new Map();
 chatState.selectedConversations = new Set();
 chatState.selectionLoadedAccount = null;
@@ -875,13 +880,14 @@ function rememberConversations(account, ids) {
   const known = new Set(Array.isArray(data[account]?.known) ? data[account].known : []);
   for (const id of ids) known.add(id);
   data[account] = { known: [...known] };
-  localStorage.setItem(conversationFollowKey, JSON.stringify(data));
+  // Losing the follow list must not fail the caller that loaded the sessions.
+  try { localStorage.setItem(conversationFollowKey, JSON.stringify(data)); } catch { }
 }
 function forgetConversationFollow(account) {
   const data = readConversationFollow();
   if (!(account in data)) return;
   delete data[account];
-  localStorage.setItem(conversationFollowKey, JSON.stringify(data));
+  try { localStorage.setItem(conversationFollowKey, JSON.stringify(data)); } catch { }
 }
 async function trackNewConversations(account) {
   if (chatState.conversationSelectionBusy || chatState.selectionLoadedAccount !== account ||
@@ -1714,6 +1720,7 @@ function displayedIntent(result, messageText) {
   const grounded = result.groundedIntent;
   const evidenced = grounded && Object.prototype.hasOwnProperty.call(GROUNDED_EVIDENCE, grounded.label) &&
     GROUNDED_EVIDENCE[grounded.label].includes(grounded.evidenceKind);
+  if (!evidenced && ranked[0]?.rawLabel === "general_exchange") return [];
   if (!evidenced) {
     const guard = localIntentTextGuard(messageText);
     if (guard === "unattributed" && !["correct", "clarify", "explain"].includes(ranked[0]?.rawLabel)) return [];
@@ -3732,13 +3739,15 @@ function clearApiPortraitView() {
   byId("apiPortraitStatus").hidden = false;
   byId("btnRetryApiPortrait").hidden = true;
   text("apiPortraitStatus", "正在读取会话消息");
-byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(true));
+  byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", settingsState.modelSourceResolved &&
+    settingsState.modelSourceSnapshot.mode === "api" && chatState.view === "persona");
 }
 function cancelApiPortraitPoll() {
   ++portraitState.apiPortraitRequest;
   clearTimeout(portraitState.apiPortraitPollTimer);
   portraitState.apiPortraitPollTimer = null;
   portraitState.apiPortraitLoadingKey = null;
+  byId("apiPortraitStatus")?.classList?.remove?.("ai-busy");
 }
 function syncPortraitMode() {
   const apiMode = settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api";
@@ -3840,7 +3849,10 @@ function renderApiPortrait(data) {
   }
   byId("apiPortraitStatus").hidden = false;
   text("apiPortraitStatus", state);
-byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(running || job.status === "queued" || (!ready && data.inventoryStatus !== "error")));
+  const statusBusy = settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api" &&
+    chatState.view === "persona" && !data.suspended && job.status !== "error" && !submitError &&
+    contextReady && (running || !ready && data.inventoryStatus !== "error");
+  byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", statusBusy);
   // Like local Laya, entering/switching back to a conversation automatically continues
   // the saved incremental analysis. The backend resumes from the persisted cursor and
   // sends only new/unprocessed text, and dedupes an in-flight job. A terminal error stops
@@ -3908,7 +3920,7 @@ async function loadApiPortrait(member = "") {
   } catch (error) {
     if (token === portraitState.apiPortraitRequest && error?.name !== "AbortError") {
       text("apiPortraitStatus", "画像读取失败，请稍后重试");
-byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(false));
+      byId("apiPortraitStatus")?.classList?.remove?.("ai-busy");
       portraitState.apiPortraitReadFailures++;
       if (portraitState.apiPortraitReadFailures <= 3)
         portraitState.apiPortraitPollTimer = setTimeout(() => { void loadApiPortrait(member); },
@@ -3927,7 +3939,7 @@ async function startApiPortrait(autoKey, force = false, refreshAxes = false) {
       portraitState.apiPortraitSubmitErrors.has(autoKey) && !force) return;
   if (!apiPortraitContextReady()) {
     text("apiPortraitStatus", API_PORTRAIT_CONTEXT_HINT);
-byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(false));
+    byId("apiPortraitStatus")?.classList?.remove?.("ai-busy");
     byId("btnRetryApiPortrait").disabled = true;
     return;
   }
@@ -3936,7 +3948,7 @@ byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(false));
   byId("btnRetryApiPortrait").hidden = true;
   setStripStatus("API 分析中");
   text("apiPortraitStatus", refreshAxes ? "正在根据已保存画像重新评估 MBTI" : "正在提交 API 画像");
-byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(true));
+  byId("apiPortraitStatus")?.classList?.add?.("ai-busy");
   try {
     const body = { account, user, ...(member ? { member } : {}),
       ...(refreshAxes ? { refreshAxes: true } : {}) };
@@ -3953,7 +3965,7 @@ byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(true));
     rememberApiPortraitSubmitError(autoKey, reason);
     setStripStatus("分析失败，请重试");
     text("apiPortraitStatus", "API 画像提交失败（" + reason + "）");
-byId("apiPortraitStatus")?.classList?.toggle?.("ai-busy", !!(false));
+    byId("apiPortraitStatus")?.classList?.remove?.("ai-busy");
     byId("btnRetryApiPortrait").hidden = false;
   } finally {
     portraitState.apiPortraitBusy = false;
@@ -4190,6 +4202,7 @@ function renderGuidance(data) {
   portraitState.guidanceSnapshot = { ...data, _scope: scope };
   const job = data.job || {};
   portraitState.guidanceRunning = !data.suspended && ["queued", "running"].includes(job.status);
+  portraitState.guidanceStatusFailed = job.status === "error" || data.suspended === true;
   const guidance = normalizeGuidance(data.guidance);
   const key = JSON.stringify([scope, guidance]);
   if (portraitState.guidanceRenderedKey !== key) {
@@ -4207,7 +4220,6 @@ function renderGuidance(data) {
   else if (portraitState.guidanceRunning) state = "正在生成回复…";
   else if (job.status === "insufficient") state = "暂无可用于回复的聊天文本";
   text("guidanceStatus", state);
-byId("guidanceStatus")?.classList?.toggle?.("ai-busy", !!(portraitState.guidanceRunning || !!portraitState.guidanceBusy));
   syncGuidanceAction();
 }
 function syncGuidanceAction() {
@@ -4225,14 +4237,10 @@ function syncGuidanceAction() {
     !assistant.agentId ? "请先在助手仓库启用助手" : busy ? "正在生成回复" :
     portraitState.guidanceRendered ? "重新生成三个回复选项" : "生成三个回复选项";
   button.setAttribute("aria-label", button.title);
-  if (apiMode && chatState.view === "chat" && chatState.currentUser && chatState.currentAccount && !assistant.agentId) {
+  if (apiMode && chatState.view === "chat" && chatState.currentUser && chatState.currentAccount && !assistant.agentId)
     text("guidanceStatus", button.title);
-    byId("guidanceStatus")?.classList?.toggle?.("ai-busy", !!(false));
-  } else {
-    // Keep the ring in sync with the run instead of clearing it: this function runs right after
-    // renderGuidance(), which just turned it on for a running generation.
-    byId("guidanceStatus")?.classList?.toggle?.("ai-busy", !!busy);
-  }
+  byId("guidanceStatus")?.classList?.toggle?.("ai-busy", available && busy &&
+    !portraitState.guidanceStatusFailed && !portraitState.guidanceSubmitError);
   for (let index = 0; index < 3; index++)
     byId("replyChoice" + index).disabled = !available || !portraitState.guidanceRendered?.replies[index];
 }
@@ -4253,6 +4261,7 @@ function clearGuidanceView(scope = null) {
   portraitState.guidanceSubmitError = "";
   portraitState.guidanceBusy = false;
   portraitState.guidanceRunning = false;
+  portraitState.guidanceStatusFailed = false;
   renderGuidanceBody(null);
   text("guidanceStatus", "");
   syncGuidanceAction();
@@ -4289,6 +4298,7 @@ async function loadGuidance() {
   } catch (error) {
     if (token === portraitState.guidanceRequest && error?.name !== "AbortError") {
       portraitState.guidanceRunning = false;
+      portraitState.guidanceStatusFailed = true;
       text("guidanceStatus", GUIDANCE_ERRORS[error?.code] || "回复读取失败，请重试");
       syncGuidanceAction();
     }
@@ -4312,6 +4322,7 @@ async function startGuidance() {
     settingsState.modelSourceSnapshot.mode === "api" && chatState.view === "chat";
   portraitState.guidanceBusy = true;
   portraitState.guidanceSubmitError = "";
+  portraitState.guidanceStatusFailed = false;
   syncGuidanceAction();
   text("guidanceStatus", `正在生成回复 · ${guidanceWindowLabel()}`);
   try {
@@ -4698,6 +4709,7 @@ function applyActiveModelSource(data) {
     if (chatState.view === "persona" && chatState.currentUser) void loadProfile(portraitState.activeMember);
   }
   renderApiInsightStatus();
+  window.dispatchEvent?.(new Event("model-source-updated"));
 }
 function beginUnknownModelSource() {
   cancelLocalProfilePoll();
@@ -5405,8 +5417,8 @@ function renderApiInsightStatus() {
   retry.textContent = "分析失败 · 重试";
   if (!settingsState.modelSourceResolved || settingsState.modelSourceSnapshot.mode !== "api" || !settingsState.settings.intent || !chatState.currentUser) {
     if (labelState.apiInsightStatusRendered) node.textContent = "";
-    node.classList?.remove?.("ai-busy");
     labelState.apiInsightStatusRendered = false;
+    node.classList?.remove?.("ai-busy");
     retry.hidden = !(portraitState.incrementalFailed || usingLocalFine() && labelState.recentFailed);
     if (usingLocalFine() && settingsState.localModelResolved && !settingsState.localModelReady) {
       node.textContent = "未安装 Laya 模型，请在设置下载模型";
@@ -5453,8 +5465,8 @@ function renderApiInsightStatus() {
     node.textContent = "";
     setIntentActionState("idle");
   }
-  node.classList?.toggle?.("ai-busy", statusBusy);
   if (!entry?.error) retry.hidden = !portraitState.incrementalFailed;
+  node.classList?.toggle?.("ai-busy", statusBusy);
 }
 function renderApiInsightResult(result, text = "") {
   return messageLabelsApi().render(window.MessageInsightAdapters.apiView(result, text), String(result?.id || ""));
@@ -6039,10 +6051,12 @@ function clearLocalUiAnalysis(account) {
     if (scope[0] === account && scope.length === 3) portraitState.profileSnapshotsRequireRefresh.delete(key);
   } catch { }
   saveStoredProfiles();
-  for (let index = localStorage.length - 1; index >= 0; index--) {
-    const key = localStorage.key(index);
-    if (key?.startsWith(`mbti-unlocked:${account}:`)) localStorage.removeItem(key);
-  }
+  try {
+    for (let index = localStorage.length - 1; index >= 0; index--) {
+      const key = localStorage.key(index);
+      if (key?.startsWith(`mbti-unlocked:${account}:`)) localStorage.removeItem(key);
+    }
+  } catch { }
   if (chatState.currentAccount === account) {
     labelState.results = {};
     chatState.conversationMood = null;

@@ -1,9 +1,11 @@
+// Build bounded fine-intent choices without changing portrait questions or model weights.
 import type { LabelScore } from "../../shared/contracts";
 import type { Answer, Question } from "./types";
 import { groundedIntentWithContext, isEmbeddedQuestionStatement, isUnattributableIntentTarget, normalizeIntentTarget } from "./grounded-intent";
+import { hasInvitationContext, isContextualCourtesy, recentIntentContext } from "./intent-context";
 
 /** Stable wire marker. A saved legacy fine result can be refreshed one message at a time. */
-export const GENERAL_LABEL_SCHEMA = "generic-v11";
+export const GENERAL_LABEL_SCHEMA = "generic-v12";
 
 export const INTENTS = [
   { id: "small_talk", zh: "闲聊", en: "small talk" },
@@ -47,6 +49,8 @@ export const INTENTS = [
   { id: "show_material", zh: "展示内容", en: "show material" },
   { id: "offer_help", zh: "提供帮助", en: "offer help" },
   { id: "tease", zh: "调侃", en: "tease" },
+  { id: "sarcasm", zh: "讽刺", en: "sarcasm" },
+  { id: "criticize", zh: "责备", en: "criticize" },
   { id: "close_chat", zh: "告别", en: "say goodbye" },
   { id: "general_exchange", zh: "一般交流", en: "general exchange" },
 ] as const;
@@ -62,20 +66,16 @@ const ANCHORS: readonly IntentId[] = ["inform", "share_news", "small_talk"];
 const FILLERS: readonly IntentId[] = ["status_report", "explain", "share_feeling", "agree"];
 const MAX_OPTIONS = 10;
 const MIN_OPTIONS = 8;
-const QUOTED = /“[^”]*”|「[^」]*」|『[^』]*』|‘[^’]*’|"[^"]*"|`[^`]*`/gu;
 const QUESTION_CUE = /[？?]|(?:怎么|为什么|如何|是否|是不是|能否|能不能|多少|几点|几号|几(?:个人|位|楼|件|份|次|辆|本|条|张)|什么|咋(?:样|办|回事|了)|啥(?:时候|情况|意思)|干嘛|哪(?:个|家|里|儿))[^。！!？?]{0,20}(?:[。！!，,\s]|$)|(?:吗|呢)(?:[。！!，,\s]|$)|^(?:谁|什么|哪里|哪儿|何时|什么时候|几|多少)/u;
 const RHETORICAL_CORRECTION = /^(?:[^。！？?]{0,12})?这不[^。！？?]{1,50}(?:了|过)吗[？?]?$/u;
 const NONQUESTION_SHORT = /^(?:没什么|没啥)(?:事|意思|好说的)?[。！!\s]*$/u;
 const CARE_CONTINUATION = /[？?].{0,60}(?:早点休息|好好休息|注意身体|照顾好自己|别太累)/u;
 const DIRECTED_CONFIDING = /想跟你说|想找你聊|想聊聊|说说心里话|能不能听我说/u;
 const DENY_CONTEXT = /喜欢|爱|在乎|想我|暧昧|关系|要不要|是不是|会不会|是否/u;
-// Bounded invitation context hint: only brings the relevant candidates into the question.
-const INVITE_CONTEXT = /(?:要不要|一起|约|有空|安排|见面|出来|吃饭|看展|看电影|逛街|聚|来我家|请你|请我|周六|周日|周末|明天|后天|下周|下个月)/u;
 // "下次见/下次聊" are farewells, not deferrals of an invitation.
 const DEFERRAL = /改天|下次(?!见|聊|再聊|说)|以后再说|再说吧|再约|看情况|看(?:看)?再说|过(?:几|两)天|有空再说|回头(?:再)?(?:说|约)|晚点再说/u;
 const CONCRETE_TIME = /今天|明天|后天|明早|今晚|这周|本周|下周|周末|周[一二三四五六日天]|下个月|月底|月初|\d{1,2}[号日]/u;
 const CONCRETE_PLAN = /请你|请我|请客|我请|一起|约你|约我|见面|来找我|来找你/u;
-const MAX_HINT_CODEPOINTS = 240;
 
 /** Literal wording only retrieves candidates; Laya supplies every displayed probability. */
 const CUES: ReadonlyArray<{ pattern: RegExp; ids: readonly IntentId[] }> = [
@@ -108,7 +108,7 @@ const CUES: ReadonlyArray<{ pattern: RegExp; ids: readonly IntentId[] }> = [
   { pattern: /拜拜|再见|明天见|回见|下次见|回头见|先挂了|我走了|不聊了|回头聊|先这样|下次聊/u, ids: ["close_chat", "small_talk"] },
   { pattern: /^(?:嗯|好[的呀啊了]?|可以[的呀啊]?|行[的呀啊]?|没问题|当然可以|同意|OK|ok)(?:[，,.!！。\s]|$)/u, ids: ["agree", "confirm"] },
   { pattern: /收到|明白了|知道了|确认一下|没错/u, ids: ["confirm", "agree"] },
-  { pattern: /我(?:先)?(?:看(?:看|一下)|查(?:看|一下))|我去看看/u, ids: ["inspect", "plan"] },
+  { pattern: /(?:^|[，,。；;])\s*我(?:先)?(?:看(?:看|一下)|查(?:看|一下)|去看看)/u, ids: ["inspect", "plan"] },
   { pattern: /要不要.{0,12}(?:一起|去|来)|(?:我们|咱们|一起).{0,8}(?:去|来|吃|喝|玩|看|逛|见|聚|聊|打球)|约(?:个|你|我|在)/u, ids: ["invite", "plan"] },
   { pattern: /帮我|帮忙|能不能.{0,8}(?:弄|看|改|做)|麻烦(?:你|您)|请(?:你|您)|(?:告诉|发给|给)我|把.{1,20}给我/u, ids: ["seek_help", "ask_question"] },
   { pattern: /不是.{0,30}而是|不是的|当然不是|不对|应该是|你说的不对|我不同意|我不赞成/u, ids: ["correct", "clarify"] },
@@ -137,9 +137,8 @@ export interface GeneralIntentQuestion {
  * never attributed to the current speaker.
  */
 export function generalIntentQuestion(targetText: string, contextHint = ""): GeneralIntentQuestion {
-  const hint = Array.from(String(contextHint || "").replace(QUOTED, " ").trim())
-    .slice(0, MAX_HINT_CODEPOINTS).join("");
-  const inviteContext = INVITE_CONTEXT.test(hint);
+  const hint = recentIntentContext(contextHint);
+  const inviteContext = hasInvitationContext(hint);
   const text = isUnattributableIntentTarget(targetText) ? "" : normalizeIntentTarget(targetText);
   const options: IntentId[] = [...ANCHORS];
   const add = (id: IntentId): void => {
@@ -148,6 +147,13 @@ export function generalIntentQuestion(targetText: string, contextHint = ""): Gen
   let matched = false;
   const direct = groundedIntentWithContext(targetText, hint);
   if (direct) { add(direct.label); matched = true; }
+  const courtesy = isContextualCourtesy(text, hint);
+  if (courtesy) {
+    add("thank");
+    add("sarcasm");
+    add("criticize");
+    matched = true;
+  }
   const statement = isEmbeddedQuestionStatement(text);
   const ownCorrection = direct?.label === "correct";
   const negatedReply = /^(?:不是|并非)[，,]\s*我[^。！？?]{2,100}/u.test(text);
@@ -208,7 +214,8 @@ export function generalIntentQuestion(targetText: string, contextHint = ""): Gen
   return {
     question: {
       type: "choice",
-      instructions: GENERAL_INSTRUCTIONS,
+      instructions: courtesy ? GENERAL_INSTRUCTIONS +
+        "礼貌词也可能是反话：依据前文区分真诚感谢、反讽和责备；不能仅因为出现谢谢就选感谢。" : GENERAL_INSTRUCTIONS,
       criteria: options.map((id) => byId.get(id)!.zh),
     },
     focused: matched,

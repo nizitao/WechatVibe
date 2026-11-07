@@ -27,7 +27,7 @@ const source = [
 ].map(body).join("\n") + "\nlet recentIntentController = null;\n";
 
 function harness({ ready = true, results = {}, apiOverride } = {}) {
-  const nodes = new Map(), requests = [], timers = new Map();
+  const nodes = new Map(), requests = [], timers = new Map(), modelEvents = [];
   let timerId = 0, runJob = { status: "idle" };
   function byId(id) {
     if (!nodes.has(id)) {
@@ -43,6 +43,8 @@ function harness({ ready = true, results = {}, apiOverride } = {}) {
   const candidates = ["m1", "m2"].map(id => ({ id, side: "other", kind: "text", text: `Synthetic ${id}` }));
   const localSource = { mode: "local", sourceId: "local:laya" };
   const context = vm.createContext({ AbortController, AbortSignal, byId,
+    Event: class Event { constructor(type) { this.type = type; } },
+    window: { dispatchEvent(event) { modelEvents.push(event); return true; } },
     setTimeout(callback) { timers.set(++timerId, callback); return timerId; }, clearTimeout(id) { timers.delete(id); },
     CURRENT_LABEL_SCHEMA: "generic-v11", document: { hidden: false }, startupActive: false,
     chatState: { currentAccount: "acct", currentUser: "friend", generation: 1, view: "chat",
@@ -86,7 +88,7 @@ function harness({ ready = true, results = {}, apiOverride } = {}) {
     context[name] = () => {};
   vm.runInContext(source, context);
   const flush = async () => { for (let index = 0; index < 6; index++) await new Promise(resolve => setImmediate(resolve)); };
-  return { context, requests, byId, candidates, localSource, flush,
+  return { context, requests, byId, candidates, localSource, flush, modelEvents,
     posts: () => requests.filter(request => request.url === "/api/analyze" && request.payload),
     async click() { await context.toggleIntentRecognition(); await flush(); },
   };
@@ -187,6 +189,8 @@ it("source switches clear transient local state and reject a local to API to loc
   assert.equal(run.context.labelState.requestedRecentSignatures.size, 0);
   delay = false;
   run.context.applyActiveModelSource(run.localSource);
+  assert.equal(run.modelEvents.length, 2);
+  assert.ok(run.modelEvents.every(event => event.type === "model-source-updated" && event.detail === undefined));
   await run.flush();
   finish({ account: "acct", results: { m1: { state: "done", labelSchema: "generic-v11" } },
     job: { recent: { id: "late", status: "running" } } });

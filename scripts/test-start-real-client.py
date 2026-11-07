@@ -58,6 +58,20 @@ class FakeProcess:
         return None
 
 
+class SpawningProcess:
+    def __init__(self, pid, name, parent=None):
+        self.pid, self._name, self._parent = pid, name, parent
+
+    def parent(self):
+        return self._parent
+
+    def ppid(self):
+        return self._parent.pid if self._parent else 0
+
+    def name(self):
+        return self._name
+
+
 def unused_port():
     with socket.socket() as connection:
         connection.bind(("127.0.0.1", 0))
@@ -88,6 +102,67 @@ class LauncherTests(unittest.TestCase):
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return server
+
+    def test_shell_identity_accepts_only_direct_shell_or_one_python_redirector(self):
+        shell = SpawningProcess(4200, "electron.exe")
+        for name, accepted in (("python.exe", True), ("PYTHONW.EXE", True),
+                               ("powershell.exe", False), (None, False)):
+            chain = SpawningProcess(1, "python.exe", SpawningProcess(2, name, shell))
+            with self.subTest(name=name), patch("psutil.Process", return_value=chain):
+                self.assertEqual(launcher._spawned_by_shell(shell.pid), accepted)
+        direct = SpawningProcess(1, "python.exe", shell)
+        with patch("psutil.Process", return_value=direct):
+            self.assertTrue(launcher._spawned_by_shell(shell.pid))
+            self.assertFalse(launcher._spawned_by_shell(shell.pid + 1))
+            self.assertFalse(launcher._spawned_by_shell(0))
+        nested = SpawningProcess(1, "python.exe", SpawningProcess(2, "python.exe",
+                                    SpawningProcess(3, "python.exe", shell)))
+        with patch("psutil.Process", return_value=nested):
+            self.assertFalse(launcher._spawned_by_shell(shell.pid))
+
+    def test_shell_identity_denies_vanished_or_unreadable_ancestors(self):
+        import psutil
+        from unittest.mock import Mock
+        for error in (psutil.AccessDenied(), psutil.NoSuchProcess(1)):
+            process = Mock()
+            process.parent.side_effect = error
+            with self.subTest(error=error), patch("psutil.Process", return_value=process):
+                self.assertFalse(launcher._spawned_by_shell(4200))
+
+    def test_run_command_uses_venv_aware_shell_check_and_always_closes_gate(self):
+        from unittest.mock import Mock
+        args = Mock(stop_owned_bridge=False, status=False)
+        shell = SpawningProcess(4200, "electron.exe")
+        redirector = SpawningProcess(1, "python.exe", SpawningProcess(2, "python.exe", shell))
+        gate = Mock()
+        with patch("psutil.Process", return_value=redirector), \
+             patch.object(launcher, "InstallationGate", return_value=gate), \
+             patch.object(launcher, "_run_admitted", return_value=0) as admitted, \
+             patch.dict(launcher.os.environ, {"WECHATVIBE_SHELL_PID": "4200"}):
+            self.assertEqual(launcher.run_command(args, self.config), 0)
+            admitted.assert_called_once()
+            self.assertIn(unittest.mock.call(role="shell", pid=4200), gate.register.call_args_list)
+        gate.close.assert_called_once()
+        for invalid in ("4201", "not-a-pid"):
+            gate.reset_mock()
+            with patch("psutil.Process", return_value=redirector), \
+                 patch.object(launcher, "InstallationGate", return_value=gate), \
+                 patch.object(launcher, "_run_admitted") as admitted, \
+                 patch.dict(launcher.os.environ, {"WECHATVIBE_SHELL_PID": invalid}):
+                with self.assertRaisesRegex(launcher.LauncherError, "identity"):
+                    launcher.run_command(args, self.config)
+                admitted.assert_not_called()
+            gate.close.assert_called_once()
+
+    def test_json_startup_failure_exposes_only_a_fixed_category(self):
+        secret = "C:/Users/private-user/token-" + "a" * 64
+        with patch.dict(launcher.os.environ, {"CHATUI_PORT": str(self.config.port)}), \
+             patch.object(launcher, "run_command", side_effect=launcher.LauncherError(
+                 "Bridge exited with code 1; log: " + secret)), \
+             redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()):
+            self.assertEqual(launcher.main(["--no-open", "--json"]), 1)
+        self.assertEqual(json.loads(output.getvalue()), {"startupFailure": "bridge_exited"})
+        self.assertNotIn(secret, output.getvalue())
 
     def test_reuses_matching_version_without_creating_runtime_files(self):
         self.server("real-ui-1")
@@ -642,6 +717,75 @@ time.sleep(float(os.environ["FIXTURE_EXIT_DELAY"]))
         parent = Mock()
         parent.children.return_value = [expected, unrelated, wrong_script]
         self.assertEqual(launcher.owned_model_children(self.config, parent), [expected])
+
+    def test_analysis_workers_follow_only_one_verified_python_bridge_child(self):
+        from unittest.mock import Mock
+        node = self.root / "node.exe"
+        node.write_bytes(b"fixture")
+        model_script = self.root / "bridge" / "analysis_server.ts"
+        model_script.write_text("fixture", encoding="utf-8")
+        expected = Mock()
+        expected.exe.return_value = str(node)
+        expected.cmdline.return_value = [str(node), "--import", "tsx", str(model_script)]
+        interpreter = Mock()
+        interpreter.exe.return_value = str(self.config.python_exe)
+        interpreter.cmdline.return_value = [str(self.config.python_exe),
+                                            str(self.root / "bridge/chat_server.py")]
+        interpreter.children.return_value = [expected]
+        parent = Mock()
+        parent.children.return_value = [interpreter]
+        self.assertEqual(launcher.owned_model_children(self.config, parent), [expected, interpreter])
+        for command in ([str(self.config.python_exe), str(self.root / "unrelated.py")],
+                        [str(node), str(self.root / "bridge/chat_server.py")]):
+            interpreter.cmdline.return_value = command
+            interpreter.children.reset_mock()
+            self.assertEqual(launcher.owned_model_children(self.config, parent), [])
+            interpreter.children.assert_not_called()
+
+    def test_real_venv_redirector_workers_are_owned_and_forced_shutdown_leaves_no_orphans(self):
+        import psutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js is unavailable")
+        venv = self.root / ".venv"
+        subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(venv)],
+                       check=True, capture_output=True)
+        python = venv / "Scripts/python.exe"
+        script = self.root / "bridge/chat_server.py"
+        model_script = self.root / "bridge/analysis_server.ts"
+        model_script.write_text("setInterval(() => {}, 1000);", encoding="utf-8")
+        script.write_text("import subprocess, time\nsubprocess.Popen(" +
+            repr([node, "--import", "tsx", str(model_script)]) + ")\ntime.sleep(60)\n", encoding="utf-8")
+        process = subprocess.Popen([str(python), str(script)], cwd=SCRIPT.parent.parent,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: process.poll() is None and process.kill())
+        parent = psutil.Process(process.pid)
+        deadline = time.monotonic() + 8
+        workers = []
+        config = launcher.Config(self.root, python, self.config.port)
+        try:
+            while time.monotonic() < deadline:
+                workers = launcher.owned_model_children(config, parent)
+                if any(Path(child.exe()).name.casefold() == "node.exe" for child in workers):
+                    break
+                time.sleep(0.05)
+            self.assertEqual(len(workers), 2, "the wrapper owns one interpreter and one Node worker")
+            self.assertEqual(workers[-1].ppid(), process.pid)
+            alive, created = launcher.process_identity(process.pid)
+            self.assertTrue(alive)
+            launcher.finish_owned_shutdown(config, {"pid": process.pid, "created_filetime": created},
+                                           workers, timeout=5)
+            process.wait(timeout=5)
+            self.assertTrue(all(not child.is_running() for child in workers))
+        finally:
+            for child in workers:
+                try:
+                    if child.is_running():
+                        child.kill()
+                        child.wait(timeout=5)
+                except psutil.NoSuchProcess:
+                    pass
 
     def test_bounded_cleanup_terminates_only_verified_bridge_after_worker_drains(self):
         from unittest.mock import Mock

@@ -76,16 +76,19 @@ body.theme-light .advisor-input,body.theme-light .advisor-textarea-form { backgr
 .advisor-frame-body ::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-hover); }
 .advisor-frame-body ::-webkit-scrollbar-button { display: none; width: 0; height: 0; }
 .advisor-frame-top { flex: 0 0 54px; display: flex; align-items: center; padding: 0 20px; box-sizing: border-box; }
-.advisor-agent-control { position: relative; min-width: 0; }
+.advisor-agent-control { position: relative; min-width: 0; flex: 1; }
+.advisor-agent-control .advisor-agent-name { max-width: 100%; }
 .advisor-agent-name { display: inline-flex; gap: 6px; align-items: center; padding: 6px 0; max-width: 360px; border: 0; background: transparent; color: inherit; font: inherit; font-size: 15px; font-weight: 600; cursor: pointer; }
-.advisor-agent-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.advisor-agent-name span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .advisor-agent-name:disabled { cursor: default; opacity: 1; }
 .advisor-agent-name svg { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; }
 .advisor-agent-name:disabled svg { visibility: hidden; }
 .advisor-agent-menu { position: absolute; top: 100%; left: 0; min-width: 180px; max-width: 360px; max-height: 300px; overflow-y: auto; padding: 5px; border: 1px solid var(--advisor-border); border-radius: 8px; background: var(--advisor-surface); box-shadow: 0 8px 24px rgba(0,0,0,.13); z-index: 10; }
 .advisor-agent-choice { display: block; width: 100%; padding: 9px 12px; border: 0; border-radius: 4px; background: transparent; color: inherit; font: inherit; font-size: 13px; text-align: left; overflow-wrap: anywhere; cursor: pointer; }
 .advisor-agent-choice:hover,.advisor-agent-choice.active { background: rgba(127,127,127,.13); }
-.advisor-model-control { position: relative; min-width: 0; flex: 0 1 auto; }
+.advisor-model-control { position: relative; min-width: 0; flex: 0 1 auto; max-width: 48%; margin-left: 12px; }
+.advisor-model-control .advisor-agent-menu { left: auto; right: 0; max-width: min(360px, calc(100vw - 40px)); }
+.advisor-model-name { font-size: 13px; font-weight: 500; color: var(--advisor-muted); max-width: 100%; }
 .advisor-composer-left { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1 1 auto; }
 .advisor-new-thread { display: inline-flex; align-items: center; gap: 4px; flex: none; height: 26px; padding: 0 9px; border: 1px solid var(--advisor-border); border-radius: 13px; background: transparent; color: var(--advisor-muted); font: inherit; font-size: 12px; line-height: 1; cursor: pointer; }
 .advisor-new-thread:hover { border-color: #07c160; color: #07c160; }
