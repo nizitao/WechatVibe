@@ -306,9 +306,15 @@ class AccountDatabaseTests(unittest.TestCase):
         attacker.mkdir()
         linked = self.root / ".local" / "advisor-data"
         linked.parent.mkdir(parents=True)
+        created_link = False
         try:
             linked.symlink_to(attacker, target_is_directory=True)
+            # Some volumes accept the call and keep nothing; asserting afterwards would
+            # then test a plain directory that does not exist, not the store's guard.
+            created_link = linked.is_symlink() or linked.exists()
         except (OSError, NotImplementedError):
+            created_link = False
+        if not created_link:
             import subprocess
             created = subprocess.run(["cmd", "/c", "mklink", "/J", str(linked), str(attacker)],
                                      capture_output=True)

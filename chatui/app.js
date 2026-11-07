@@ -2369,6 +2369,11 @@ function analyzableMessages(window = fineWindow()) {
 function pickableMessage(message) {
   if (message.side !== "other" || message.kind !== "text" ||
       typeof message.text !== "string" || !message.text.trim()) return false;
+  // Both backends validate every id with `has_analysis_content` and reject the whole
+  // batch when one has nothing left to read. A link-only or placeholder-only line is
+  // therefore not pickable: selecting it used to make「分析选中」fail for the entire
+  // selection, with no hint about which row caused it.
+  if (!hasAnalyzableText(message.text)) return false;
   const apiMode = settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api";
   return !apiMode || (hasIntentContent(message.text) && !isIncompleteFragment(message.text));
 }

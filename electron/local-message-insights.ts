@@ -34,6 +34,35 @@ function rankedScores(answer: Answer | undefined): LabelScore[] {
     .sort((a, b) => b.probability - a.probability);
 }
 
+/** The fine question set for one target; split out so a window can be batched. */
+export function fineMessageQuestions(
+  side: "self" | "other",
+  targetText: string,
+  contextHint = "",
+): Record<string, Question> {
+  const intentQuestion = generalIntentQuestion(targetText, contextHint);
+  return side === "other"
+    // Keep the portrait question object untouched, while using the same fine display
+    // emotion question for both sides.  The relationship question remains available for
+    // OTHER messages because it is a fine score input, not a portrait emotion route.
+    ? { ...ANALYSIS_QUESTIONS, ...FINE_DISPLAY_QUESTIONS, intent: intentQuestion.question }
+    : { ...FINE_DISPLAY_QUESTIONS, intent: intentQuestion.question };
+}
+
+/** Map one prediction's answers back to the fine DTO; split out for the batched path. */
+export function fineMessageInsight(
+  answers: Record<string, Answer>,
+  side: "self" | "other",
+): FineMessageInsight {
+  const intent = generalIntentScores(answers.intent);
+  return {
+    emotion: rankedScores(answers.emotion),
+    intent,
+    intentBroad: intent,
+    relationship: side === "other" ? rankedScores(answers.relationship) : [],
+  };
+}
+
 /**
  * One budget-checked prediction per target, exactly like the previous inline branch.
  *
@@ -46,19 +75,8 @@ export async function generateFineMessageInsight(
   targetText: string,
   contextHint = "",
 ): Promise<FineMessageInsight> {
-  const intentQuestion = generalIntentQuestion(targetText, contextHint);
-  const questions = side === "other"
-    // Keep the portrait question object untouched, while using the same fine display
-    // emotion question for both sides.  The relationship question remains available for
-    // OTHER messages because it is a fine score input, not a portrait emotion route.
-    ? { ...ANALYSIS_QUESTIONS, ...FINE_DISPLAY_QUESTIONS, intent: intentQuestion.question }
-    : { ...FINE_DISPLAY_QUESTIONS, intent: intentQuestion.question };
-  const answers = await predict(questions);
-  const intent = generalIntentScores(answers.intent);
-  return {
-    emotion: rankedScores(answers.emotion),
-    intent,
-    intentBroad: intent,
-    relationship: side === "other" ? rankedScores(answers.relationship) : [],
-  };
+  return fineMessageInsight(
+    await predict(fineMessageQuestions(side, targetText, contextHint)),
+    side,
+  );
 }

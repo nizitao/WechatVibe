@@ -245,3 +245,62 @@ it("action candidates survive framing and do not mistake a statement for a quest
     "这次有什么安排？").question.criteria;
   assert.ok(!suggestion.includes("拒绝"));
 });
+
+it("batched fine targets produce the same result as one predict per target", async () => {
+  const messages = [
+    { id: "1", side: "other" as const, text: "今天下班了一起去吃火锅吗", time: 1 },
+    { id: "2", side: "other" as const, text: "我大概六点半到公司楼下等你", time: 2 },
+    { id: "3", side: "other" as const, text: "好呀那就这么定了", time: 3 },
+    { id: "4", side: "other" as const, text: "记得提前十分钟到", time: 4 },
+  ];
+  const answersFor = (state: string): Record<string, Answer> => {
+    const shift = state.length % 2 ? 0.1 : 0;
+    return {
+      emotion: choice({ "坦诚自然": 0.6 + shift, "敏感上头": 0.4 - shift }),
+      intent: choice({ "一般交流": 0.5 + shift, "分享": 0.5 - shift }),
+      relationship: choice({ warm: 0.7, neutral: 0.3 }),
+    };
+  };
+  const request = {
+    sessionId: "fine-batch-equivalence",
+    messages,
+    targetIds: ["1", "2", "3", "4"],
+    messageLabelsOnly: true,
+    contextWindow: 3,
+  };
+
+  const singleStates: State[] = [];
+  __setAnalysisEngineForTest({
+    async predict(state: State): Promise<PredictResult> {
+      singleStates.push(state);
+      return { model: "synthetic", usage: { input_tokens: 0, output_tokens: 0 }, answers: answersFor(state) };
+    },
+  });
+  const single = await analyzeMessageTargets(request);
+
+  const batched: { state: State; questions: Record<string, Question> }[][] = [];
+  __setAnalysisEngineForTest({
+    async predict(): Promise<PredictResult> {
+      throw new Error("the batched path must not fall back to one predict per target");
+    },
+    async predictBatch(entries): Promise<PredictResult[]> {
+      batched.push(entries);
+      return entries.map((entry) => ({
+        model: "synthetic", usage: { input_tokens: 0, output_tokens: 0 }, answers: answersFor(entry.state),
+      }));
+    },
+  });
+  try {
+    const result = await analyzeMessageTargets(request);
+    assert.equal(batched.length, 1, "one forward batch for the whole window");
+    assert.equal(batched[0]!.length, 4);
+    assert.deepEqual(batched[0]!.map((entry) => Object.keys(entry.questions)),
+      Array.from({ length: 4 }, () => ["emotion", "intent", "relationship"]));
+    assert.deepEqual(result.messages, single.messages);
+    assert.deepEqual(result.affinity, single.affinity);
+    assert.deepEqual(batched[0]!.map((entry) => entry.state), singleStates,
+      "a batched window must build the same per-target state as the per-message path");
+  } finally {
+    __setAnalysisEngineForTest(null);
+  }
+});

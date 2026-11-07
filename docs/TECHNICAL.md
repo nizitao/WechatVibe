@@ -775,14 +775,17 @@ RELATIONSHIP_WEIGHT = { romantic: 1.0, warm: 0.55, neutral: 0.0, distant: −0.4
 ```
 **情绪不参与关系分**（设计上只用关系信号）。
 
-亲密度（生产路径 `affinity_from_progress`）：
+亲密度（生产路径 `affinity_from_progress`，与 `electron/laya/scoring.ts` 同公式）：
 ```
-count = scoreCount
-count == 1 → weighted = scoreSum
-else      → weighted = (0.5*scoreSum + 0.5*scoreWeighted/(count-1)) / (0.75*count)
-affinity  = round(50 + 50 * clamp(weighted, −1, 1))
+r = 0.5 ** (1 / 8)                         # 8 条消息半衰期
+weighted = scoreExp / confidenceExp
+scoreExp      = Σ score · confidence · r^age
+confidenceExp = Σ confidence · r^age
+affinity = round(50 + 50 * clamp(weighted, −1, 1))
 ```
-其中 `scoreWeighted` 是**线性递推加权和**（rank = 0,1,2,…,n−1），与逐条追加等价。`count == 0 → None`；群整体返回 None。
+`confidence` 是关系分布到均匀分布的总变差距离；旧检查点没有 `scoreExp/confidenceExp` 时回退原线性公式，
+不把两套权重混算。`scoreCount == 0 → None`；群整体返回 None。半衰期由
+`tests/fixtures/laya-affinity-corpus.jsonl` 的验证集选择，详见 `docs/laya-scoring-calibration.md`。
 
 等级：`gradeFor(affinity)`：S≥85、A≥70、B≥58、C≥45、D≥32、否则 E。
 前端展示：5 级心轨 `素昧平生 / 泛泛之交 / 初识相知 / 友善默契 / 亲密无间`，`level = min(5, floor(score/20)+1)`。
@@ -798,7 +801,9 @@ affinity  = round(50 + 50 * clamp(weighted, −1, 1))
 - `count += N`；`targetCount += N`
 - 分布：`state[field][label] += N × probability`（**质量累加，不是概率平均**）
 - 关键词：`words[word] += count`（整数计数）
-- 关系分：`scoreSum += N×score`；`scoreWeighted += (N×rank + N(N−1)/2) × score`，其中 `rank = scoreCount − len(tail_scores)`；再补 `sum(tail_scores) × N`（乱序回填）
+- 关系分：保留旧字段 `scoreSum/scoreWeighted` 供迁移对照；v2 用
+  `scoreExp/confidenceExp = r^N × 旧值 + (1−r^N) × 乱序 tail + 新块`，其中新块权重为
+  `score·confidence·r^rank·(1−r^N)/(1−r)`；逐条、批量与乱序插值数学等价
 - 情绪 mood：同样用 `rank_sum = N×rank + N(N−1)/2` 闭式加权；主情绪以 `rawLabel` 归并（跨版本稳定）
 - 风格六维：`style[key] += N × value`
 - MBTI 四轴：`insufficient ≥ max(left, right)` → 只累加 `insufficient`；否则累加 left/right 质量并置 `supported = True`
@@ -1136,7 +1141,9 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 
 ### 12.2 修改打分/派生规则（好感度、MBTI、雷达、摘要、关键词）
 
-- 好感度：`backend_contracts.affinity_from_progress`（生产路径）+ `electron/laya/scoring.ts:affinityFromScores`（推理层等价实现）。**两处需同步**，否则本地与 API 模式口径不一致。
+- 好感度：`backend_contracts.affinity_from_progress`（生产路径）+ `electron/laya/scoring.ts:affinityFromSignals`（推理层等价实现）。`AFFINITY_HALF_LIFE=8` 同时定义在
+  `bridge/backend_contracts.py` 与 `electron/laya/scoring.ts`，修改时必须同步并升级
+  `AFFINITY_CALIBRATION.version`；训练/对比见 `docs/laya-scoring-calibration.md`。
 - MBTI：`backend_contracts.mbti_from_totals`（阈值 `MIN_PERSONALITY_MESSAGES=100` / `MIN_AXIS_EVIDENCE=30` / `MIN_AXIS_MARGIN=0.2`）+ `electron/laya/personality.ts` 的问题与证据提取。
 - 雷达/摘要/关键词：`profile_state.traits_from_state`、`profile_signals.py`、`backend_contracts`。
 - 影响面：改变统计口径时应递增相应版本（`FINE_LABEL_SCHEMA` / `BATCH_VERSION` / portrait 修订），否则新旧结果会混算；`batch_state._state()` 的结构契约（`empty_state()` 键集）一旦变更，`api_portrait_statistics.valid_statistics` 与历史 `state_json` 会全部判不合法。
@@ -1311,7 +1318,7 @@ POST /api/analysis-target/forget {account,user,sourceId,messageId}
 | `npm run test:node` | 61 个 TS/CJS 测试（`tests/` 下 21 个 `*.test.ts` + 40 个 `*.test.cjs`）：分词器、模型连接器、分类器、契约、UI 逻辑 |
 | `npm run test:python` | `scripts/run-python-tests.py`：三组（`bridge` / `scripts` / `native-reader`）**并行**、组内文件串行（多个 bridge 测试共用项目 `.local` 目录，并行会互相竞争）；某组失败不掩盖其他组结果，全部通过打印 `ALL_PYTHON_TESTS_PASSED` |
 | `npm run test:scripts` | `scripts/run-node-script-tests.cjs`（桌面/更新/启动器脚本） |
-| `npm run test:model` | `tsx scripts/test-model.ts`，真实加载 ONNX 跑中文推理；**需先下载模型**，并设 `LAYA_MODEL_DIR` 指向已安装客户端的模型目录（如 `D:\program\wechat\win-unpacked\resources\client\.local\models\laya`）；基线输出 affinity 73 |
+| `npm run test:model` | `tsx scripts/test-model.ts`，真实加载 ONNX 跑中文推理；**需先下载模型**，并设 `LAYA_MODEL_DIR` 指向已安装客户端的模型目录（如 `D:\program\wechat\win-unpacked\resources\client\.local\models\laya`）；基线输出 affinity 75（随关系提示词版本变化） |
 | `npm run test:recovery` | 桌面、服务恢复、账号存储、启动器 |
 | `npm run build:portable` | 完整便携构建 |
 | `python scripts/run-project-python.py scripts/test-start-real-client.py` | launcher 单元测试 |

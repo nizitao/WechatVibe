@@ -322,8 +322,10 @@ export async function analyzeApiGuidance(
   const resolve = (value: unknown): string => {
     if (typeof value === "number" && Number.isSafeInteger(value)) value = String(value);
     if (typeof value !== "string") return "";
-    const direct = reverse.get(value);
-    if (direct) return direct;
+    // The same lookup as the insight parser: the alias, or a real id echoed back. Looking
+    // only at the alias map made the conflict check below unreachable (`direct` was always
+    // falsy there), so a numeric id that named two owners could pick the wrong message.
+    const direct = reverse.get(value) ?? (originalIds.has(value) ? value : undefined);
     const numeric = /^\d+$/u.test(value) ? reverse.get(`g${value}`) : undefined;
     // A provider may drop the short prefix; a real id may also be echoed back.
     // Never choose between two different owners.

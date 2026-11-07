@@ -1322,7 +1322,7 @@ class BackendTests(unittest.TestCase):
         self.assertIs(labelled_pin_status(status, object()), status)
 
     def test_affinity_reference_and_stable_identity(self):
-        self.assertEqual(affinity([1, -1]), 33)
+        self.assertEqual(affinity([1, -1]), 48)
         row = {"local_id": 1, "sort_seq": 5, "server_id": 9}
         self.assertNotEqual(message_id("a", "user", "shard0", row), message_id("b", "user", "shard0", row))
         self.assertNotEqual(message_id("a", "user", "shard0", row), message_id("a", "room", "shard0", row))
@@ -2074,6 +2074,32 @@ class FineLabelRevisionTests(unittest.TestCase):
     def run_job(self, user, limit):
         self.backend.start(user, "recent", limit)
         self.backend.tasks.join()
+
+    def test_visible_window_uses_one_batched_worker_call(self):
+        """A whole visible window is one worker request; see docs/performance-analysis.md §3.4."""
+        self.source.add("friend", 6)
+        calls = []
+        original = self.analyzer.analyze
+
+        def analyze_targets(session, messages, targets, **kwargs):
+            calls.append({"targets": list(targets),
+                          "context": [item["id"] for item in messages],
+                          "contextWindow": kwargs.get("contextWindow")})
+            return [{**original(session, messages, target), "labelSchema": FINE_LABEL_SCHEMA,
+                     "groundedIntent": None} for target in targets]
+
+        self.analyzer.analyze_targets = analyze_targets
+        account, workdir, store = self.backend._scoped_identity()
+        version = self.analyzer.analysis_version()
+        list(self.backend._run_fine_recent(account, "friend", version, store,
+                                           {"total": 0, "processed": 0}, (account, workdir), 6))
+
+        self.assertEqual(len(calls), 1, "the window must not fall back to one call per message")
+        self.assertEqual(calls[0]["contextWindow"], 3)
+        self.assertEqual(len(calls[0]["targets"]), 6)
+        self.assertEqual(len(calls[0]["context"]), 6)
+        saved = store.fine_view(account, "friend", version)
+        self.assertEqual(len(saved), 6, "every batched result is durably saved")
 
     def test_unmarked_fine_response_keeps_previous_label(self):
         self.source.add("friend", 1)

@@ -741,17 +741,23 @@ class AccountDatabase:
 
     def delete_thread(self, thread_id):
         """Remove one conversation and everything hanging off it. Reports whether it existed."""
-        with self._connect() as connection:
-            row = connection.execute("SELECT id FROM threads WHERE id=?", (thread_id,)).fetchone()
-            if row is None:
-                return False
-            connection.execute(
-                "DELETE FROM requests WHERE run_id IN (SELECT id FROM runs WHERE thread_id=?)",
-                (thread_id,))
-            connection.execute("DELETE FROM runs WHERE thread_id=?", (thread_id,))
-            connection.execute("DELETE FROM messages WHERE thread_id=?", (thread_id,))
-            connection.execute("DELETE FROM threads WHERE id=?", (thread_id,))
-            return True
+        # Every other writer holds `self.lock` around its transaction, and they all share one
+        # connection (check_same_thread=False). Without it a delete can join the import
+        # worker's open transaction: its rows get committed by that thread, or rolled back
+        # with it, leaving a thread row that no longer matches its messages.
+        with self.lock:
+            connection = self._connect()
+            with connection:
+                row = connection.execute("SELECT id FROM threads WHERE id=?", (thread_id,)).fetchone()
+                if row is None:
+                    return False
+                connection.execute(
+                    "DELETE FROM requests WHERE run_id IN (SELECT id FROM runs WHERE thread_id=?)",
+                    (thread_id,))
+                connection.execute("DELETE FROM runs WHERE thread_id=?", (thread_id,))
+                connection.execute("DELETE FROM messages WHERE thread_id=?", (thread_id,))
+                connection.execute("DELETE FROM threads WHERE id=?", (thread_id,))
+                return True
 
     def thread(self, thread_id):
         return self._row("SELECT * FROM threads WHERE id=?", (thread_id,))

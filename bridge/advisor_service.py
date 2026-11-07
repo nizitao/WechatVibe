@@ -445,15 +445,19 @@ class AdvisorService:
             row = database.thread(thread_id)
             if row is None or row["user"] != user or row["agent_id"] != agent_id:
                 raise AdvisorError("thread-unknown", "会话不存在或不属于该 Agent")
-            run = database.latest_run(thread_id)
-            if run is not None:
-                with self.condition:
-                    live = self._runs.get(run["id"])
-                if live is not None and live.state == "running":
-                    raise AdvisorError("run-active", "该会话正在生成，请先停止")
+            # Any live run of this thread blocks the delete, not only the newest row: an
+            # older run still streaming would otherwise keep writing into a deleted thread.
+            live = [item for item in self._runs.values()
+                    if item.thread_id == thread_id and item.state == "running"]
+            if live:
+                raise AdvisorError("run-active", "该会话正在生成，请先停止")
             if not database.delete_thread(thread_id):
                 raise AdvisorError("thread-unknown", "会话不存在或不属于该 Agent")
-            self._runs.pop(run["id"], None) if run is not None else None
+            # A finished thread usually has several runs in memory; dropping only the latest
+            # left the rest holding the deleted transcript and answering /events with a
+            # TypeError (503) once their thread row was gone.
+            for run_id in [run_id for run_id, item in self._runs.items() if item.thread_id == thread_id]:
+                self._runs.pop(run_id, None)
         return {"deleted": True, "threadId": thread_id}
 
     def threads(self, account, user, agent_id):
@@ -510,6 +514,10 @@ class AdvisorService:
         return result
 
     def _thread_payload(self, account, database, row):
+        # `/events` can still be asked for a run whose conversation was deleted in another
+        # window; indexing a missing row used to surface as a 503 TypeError instead.
+        if row is None:
+            raise AdvisorError("thread-unknown", "会话不存在")
         messages = []
         for message in database.thread_messages(row["id"]):
             item = {"id": message["id"], "role": message["role"], "text": message["text"],

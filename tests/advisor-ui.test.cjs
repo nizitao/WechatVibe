@@ -1349,9 +1349,14 @@ test("a failed history load clears the rows and offers a retry", async () => {
 test("the host turns a transport failure into the retry state, not a lone banner", async () => {
   const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
   advisor.initFrameHandshake();
-  advisor.fetchJson = async () => { throw new Error("offline"); };
-  await advisor.loadThreads();
+  let attempts = 0;
+  advisor.fetchJson = async () => { attempts++; throw new Error("offline"); };
+  // The host retries a transient failure once, so the harness has to run the delayed timer.
+  const pending = advisor.loadThreads();
   await new Promise(resolve => setImmediate(resolve));
+  await hostEnv.flushTimers();
+  await pending;
+  assert.equal(attempts, 2, "one quiet retry before giving the user the button");
   const menu = frameEnv.elements.get("historyMenu");
   assert.equal(menu.children.length, 1);
   assert.match(menu.children[0].textContent, /^历史读取失败/);
@@ -1415,4 +1420,68 @@ test("the host deletes through the endpoint and refreshes the list", async () =>
   assert.equal(calls[0].url, "/api/advisor/threads/delete");
   assert.deepEqual(calls[0].body, { account: "account-a", user: "friend-a", agentId: "advisor", threadId: "t-old" });
   assert.ok(calls.some(call => call.url.startsWith("/api/advisor/threads?")));
+});
+
+test("deleting the conversation on screen still refreshes the view", async () => {
+  const { hostEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const active = thread();
+  const replacement = { ...thread(), id: "account-a-friend-a-advisor-next", messages: [] };
+  const calls = [];
+  advisor.fetchJson = async url => {
+    calls.push(String(url));
+    if (String(url).startsWith("/api/advisor/threads/delete")) return { deleted: true, threadId: active.id };
+    if (String(url).startsWith("/api/advisor/threads?")) return { threads: [] };
+    return { thread: replacement, run: null, draft: "" };
+  };
+  await advisor.deleteThread(active.id);
+  assert.ok(calls[0].startsWith("/api/advisor/threads/delete"));
+  // Stopping the poll bumps the generation; the refresh has to run under the new scope or
+  // the deleted conversation stays on screen and in the cached list.
+  assert.ok(calls.some(url => url.startsWith("/api/advisor/thread?")), "the deleted thread must be replaced");
+  assert.ok(calls.some(url => url.startsWith("/api/advisor/threads?")), "the list must be refreshed");
+  assert.equal(advisor.getCachedThread("account-a", "friend-a", "advisor").id, replacement.id,
+    "the replacement thread replaces the deleted one");
+});
+
+test("a refused delete reports why instead of looking successful", async () => {
+  const { hostEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  const calls = [];
+  advisor.fetchJson = async url => {
+    calls.push(String(url));
+    if (String(url).startsWith("/api/advisor/threads/delete")) {
+      return { error: "该会话正在生成，请先停止", status: 409 };
+    }
+    if (String(url).startsWith("/api/advisor/threads?")) return { threads: [] };
+    return { thread: thread(), run: null, draft: "" };
+  };
+  await advisor.deleteThread(thread().id);
+  const problems = hostEnv.messages.filter(message => message.type === "ADVISOR_PROBLEM" &&
+    message.payload.error === "该会话正在生成，请先停止");
+  assert.equal(problems.length, 1);
+  assert.equal(problems[0].payload.retryKind, "load");
+  // The failed delete stopped the poll; reloading re-attaches the live run so the stop
+  // button keeps working.
+  assert.ok(calls.some(url => url.startsWith("/api/advisor/thread?")), "the live run must be re-attached");
+});
+
+test("a transient history failure retries itself instead of flashing empty", async () => {
+  const { hostEnv, frameEnv } = pair(), advisor = ready(hostEnv);
+  advisor.initFrameHandshake();
+  let calls = 0;
+  advisor.fetchJson = async () => {
+    calls++;
+    if (calls === 1) throw new Error("preparing");
+    return { threads: [{ id: "t-1", title: "恢复", preview: "", previewRole: "", messageCount: 1,
+      createdAtMs: 1, updatedAtMs: 2 }] };
+  };
+  const pending = advisor.loadThreads();
+  await new Promise(resolve => setImmediate(resolve));
+  await hostEnv.flushTimers();
+  await pending;
+  assert.equal(calls, 2);
+  const menu = frameEnv.elements.get("historyMenu");
+  assert.equal(menu.children.length, 1);
+  assert.equal(menu.children[0].dataset.threadId, "t-1");
 });

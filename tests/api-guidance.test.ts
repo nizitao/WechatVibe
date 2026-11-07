@@ -287,6 +287,22 @@ it("requires exactly one reading per target and never reassigns an unknown one",
   })), fails("invalid-request"));
 });
 
+it("refuses a numeric id that names two different messages", async () => {
+  // "2" is both the real id of the first message and the suffix of the second one's alias
+  // (g2). The old lookup only consulted the alias map, so this silently answered for m2.
+  const ambiguous = input({
+    messages: [
+      { id: "2", sender: "OTHER", text: "第一条，id 是数字 2" },
+      { id: "m2", sender: "OTHER", text: "第二条，别名是 g2" },
+    ],
+    targetIds: ["m2"],
+  });
+  await assert.rejects(() => analyzeApiGuidance(config, ambiguous, reply({
+    subtexts: [{ id: "2", status: "ok", implied: "说不清是哪一条" }],
+    advice: { forOthers: okOthers, forSelf: null },
+  })), fails("invalid-output"), "an id with two owners must not be assigned to either message");
+});
+
 it("reports a terminal reading without smuggling in an interpretation", async () => {
   const result = await analyzeApiGuidance(config, input(), reply({
     subtexts: [{ id: "g2", status: "uncertain" }],

@@ -528,19 +528,26 @@ function validThread(value, scope) {
         // The conversation on screen is going away, so its run has to stop first.
         this.generation++; this.abortCurrentPoll();
       }
-      try {
-        await this.fetchJson("/api/advisor/threads/delete", { method: "POST",
-          body: JSON.stringify({ account: scope.account, user: scope.user, agentId: scope.agentId, threadId }) });
-      } catch (error) {
-        this.problem(error, scope, "load");
-        await this.loadThreads(scope);
+      // The bump above invalidates `scope`; the refresh below has to run under the new one,
+      // exactly like `openThread`. Comparing with `scope` made every active delete skip it,
+      // leaving the deleted conversation on screen and in the cached thread list.
+      const next = this.captureScope();
+      const result = await this.fetchJson("/api/advisor/threads/delete", { method: "POST",
+        body: JSON.stringify({ account: scope.account, user: scope.user, agentId: scope.agentId, threadId }) });
+      if (!this.isCurrent(next) || next.account !== scope.account || next.user !== scope.user ||
+        next.agentId !== scope.agentId) return;
+      // `fetchJson` never throws: a failed delete arrives as `{error}`. Reporting it after
+      // the refresh keeps `loadThreads`' own `clearProblem("load")` from erasing it.
+      if (result?.error) {
+        if (wasActive) await this.loadThread(next);
+        await this.loadThreads(next);
+        if (this.isCurrent(next)) this.problem(result, next, "load");
         return;
       }
-      if (!this.isCurrent(scope)) return;
-      if (wasActive) await this.loadThread(this.captureScope());
-      await this.loadThreads(this.captureScope());
+      if (wasActive) await this.loadThread(next);
+      await this.loadThreads(next);
     },
-    async loadThreads(scope = this.captureScope()) {
+    async loadThreads(scope = this.captureScope(), attempt = 0) {
       if (!this.isCurrent(scope) || !scope.account || !scope.user || !scope.agentId || !this.catalogReady) return;
       const serial = ++this.historySerial;
       const query = new URLSearchParams({ account: scope.account, user: scope.user, agentId: scope.agentId });
@@ -570,12 +577,27 @@ function validThread(value, scope) {
           error: (failure ? `历史读取失败：${failure}，点此重试` : "历史读取失败，点此重试").slice(0, 120),
           activeThreadId: activeId,
         }, scope);
+        // Switching contact or waking the data source can fail this request for a moment; one
+        // quiet retry fills the menu in afterwards. It is scheduled, never awaited: the switch
+        // and delete paths await `loadThreads`, and a delay inside that chain held their own
+        // refresh for 600ms. The failure is still reported now, so a real error stays visible.
+        if (attempt < 1) this.scheduleThreadRetry(scope, attempt + 1, serial);
         return;
       }
       this.clearProblem("load", scope);
       this.postToFrame("ADVISOR_SET_THREADS", {
         threads: data.threads, activeThreadId: activeId,
       }, scope);
+    },
+    // Scheduled instead of awaited: `loadThreads` is awaited by the switch and delete paths,
+    // and a delay inside that chain delayed their own refresh. The retry only fires while it
+    // is still the newest load: a manual retry takes a new serial, and this one must not bump
+    // `historySerial` and discard the result that request is about to deliver.
+    scheduleThreadRetry(scope, attempt, serial) {
+      setTimeout(() => {
+        if (this.historySerial !== serial || !this.isCurrent(scope)) return;
+        void this.loadThreads(scope, attempt);
+      }, 600);
     },
     onSessionChanged(account, user) {
       account = typeof account === "string" ? account : ""; user = typeof user === "string" ? user : "";

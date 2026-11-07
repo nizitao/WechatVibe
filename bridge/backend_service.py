@@ -62,6 +62,12 @@ from wechat_source import WeChatSource
 
 DEFAULT_ANALYSIS_WORKERS = 1
 MAX_ANALYSIS_WORKERS = 4
+# Labels for one visible window are held in memory and committed in a single transaction.
+# Eight matches the yield cadence, so a UI refresh never reports more rows than are durable.
+FINE_RESULT_BATCH = 8
+# One worker request carries at most this many targets, so a long window still yields
+# between chunks and an interactive re-analysis never waits behind a 500-message batch.
+FINE_BATCH_TARGETS = 32
 ELASTIC_SAMPLE_SECONDS = 30
 ELASTIC_RAMP_SAMPLES = 2
 ELASTIC_BUSY_CPU = 85
@@ -2227,14 +2233,14 @@ class Backend:
         known = set(users)
         rows = store.analysis_progress_rows(account, version)
         scanned = complete = analyzed = 0
-        for session, subject, done, state in rows:
+        for session, subject, done, count in rows:
             # One row per analysed subject: the conversation itself, or "" for a group overall.
             if session not in known or subject != ("" if session.endswith("@chatroom") else session):
                 continue
             scanned += 1
             complete += 1 if done else 0
             try:
-                analyzed += int(json.loads(state or "{}").get("count") or 0)
+                analyzed += int(count or 0)
             except (TypeError, ValueError):
                 pass
         # Text totals are plain SQL counts, so this stays cheap; cache them briefly because
@@ -2735,7 +2741,11 @@ class Backend:
         snapshot = None
         pieces = None
         row_hashes = None
-        if start_after is None and after is None:
+        # A rebuild re-derives the portrait under new rules, so it must read history again: the
+        # 60s snapshot was built under the previous rules and only carries the old counts and
+        # fingerprint. Reusing it made the rebuild finish without a single history page, which
+        # showed up as a portrait whose statistics version changed but whose evidence did not.
+        if start_after is None and after is None and not rebuild:
             snapshot_key = (account, scope[1], user, subject, highwater)
             deadline = time.monotonic() + 30
             while True:
@@ -3453,6 +3463,55 @@ class Backend:
         return self._analyze_item(account, user, version, store, context, item, scope,
                                   fine=True, portrait_context=portrait_context)
 
+    def _flush_fine_results(self, account, user, version, store, pending, scope):
+        """Commit a batch of deferred fine results in one transaction.
+
+        ``_analyze_item(defer=True)`` returns the validated result without touching the
+        database. Batching the writes keeps one FULL-sync commit per window instead of one
+        per message, and keeps the source lock held for microseconds rather than ~8 ms per
+        row (docs/performance-analysis.md §3.4).
+        """
+        if not pending:
+            return
+        started = time.perf_counter()
+        self._assert_scope(scope)
+        verified = time.perf_counter()
+        rows, skips, prepared = [], [], []
+        for item, result in pending:
+            if result is None:
+                continue
+            if "skip" in result:
+                skips.append((item, result["skip"]))
+            else:
+                rows.append((item, result["result"]))
+                prepared.append(result)
+        with self._scope_commit(scope):
+            if rows:
+                store.save_fine_many(account, user, version, rows)
+            if skips:
+                store.skip_fine_many(account, user, version, skips)
+        finished = time.perf_counter()
+        with self.jobs_lock:
+            metrics = self.performance.setdefault((account, user, version), {})
+            defaults = {
+                "count": 0, "modelMs": 0.0, "requestMs": 0.0, "verifyMs": 0.0,
+                "saveMs": 0.0, "betweenMs": 0.0, "lastFinished": started,
+            }
+            for name, value in defaults.items():
+                metrics.setdefault(name, value)
+            metrics["verifyMs"] += (verified - started) * 1000
+            metrics["saveMs"] += (finished - verified) * 1000
+            if prepared:
+                metrics["count"] += len(prepared)
+                metrics["modelMs"] += sum(item["modelMs"] for item in prepared)
+                metrics["requestMs"] += sum((item["inferred"] - item["started"]) * 1000
+                                            for item in prepared)
+                metrics["betweenMs"] += max(0.0, (prepared[0]["started"] - metrics["lastFinished"]) * 1000)
+                for previous, current in zip(prepared, prepared[1:]):
+                    metrics["betweenMs"] += max(0.0, (current["started"] - previous["inferred"]) * 1000)
+                metrics["lastFinished"] = finished
+        pending.clear()
+
     def _resolve_selected_targets(self, user, limit, target_ids):
         """Validate a hand-picked id list against the analysable tail window.
 
@@ -3498,6 +3557,7 @@ class Backend:
         job["total"] = len(selected)
         job["processed"] = sum(item["id"] in known for _index, item in selected)
         contexts = {}
+        pending = []
         since_yield = 0
         for index, item in reversed(selected):
             if item["id"] in known:
@@ -3506,9 +3566,13 @@ class Backend:
                 subject = item.get("senderId") if user.endswith("@chatroom") else user
                 if subject not in contexts:
                     contexts[subject] = self._fine_portrait_context(account, user, version, store, item)
-                self._analyze_fine_item(account, user, version, store,
-                                        window[max(0, index - 3):index + 1], item, scope,
-                                        portrait_context=contexts[subject])
+                prepared = self._analyze_item(account, user, version, store,
+                                              window[max(0, index - 3):index + 1], item, scope,
+                                              defer=True, fine=True,
+                                              portrait_context=contexts[subject])
+                pending.append((item, prepared))
+                if len(pending) >= FINE_RESULT_BATCH:
+                    self._flush_fine_results(account, user, version, store, pending, scope)
             else:
                 self._analyze_item(account, user, version, store,
                                    window[max(0, index - 3):index + 1], item, scope)
@@ -3517,7 +3581,47 @@ class Backend:
             since_yield += 1
             if since_yield >= 8 or self._interactive_waiting():
                 since_yield = 0
+                self._flush_fine_results(account, user, version, store, pending, scope)
                 yield
+        self._flush_fine_results(account, user, version, store, pending, scope)
+
+    def _run_fine_window_batched(self, account, user, version, store, job, scope, window,
+                                 pending_items, portrait_context):
+        """Analyse the whole visible window in one worker request.
+
+        Returns False when the batch cannot be used (no batching entry point, or one
+        over-long target), so the caller falls back to the per-message path that records
+        individual skips. Returns True after the results are durably saved.
+        """
+        analyze_targets = getattr(self.analyzer, "analyze_targets", None)
+        if not callable(analyze_targets):
+            return False
+        indexes = [index for index, _item in pending_items]
+        first, last = max(0, min(indexes) - 3), max(indexes) + 1
+        targets = [item["id"] for _index, item in pending_items]
+        session = account + ":" + str(store.path) + ":" + user
+        started = time.perf_counter()
+        try:
+            self._assert_scope(scope)
+            response = analyze_targets(session, window[first:last], targets,
+                                       portraitContext=portrait_context, messageLabelsOnly=True,
+                                       contextWindow=3)
+        except RuntimeError as exc:
+            if str(exc) == "ObservedTextTooLongError":
+                return False
+            raise
+        inferred = time.perf_counter()
+        batch_ms = (float(response[0].get("_modelMs") or 0) if response else 0.0) or \
+            (inferred - started) * 1000
+        # One request produced every row; report the batch's share per message so the
+        # aggregate `modelMs` stays a real total instead of N copies of it.
+        model_ms = batch_ms / max(1, len(response))
+        prepared = [(item, {"result": validate_fine_result(result, version, item["side"]),
+                            "started": started, "inferred": inferred, "modelMs": model_ms})
+                    for item, result in zip((item for _index, item in pending_items), response)]
+        self._flush_fine_results(account, user, version, store, prepared, scope)
+        job["processed"] += len(prepared)
+        return True
 
     def _run_fine_recent(self, account, user, version, store, job, scope, limit):
         self._assert_scope(scope)
@@ -3529,7 +3633,32 @@ class Backend:
         known = store.fine_known(account, user, version, [item["id"] for _index, item in selected])
         job["total"] = len(selected)
         job["processed"] = sum(item["id"] in known for _index, item in selected)
+        pending_items = [(index, item) for index, item in selected if item["id"] not in known]
+        if len(pending_items) > 1:
+            contexts = {}
+            for _index, item in pending_items:
+                subject = item.get("senderId") if user.endswith("@chatroom") else user
+                if subject not in contexts:
+                    contexts[subject] = self._fine_portrait_context(account, user, version, store, item)
+            shared = set(contexts.values())
+            if len(shared) == 1:
+                context = shared.pop()
+                complete = True
+                for start in range(0, len(pending_items), FINE_BATCH_TARGETS):
+                    chunk = pending_items[start:start + FINE_BATCH_TARGETS]
+                    if not self._run_fine_window_batched(account, user, version, store, job,
+                                                         scope, window, chunk, context):
+                        complete = False
+                        break
+                    yield
+                if complete:
+                    return
+                # A later chunk hit an over-long target: re-read what is already durable so
+                # the per-message fallback never repeats a saved batch.
+                known = store.fine_known(account, user, version,
+                                         [item["id"] for _index, item in selected])
         contexts = {}
+        pending = []
         since_yield = 0
         for index, item in reversed(selected):
             if item["id"] in known:
@@ -3537,15 +3666,21 @@ class Backend:
             subject = item.get("senderId") if user.endswith("@chatroom") else user
             if subject not in contexts:
                 contexts[subject] = self._fine_portrait_context(account, user, version, store, item)
-            self._analyze_fine_item(account, user, version, store,
-                                    window[max(0, index - 3):index + 1], item, scope,
-                                    portrait_context=contexts[subject])
+            prepared = self._analyze_item(account, user, version, store,
+                                          window[max(0, index - 3):index + 1], item, scope,
+                                          defer=True, fine=True,
+                                          portrait_context=contexts[subject])
+            pending.append((item, prepared))
+            if len(pending) >= FINE_RESULT_BATCH:
+                self._flush_fine_results(account, user, version, store, pending, scope)
             known.add(item["id"])
             job["processed"] += 1
             since_yield += 1
             if since_yield >= 8 or self._interactive_waiting():
                 since_yield = 0
+                self._flush_fine_results(account, user, version, store, pending, scope)
                 yield
+        self._flush_fine_results(account, user, version, store, pending, scope)
 
     def _run_fine_message(self, key, store, job, scope, message_id):
         """Re-analyze one message on demand, even when a saved label already exists.

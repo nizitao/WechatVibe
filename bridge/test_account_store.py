@@ -41,6 +41,11 @@ def short_directory_alias(path):
 def directory_reparse_alias(target, alias):
     try:
         os.symlink(target, alias, target_is_directory=True)
+        # `os.symlink` can return without creating anything on a filtered volume; the
+        # caller would then assert against a path that does not exist and report a
+        # product failure. Verify the link before trusting it.
+        if not os.path.lexists(alias):
+            raise OSError("symbolic link was not created")
     except (OSError, NotImplementedError):
         if os.name != 'nt':
             raise unittest.SkipTest('directory reparse alias unavailable')

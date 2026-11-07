@@ -138,16 +138,22 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                 except OSError:
                     pass
 
-        def send(self, status, body, content_type="application/json; charset=utf-8"):
+        def send(self, status, body, content_type="application/json; charset=utf-8", headers=None):
             payload = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode("utf-8")
+            extra = dict(headers or {})
+            cache_control = extra.pop("Cache-Control", "no-store")
             try:
                 self.send_response(status)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(payload)))
-                self.send_header("Cache-Control", "no-store")
+                if status != 304:
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Cache-Control", cache_control)
                 self.send_header("X-Content-Type-Options", "nosniff")
+                for name, value in extra.items():
+                    self.send_header(name, value)
                 self.end_headers()
-                self.wfile.write(payload)
+                if status != 304:
+                    self.wfile.write(payload)
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 # Switching chats cancels obsolete requests. There is no client left to
                 # receive a second 503 response; retain the successfully read result.
@@ -285,7 +291,14 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                 if not target.is_relative_to(CHATUI.resolve()) or not target.is_file():
                     return self.send(404, {"error": "not found"})
                 mime = static_content_type(target.name)
-                return self.send(200, target.read_bytes(), mime)
+                # The UI is static and unversioned; revalidate instead of re-sending ~300 KB
+                # of JS on every window reload. API responses stay `no-store`.
+                info = target.stat()
+                etag = '"%x-%x"' % (info.st_mtime_ns, info.st_size)
+                headers = {"Cache-Control": "no-cache", "ETag": etag}
+                if self.headers.get("If-None-Match") == etag:
+                    return self.send(304, b"", mime, headers=headers)
+                return self.send(200, target.read_bytes(), mime, headers=headers)
             except AdvisorError as exc:
                 return self.send(advisor_http.error_status(exc), {"error": exc.code, "message": exc.message})
             except PayloadUnreadable as exc:

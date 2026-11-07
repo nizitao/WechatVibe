@@ -16,3 +16,17 @@
 - 前端校验函数的长度/字段必须对齐后端真实文档结构（如 `ModelSourceStore.public()` 的 `api` **没有 name**），测试夹具要从后端输出抄，自己编字段会把 bug 盖住。
 - **行尾陷阱**：`.gitattributes` 只给 `chatui/*.html|css` 定了 `eol=lf`，`chatui/*.js` 会被 Windows 编辑器存成 CRLF 而 Git 索引仍是 LF（`git status` 显示干净）。按多行源码模式断言的测试读到的可能是 CRLF，会随机失败——断言前先 `.replace(/\r\n/g, "\n")`。
 - 这个工作区可能有并行会话同时改同一批文件（docs、app.js、Start.bat 等）；动手前 `git status`，不要回滚别人的改动。22:46 有并行会话把整个工作树一次性提交（`42d0016`），改动会被合并进去。
+
+## Laya 好感度链路（2026-10-31 核实）
+- **界面上的好感度由 Python 算**：`backend_service.py:4364/4498` → `backend_contracts.affinity_from_progress`。
+  `bridge/node_analysis.py` 不引用 `affinity`/`delta`/`affinityGrade`/`nextStep`，所以只改
+  `electron/laya/scoring.ts` **不会**改变显示值。`docs/TECHNICAL.md` §12.2 的「两处需同步」即指此。
+- 累加器有三处：`bridge/profile_state.py:add_result`（逐条）、`bridge/batch_state.py:_merge`（批量）、
+  `bridge/api_portrait_statistics.py`（API 画像）；持久化在 `summary_v1`（`score_count/score_sum/score_weighted`）。
+- 模型是 `mizchi/laya-multilingual-onnx@d9d003d5`，`model.onnx` 647MB，按 sha256 校验；仓库无训练代码。
+  `.models/laya` 平时不存在，`npm run setup:models` 下载；代理 6864 会在大文件传输中途断开。
+- 评分头 v2（`AFFINITY_CALIBRATION`）：指数 recency 半衰期 10 条 + TV 距离置信度权重，无下限。
+  评测 `node --import tsx scripts/laya-score-eval.ts [--grid]`，回归 `tests/laya-scoring-calibration.test.ts`。
+- 提示词探针 `scripts/laya-prompt-probe.ts`（fit/holdout 各 20，`--dry-run` 不需要模型）。
+  `.local/` 下的同名旧版把用例全标 `confirm`，`fitHits` 恒为 0，其结论不可用。
+

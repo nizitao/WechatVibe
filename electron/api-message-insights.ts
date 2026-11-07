@@ -159,12 +159,15 @@ function normalizeAffect(value: unknown): ApiAffect | undefined {
     if (!(AFFECT_KEYS as readonly string[]).includes(key)) outputError();
   }
   const affect: ApiAffect = {};
+  // One label is the contract and it is normalised onto `feeling`, which is the field the
+  // renderer shows first. An empty first key must not end the search though: with
+  // `{"tone":"无","interaction":"亲密"}` the `break` used to run before `interaction` was
+  // read, so a usable label was dropped and the message came back with no affect at all.
   for (const key of ["feeling", "tone", "interaction"] as const) {
     const raw = record[key];
     if (raw === undefined || raw === null) continue;
     const label = shortLabel(raw);
-    if (label) affect.feeling = label;
-    break;
+    if (label) { affect.feeling = label; break; }
   }
   return Object.keys(affect).length ? affect : undefined;
 }
@@ -382,6 +385,10 @@ export async function analyzeApiInsights(
     prompt: `CHAT_BATCH_JSON:\n${JSON.stringify({ messages: promptMessages, targetIds: promptTargetIds })}`,
     jsonMode: false,
     stream: true,
+    // Every other generation path bounds the provider call; this one did not, so a gateway
+    // that never answers outlived the host's own 180s budget and left an orphan request
+    // (plus its stream buffer) behind while the caller retried.
+    timeoutMs: 150_000,
     ...(onTextDelta ? { onTextDelta: stream.push } : {}),
   });
   const parseStarted = performance.now();
