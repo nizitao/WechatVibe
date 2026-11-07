@@ -17,8 +17,14 @@ const testFiles = readdirSync(path.join(root, "tests"))
   .sort()
   .map(name => path.join("tests", name));
 
+// Several files spawn a child (`analysis_server.ts` via tsx) and wait five seconds for its
+// ready line. At the default concurrency (one file per core) those children starve and the
+// run stalls or reports `API worker did not start`; four at a time keeps them inside budget.
+// Override with TEST_FILE_CONCURRENCY when a machine can take more.
+const testConcurrency = process.env.TEST_FILE_CONCURRENCY || "4";
 const suites = [
-  { name: "node", command: process.execPath, args: ["--import", "tsx", "--test", ...testFiles] },
+  { name: "node", command: process.execPath,
+    args: ["--import", "tsx", "--test", `--test-concurrency=${testConcurrency}`, ...testFiles] },
   { name: "scripts", command: process.execPath, args: ["scripts/run-node-script-tests.cjs"] },
   // run-python-tests.py re-executes itself into the project interpreter when the
   // current one is not it, so this stays a plain `python` launch like the npm script.
