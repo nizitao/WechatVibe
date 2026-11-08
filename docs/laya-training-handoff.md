@@ -32,42 +32,54 @@
 
 | 项 | 值 |
 | --- | --- |
-| 日期 | 2026-11-01 |
+| 日期 | 2026-11-01 建档，2026-11-07 v2 迭代 |
 | 分支 | `perf/optimize-tokenizer` |
 | Node | v22.22.2（`package.json` 声明 24.11.1） |
 | Python | `.venv/Scripts/python.exe`，3.13.0 |
 | 模型 | `.local/models/laya`，`laya-multilingual-onnx@d9d003d` |
-| 生产关系分类 | 训练模型 `relationship-nb-v1-f2ff39cc`（字符 n-gram NB） |
+| 生产关系分类 | 训练模型 `relationship-linear-v2-35a840fb`（边界字符 1–4 gram 逻辑回归） |
+| 本地 MBTI 证据 | 训练模型 `mbti-linear-v1-6d442382`（4 轴 3 分类线性头），test 45/48 = 93.75% |
 | Laya 关系提示词 | `relationship-v2`，现仅作回退/对照，不再决定本地关系分 |
 | 评分头 | `affinity-v2`，半衰期 8 条，无权重下限 |
 | GPU 后端 | WebGPU 可用；DirectML 不可用；CUDA 不可用 |
-| 测试集结果 | **95/100，95.0%**（每类 20 条；validation 94.8%） |
+| 测试集结果 | **272/300，90.67%**；r8 最终盲测 45/50 = 90%；validation 128/136 = 94.12% |
 | 旧 Laya 提示词结果 | 分类 55%、MAE 11.60（仅为历史对照，不再是当前准确率） |
 
-本轮相关文件**尚未提交**：
+当前工作区有 **22 个未解决合并冲突文件**（`git status` 中 `UU/AA`），来自其他并行工作。
+完整 Node/Python 套件受这些冲突阻塞，与本模型无关。**不要整体回滚，也不要替别人解冲突。**
+
+v2 迭代涉及的文件：
 
 ```text
-M  electron/laya/options.ts
-M  electron/laya/scoring.ts
-M  bridge/profile_state.py
-M  bridge/result_store.py
-?? docs/laya-scoring-calibration.md
-?? scripts/laya-score-train.ts
-?? tests/fixtures/laya-affinity-corpus.jsonl
+A  electron/laya/relationship-linear.ts
+A  electron/laya/relationship-linear-model.json
+A  scripts/train-relationship-linear.py
+A  tests/relationship-linear.test.ts tests/mbti-linear.test.ts tests/laya-mbti-corpus.test.ts
+A  docs/laya-relationship-linear.md
+A  docs/laya-relationship-linear-report.json
+M  electron/analysis.ts、scripts/stage-real-client.py、package.json
+M  tests/fixtures/laya-affinity-corpus.jsonl（931 条）
+M  tests/laya-affinity-corpus.test.ts、scripts/laya-score-train.ts
+D  electron/laya/relationship-nb.* 等 6 个 v1 文件（已退役）
 ```
-
-另外还有 `batch_state.py`、`api_portrait_statistics.py`、`backend_contracts.py`、
-`message_results.py`、`analysis.ts`、`api-portrait-classifier.ts` 等本轮修改，提交前逐文件看 diff。
 
 ## 3. 文件地图
 
 | 文件 | 作用 |
 | --- | --- |
-| `tests/fixtures/laya-affinity-corpus.jsonl` | 551 条手写训练语料，唯一数据源 |
-| `scripts/train-relationship-nb.py` | **当前主模型**：关系分类训练/校准/90% 闸门 |
-| `electron/laya/relationship-nb.ts` | 生产推理 |
-| `electron/laya/relationship-nb-model.json` | 训练产物（117 KB） |
-| `docs/laya-relationship-nb.md` | 模型卡与结果 |
+| `tests/fixtures/laya-affinity-corpus.jsonl` | 931 条手写关系语料，唯一数据源 |
+| `tests/fixtures/laya-mbti-corpus.jsonl` | 480 行 MBTI 证据语料（4 轴 × 3 类，360 唯一文本） |
+| `scripts/train-mbti-linear.py` | MBTI 四头线性模型训练/校准/90% 闸门 |
+| `electron/laya/mbti-linear.ts` | MBTI 生产推理（本地分析链） |
+| `electron/laya/mbti-linear-model.json` | 训练产物 |
+| `electron/laya/thread-tuning.ts` | CPU 线程数启发式、真实形状校准与结果缓存 |
+| `scripts/benchmark-laya-threads.ts` | 一次性线程校准入口（`npm run benchmark:laya-threads`） |
+| `docs/laya-mbti-linear.md` / `docs/laya-mbti-linear-report.json` | 模型卡与分层指标 |
+| `scripts/train-relationship-linear.py` | **当前主模型**：关系分类训练/校准/90% 闸门 |
+| `electron/laya/relationship-linear.ts` | 生产推理 |
+| `electron/laya/relationship-linear-model.json` | 训练产物（447 KB） |
+| `docs/laya-relationship-linear.md` | 模型卡与结果 |
+| `docs/laya-relationship-linear-report.json` | 分层指标与模型溯源 |
 | `scripts/laya-score-train.ts` | Laya 提示词/半衰期历史评测脚本 |
 | `scripts/laya-score-eval.ts` | 手工分布场景和半衰期搜索，离线回归 |
 | `electron/laya/options.ts` | 关系题面、版本号、权重 |
@@ -101,15 +113,17 @@ JSONL，每行：
 | `target` | 0~100 的整数，代表该类期望分数 |
 | `split` | `train / validation / test` |
 
-当前切分：总计 355/96/100，共 551 条。
+当前切分：总计 495/136/300，共 931 条。
 
-- rejecting：56/16/20
-- distant：60/16/20
-- neutral：58/16/20
-- warm：92/24/20
-- romantic：89/24/20
+- rejecting：84/24/60
+- distant：88/24/60
+- neutral：86/24/60
+- warm：120/32/60
+- romantic：117/32/60
 
-test 已从 20 扩到 100，仍严格 20/类。当前训练、验证和 test 指标均已按 551 条重跑。
+test 严格 60/类，由五批组成：原始 4、r4 +16、r6 +20、r7 +10（开发测试）、
+r8 +10（最终盲测）。r8 从未参与选型，与其余语料最高相似度 0.700、平均 0.541。
+当前训练、验证和 test 指标均已按 931 条重跑。
 
 评分区间：
 
@@ -123,20 +137,21 @@ romantic  80..100
 
 **铁律**：test 只用于最终报告。不要看 test 错误后再改提示词、加规则或选参数。新增语料时优先加入
 train/validation，保留原 test 不动；如果必须换 test，先记录旧版本结果并说明原因。
+本轮曾按 r7 盲测暴露的缺口补语料，r7 因此降级为开发测试，最终闸门另起全新 r8 批次。
 
 ## 5. 训练流程
 
 ```text
-当前主训练（关系分类）：
-  train 355 + validation 96
-    → 5 折 CV 选 alpha
-    → 训练字符 1-3 gram NB
-    → validation 拟合温度
-    → test 100 只做最终 90% 闸门
+当前主训练（scripts/train-relationship-linear.py）：
+  train 495 + validation 136
+    → 5 折 CV 选 L2
+    → 边界字符 1-4 gram + 多项逻辑回归 + 幅度剪枝
+    → validation 只拟合温度（不改 argmax）
+    → test 300 一次性 90% 闸门，分层报告 r8 盲测
 
 历史 Laya 评测（不再是生产关系来源）：
   train/validation 选提示词与半衰期
-  test 100 仅最终对照
+  test 300 仅最终对照
 ```
 
 提示词候选在 `scripts/laya-score-train.ts` 的 `VARIANTS`：
@@ -156,14 +171,15 @@ train/validation，保留原 test 不动；如果必须换 test，先记录旧�
 
 **注意**：原 280 条语料下这 10 个场景已无法区分半衰期（6 条候选同为 80%，分辨率就是 10%），
 脚本会打印同分提示并给出 16；生产值 8 的依据是离线噪声场景（`scripts/laya-score-eval.ts`）。
-扩到 551 条后不要沿用这一结论；当前生产关系分类已改为 NB，Laya 半衰期只影响聚合。
+扩到 931 条后不要沿用这一结论；当前生产关系分类已改为 v2 线性模型，Laya 半衰期只影响聚合。
 场景列不能跨语料版本比较，详见 `docs/laya-scoring-calibration.md` §6.4。
 
 ## 6. 当前结果
 
 > 下面训练/验证数字是 **280 条语料池**的历史结果，用于说明上一轮为什么回退 v3；
 > 以下 Laya 提示词数字是 280 条语料池的历史记录，保留用于解释为什么停止调提示词。
-> 当前本地关系分类是 NB，test 95%，见 `docs/laya-relationship-nb.md`。
+> 当前生产关系分类是 v2 线性模型：test 300 条 90.67%，r8 盲测 90%，
+> 见 `docs/laya-relationship-linear.md`。本节表格全部是历史对照。
 
 280 条池上，v3 在 train/validation 全胜、但 test 被否决：
 
@@ -202,7 +218,7 @@ train/validation，保留原 test 不动；如果必须换 test，先记录旧�
    于是写成 `relationship-v3` 并跑 test——结果分类准确率 **55%→45%**、MAE **11.60→12.00**，
    4 条 neutral 全错（`你到了给我发个位置。`→romantic 81）。**已回退到 v2**。
 
-NB 上线前，生产提示词是 `relationship-v2`，旧 test 指标为 70% / 55% / 11.60 / 70%。
+v1 NB 上线前，生产提示词是 `relationship-v2`，旧 test 指标为 70% / 55% / 11.60 / 70%。
 细节见 `docs/laya-scoring-calibration.md` §6.1~§6.3。
 
 顺带发现 `head_max_len=256` 是指令和选项的**共享**预算，超长会被静默截断（§6.2），改提示词前先跑
@@ -236,6 +252,25 @@ state' = r^m · state + (1 - r^m) · tail + new_block
 
 ```bash
 cd /d/project/weixinAnalyzer
+
+# 当前主模型：重训 / 只验闸门 / 契约测试
+npm run train:relationship-linear
+python scripts/train-relationship-linear.py --check
+node --import tsx --test tests/relationship-linear.test.ts tests/laya-affinity-corpus.test.ts
+
+# Laya CPU 线程一次性校准（首次约 1 分钟，之后启动命中缓存）
+npm run benchmark:laya-threads
+
+# MBTI 证据分类器
+npm run train:mbti-linear
+python scripts/train-mbti-linear.py --check
+node --import tsx --test tests/mbti-linear.test.ts tests/laya-mbti-corpus.test.ts
+
+# Laya 评分头训练：默认 auto（Windows WebGPU 优先），test 只在 winner/baseline 上解码
+npm run train:laya-score
+node --import tsx scripts/laya-score-train.ts --train-only       # 完全不解码 test
+node --import tsx scripts/laya-score-train.ts --provider=cpu     # 显式 CPU，约慢 3~4 倍
+LAYA_TRAIN_LIMIT=3 node --import tsx scripts/laya-score-train.ts --train-only  # 冒烟
 
 # 语料校验，不需要模型
 node --import tsx scripts/laya-score-train.ts --dry-run
@@ -279,7 +314,8 @@ npm run train:laya-score -- --provider=webgpu
 
 ```bash
 npm run typecheck
-node --import tsx --test tests/laya-affinity-corpus.test.ts tests/laya-scoring-calibration.test.ts
+node --import tsx --test tests/laya-affinity-corpus.test.ts tests/laya-scoring-calibration.test.ts \
+  tests/relationship-linear.test.ts
 .venv/Scripts/python.exe bridge/test_affinity_calibration.py
 .venv/Scripts/python.exe bridge/test_incremental_reconciliation.py
 .venv/Scripts/python.exe bridge/test_api_portrait_statistics.py
@@ -290,11 +326,14 @@ npm run test:python
 
 最近一次结果：
 
-- 完整 Node：**837/837**；
-- 完整 Python：**82 个文件全部通过**，约 397 秒；
-- `test_real_backend.py`：**81/81**；
-- NB 模型：validation 94.8%，test 95.0%；
-- 真实模型冒烟：`affinity: 100`（NB 判为 romantic，属高置信样本）。
+- `npm run typecheck`：通过；
+- 定向模型 + 语料测试：4/4；
+- 发布清单 10/10、脚本入口 3/3；
+- v2 关系模型：validation 128/136 = 94.12%，test 272/300 = 90.67%，r8 盲测 45/50 = 90%；
+- MBTI 模型：validation 41/48 = 85.42%，test 45/48 = 93.75%，`--check` 闸门通过；
+- 真实模型冒烟：`affinity: 69`；
+- 完整 Node：**882/882 全通过**（合并冲突已由其他会话解决）；
+- 发布清单 10/10、脚本入口 3/3；MBTI 契约 + 语料 + 旧证据测试 7/7。
 
 ## 10. 下一阶段建议
 
@@ -320,26 +359,45 @@ npm run test:python
 
 ### P1.5：先把评估集做大，再谈提示词
 
-**已完成（2026-11-01）**：共四轮。
+**已完成（2026-11-01 ~ 11-07）**：共六轮，语料 100 → 931 条，test 20 → 300 条。
 
-- 第一轮到 280：每类 20 → 56，test 4/类冻结；提示词候选在 train/val 上全胜、test 上被否决。
-- 第二轮到 380：每类 56 → 76，只加 train/validation，test 不变。
-- 第三轮到 460：只加 warm 40 + romantic 40，训练集正面类占 232/460。
-- 第四轮到 551：test 加 80 条到 100 条（20/类），另按验证错误补 11 条 train。
+- 前三轮到 460：扩 train/validation，正面增补，test 4/类冻结。
+- 第四轮到 551：test 扩到 100 条（20/类），另补 11 条 train。
+- 第五轮到 731：新增 r6 独立 test 100 条，线性模型在 200 条 test 上 91%。
+- 第六轮到 931：r7 盲测暴露含蓄表达缺口（80%）→ 补 100 条弱关键词 train/val →
+  新增 r8 最终盲测 50 条，整体 300 条 test 90.67%。
 
-**提示词这条路基本到头**，但评估集扩大后训练出了一个真正的轻量分类器，test 95%。
+**提示词这条路基本到头**；评估集扩大后已训练出真正的轻量分类器，且经历了
+"盲测失败 → 按训练/验证补语料 → 新盲测通过"的完整闭环。
 
-### P2：小型关系分类器（已完成 v1）
+### P2：小型关系分类器（已完成 v1 → v2）
 
-`relationship-nb` 已落地：
+`relationship-linear` 已落地，v1 NB 相关 6 个文件已删除：
 
-1. 字符 1–3 gram + Multinomial NB；
-2. train 5 折 CV 选 alpha，validation 拟合温度，test 100 条闸门；
+1. 边界字符 1–4 gram + 多项逻辑回归 + 幅度剪枝；
+2. train 5 折 CV 选 L2，validation 拟合温度，test 300 条闸门；
 3. 导出 JSON 模型，TypeScript 直接推理，已接入本地分析链；
-4. test 95%，详见 `docs/laya-relationship-nb.md`。
+4. test 90.67%，r8 盲测 90%，详见 `docs/laya-relationship-linear.md`。
 
 下一步若有人工标注千级真实数据，可升级为多语言编码器（bge-m3 / MiniLM / XLM-R）：
 冻结 embedding 跑 logistic regression 验证信号，再解冻微调、导出 ONNX。仍不是微调现有 Laya。
+
+### P2.5：MBTI 证据分类器（已完成 v1，2026-11-07）
+
+`mbti-linear` 已落地，本地分析链改用训练模型：
+
+1. 4 轴 × 3 类线性头，共享边界字符 1–4 gram 词表；
+2. 480 行手写语料（360 唯一文本），train/val/test 隔离，最高相似度 0.667；
+3. CV 按**轴内文本**分折选 L2，validation 拟合温度，test 一次性闸门；
+4. test 45/48 = 93.75%，详见 `docs/laya-mbti-linear.md`。
+
+迭代教训：首版 16 条/类只有 85.4%；27 组超参搜索全部停在 85.4%，瓶颈是语料不是模型；
+扩到 32 条/类后 95.8%，但查出 4 对 ≥0.75 近重复，剔除后 93.75%。
+**加语料后必须重跑近重复检查**，否则指标虚高。
+
+API 画像链仍走 4 个固定题面（与关系模型架构一致）；本地链仍把 4 个
+`PERSONALITY_QUESTIONS` 送进 Laya 但结果被覆盖，属可删除的纯浪费，
+移除需同步改 58 题 API 契约与 13 题分块断言。
 
 ### P3：CUDA
 
@@ -354,14 +412,18 @@ npm run test:python
 
 ## 11. 容易踩的坑
 
-1. **不要把 test 当验证集反复调参。** 当前 95% 是 100 条独立 test 的一次性闸门；重复按 test 调参会污染它。
+1. **不要把 test 当验证集反复调参。** 当前 90.67% 是 300 条 test 的一次性闸门；r7 曾因参与迭代而降级为开发测试，最终盲测必须另起新批次。
 2. **不要整体回滚工作区。** 这里有其他会话的修改，先看 `git diff` 再改。
 3. **不要同时改 TS 和 Python 的其中一边。** 界面读取 Python 持久化结果。
 4. **不要忘了升缓存版本。** 提示词改了就升 `RELATIONSHIP_QUESTION_VERSION`；聚合改了升
    `AFFINITY_CALIBRATION.version`。
 5. **旧 API 统计不能增量接新公式。** 版本 2 会隔离旧统计；不要强行复用。
 6. **DirectML 不是可用路径。** probe 会在 `Reshape` 节点失败；不要把它写成生产 GPU 方案。
-7. **语料是合成数据。** 指标只证明评分头和提示词在这套边界样本上更好，不代表真实聊天准确率。
+7. **语料是合成数据。** 指标只证明模型在这套边界样本上更好，不代表真实聊天准确率；含蓄拒绝/表白仍是主要误差（rejecting 召回 80%）。
+8. **不要靠加大 batch 提速。** `LAYA_TRAIN_BATCH_SIZE` 默认 1 是刻意的：2026-11-07 实测
+   16 行/批在 WebGPU 只快 1.3~1.9× 却改了 3/120 分类答案（最大概率差 0.103），CPU 上反而慢
+   0.76×。差异来自 padding 到 batch 内最长序列，不是切片 bug（`rows=1` 的 `predictBatch`
+   与逐条完全一致）。正式报告一律用默认逐行口径，见 `docs/laya-scoring-calibration.md` §7.1。
 8. **不要在未授权时读取或保存用户聊天原文。**
 9. 仓库使用 CRLF；`git diff --check` 请加 `-c core.whitespace=cr-at-eol`，否则会把所有新增行误报为尾随空白。
 10. **提示词超长会被静默截断。** `head_max_len=256` 是"指令 + 选项"的共享预算，`buildPrefix` 从尾部
@@ -380,3 +442,16 @@ npm run test:python
 - TS 与 Python 在相同输入上给出相同 `affinity`；
 - 修改后完整 Node/Python 测试通过；
 - 汇报时区分“合成语料指标”和“真实会话准确率”。
+
+## 附：Laya CPU 线程自适应（2026-11-07）
+
+- `electron/laya/runner.ts` 的 `intraOpNumThreads` 不再恒为 4。`adaptiveThreads: true`
+  时 CPU 路径先读 `.local/real-client-runtime/laya-threads.json` 缓存，未命中则按
+  `min(8, cores-1)` 启发式取值，**启动零开销**；WebGPU 忽略该参数，不参与调优。
+- 显式校准：`npm run benchmark:laya-threads`，用 8×256 的真实形状测 4 与启发式线程数，
+  结果写缓存供后续所有启动使用。也可设 `LAYA_BENCHMARK_THREADS=1` 在下次建 session 时同步测。
+- **实测教训**：单次微基准噪声大于真实差异。三次同机校准给出 8 快 14% / 4 快 42% /
+  8 快 9.5%；缩小形状省时间但会把结论反过来。故 `pickFastest` 把 <20% 差距判为平手并
+  选较少线程，三次一致收敛到 4。改校准形状或判定规则必须升 `TUNING_VERSION` 让旧缓存失效。
+- 验证：完整 Node **887/887**、发布清单 10/10、脚本入口 3/3、真实模型冒烟 `affinity: 69`；
+  校准后启动命中缓存约 3 s。

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>WechatVibe</title>
   <link rel="icon" type="image/png" href="/assets/wechatvibe-icon.png">
+  <link rel="stylesheet" href="theme-accent.css">
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="advisor.css">
 </head>
@@ -429,6 +430,19 @@
               <option value="dark">深色模式 (默认)</option>
               <option value="light">浅色模式 (白天)</option>
             </select>
+          </div>
+          <div class="settings-row settings-row-wide">
+            <span id="themeAccentLabel">主题色</span>
+            <div class="theme-accent-picker" id="themeAccentPicker" role="radiogroup" aria-labelledby="themeAccentLabel">
+              <button type="button" class="theme-accent-swatch" data-accent="green" role="radio" aria-checked="true" title="绿色（默认）" aria-label="绿色（默认）"></button>
+              <button type="button" class="theme-accent-swatch" data-accent="blue" role="radio" aria-checked="false" title="蓝色" aria-label="蓝色"></button>
+              <button type="button" class="theme-accent-swatch" data-accent="yellow" role="radio" aria-checked="false" title="黄色" aria-label="黄色"></button>
+              <button type="button" class="theme-accent-swatch" data-accent="red" role="radio" aria-checked="false" title="红色" aria-label="红色"></button>
+              <button type="button" class="settings-action-btn" id="btnResetThemeAccent" title="恢复默认绿色">恢复默认</button>
+            </div>
+          </div>
+          <div class="settings-row settings-status-row">
+            <span id="themeAccentHint" class="model-source-status" role="status" aria-live="polite">按钮、链接和高亮会即时使用所选颜色，刷新后保留。</span>
           </div>
           <div class="settings-row">
             <span>界面缩放比例</span>

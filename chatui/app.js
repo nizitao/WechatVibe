@@ -62,7 +62,10 @@ function getVisibleUnreadCount(session) {
   return 0;
 }
 const defaults = { theme: "dark", zoom: "1.0", intent: true, backgroundAnalyze: false,
-  guidanceWindowMinutes: 1440 };
+  guidanceWindowMinutes: 1440, accent: "green" };
+// 主题色预设：与 style.css 的 body[data-theme-accent="…"] 一一对应。
+const THEME_ACCENTS = ["green", "blue", "yellow", "red"];
+const THEME_ACCENT_LABELS = { green: "绿色", blue: "蓝色", yellow: "黄色", red: "红色" };
 const CURRENT_LABEL_SCHEMA = "generic-v12";
 const GENERIC_INTENT_LABELS = Object.freeze({
   small_talk: "闲聊", share_news: "分享", ask_question: "提问", seek_help: "求助", deny: "否认",
@@ -100,6 +103,8 @@ catch { settingsState.settings = { ...defaults }; }
 delete settingsState.settings.historyLimit;
 if (!["dark", "light"].includes(settingsState.settings.theme)) settingsState.settings.theme = "dark";
 if (!["0.9", "1.0", "1.1", "1.25", "1.5"].includes(settingsState.settings.zoom)) settingsState.settings.zoom = "1.0";
+// 主题色只接受预设值；旧版本设置里没有这个键，或手改坏了，一律回落到默认绿色。
+if (!THEME_ACCENTS.includes(settingsState.settings.accent)) settingsState.settings.accent = "green";
 if (typeof settingsState.settings.intent !== "boolean") settingsState.settings.intent = true;
 // Analysing every added chat in the background is opt-in: it can keep the CPU or GPU busy
 // for hours on a large account.
@@ -671,12 +676,15 @@ function renderSessions() {
       const avatarWrap = element("div", "session-avatar-wrap");
       const info = element("div", "session-info");
       const top = element("div", "session-top");
-      // The analyse button sits left of the name. It is a separate control from the card:
-      // clicking it asks for this conversation to be analysed, it never switches chats.
-      const analyseBtn = element("button", "session-analyze-btn");
+      // The analyse toggle sits on the avatar itself: a transparent button stretched over the
+      // avatar frame. It stays a separate control from the card — clicking it asks for this
+      // conversation to be analysed, it never switches chats. The state is drawn on the wrap
+      // (`requested`), so the 2px ring cannot shift the row or be clipped by the avatar.
+      const analyseBtn = element("button", "session-avatar-action");
       analyseBtn.type = "button";
       analyseBtn.dataset.action = "analyze";
-      top.append(analyseBtn, element("span", "session-name"), element("span", "session-time"));
+      avatarWrap.appendChild(analyseBtn);
+      top.append(element("span", "session-name"), element("span", "session-time"));
       analyseBtn.addEventListener("click", (event) => {
         event.stopPropagation();
         void requestConversationAnalysis(session.username);
@@ -723,15 +731,18 @@ function renderSessions() {
     if (timeNode.textContent !== displayTime) timeNode.textContent = displayTime;
     const preview = item.querySelector(".session-preview");
     if (preview.textContent !== (session.preview || "")) preview.textContent = session.preview || "";
-    const analyseBtn = item.querySelector(".session-analyze-btn");
-    if (analyseBtn) {
+    const analyseBtn = item.querySelector(".session-avatar-action");
+    if (analyseBtn && avatarWrap) {
       const requested = chatState.requestedConversations.has(session.username);
-      const label = requested ? "已加入分析" : "开始分析";
-      if (analyseBtn.textContent !== label) analyseBtn.textContent = label;
-      analyseBtn.classList.toggle("requested", requested);
+      // The ring lives on the wrap, not on the button: the button is only the hit area, so the
+      // state has to be drawn where the avatar box is, for every avatar size and theme.
+      avatarWrap.classList.toggle("requested", requested);
       // Property assignment, not setAttribute: the ARIA reflection sets the attribute in a
       // real DOM, and the plain-object DOM used by the UI tests accepts it as well.
       analyseBtn.ariaPressed = String(requested);
+      // There is no visible text any more, so the accessible name has to carry both what the
+      // control does and which state it is in.
+      analyseBtn.ariaLabel = requested ? "已加入分析" : "开始分析";
       analyseBtn.title = requested
         ? "已加入后台分析名单；点击可移出名单"
         : "点击分析该联系人，并加入后台分析名单";
@@ -1003,6 +1014,24 @@ async function requestConversationAnalysis(username) {
     // the API/local branch is picked the same way the header button picks it.
     if (username === chatState.currentUser) retryAnalysis();
     else await analyzeConversations([username]);
+  } else {
+    // Dropping the contact from the list only suppresses *future* passes. The job that is
+    // already queued, or decoding a chunk right now, would keep walking that conversation's
+    // history, so the backend has to be told to stop it explicitly.
+    try {
+      await api("/api/analysis-cancel", { method: "POST", body: JSON.stringify({
+        account, user: username,
+      }) });
+    } catch (error) {
+      // A 404 here means the running bridge predates this endpoint, so the old process keeps
+      // analysing. Surface it instead of leaving the user with a control that does nothing.
+      console.warn("analysis cancel failed", error);
+      if (current()) setStripStatus(`取消分析失败：${error.message}`);
+      return false;
+    }
+    // The whole-account progress panel reads the backend's own job table, so refresh it: a
+    // stopped conversation has to leave "正在分析" now, not at the next timed sweep.
+    void loadAnalysisOverview();
   }
   return true;
 }
@@ -1025,13 +1054,13 @@ function currentIntentRequestScope() {
 /**
  * Refuse an analysis that was never requested and explain why.
  * Returns true when the caller must stop. Kept next to the request list so the wording
- * matches the button that grants it.
+ * matches the avatar toggle that grants it.
  */
 function analysisBlockedWithoutRequest(user) {
-  // Two ways in: the sidebar granted the conversation with 「开始分析」, or the header button
-  // just asked for this loaded window. The header scope never joins the cumulative list.
+  // Two ways in: the sidebar granted the conversation by clicking its avatar, or the header
+  // button just asked for this loaded window. The header scope never joins the cumulative list.
   if (conversationAnalysisRequested(user) || currentIntentRequestScope()) return false;
-  const hint = "尚未加入会话分析 · 请在左侧点击「开始分析」";
+  const hint = "尚未加入会话分析 · 请在左侧点击会话头像";
   setStripStatus(hint);
   text("analysisStatus", hint);
   if (byId("btnRetryAnalysis") && !byId("btnRetryAnalysis").hidden) {
@@ -1050,14 +1079,17 @@ async function analyzeConversations(list, background = false) {
     if (account !== chatState.currentAccount || sourceId !== settingsState.modelSourceSnapshot.sourceId ||
         background && !settingsState.settings.backgroundAnalyze) return;
     try {
+      // The sweep marks its passes so switching background analysis off can stop exactly
+      // those, instead of also killing a pass the user started by clicking an avatar.
+      const marker = background ? { background: true } : {};
       if (usingApiInsights()) {
         await api("/api/model-insights", { method: "POST", body: JSON.stringify({
-          account, user: id, limit: API_SWEEP_WINDOW,
+          account, user: id, limit: API_SWEEP_WINDOW, ...marker,
         }) });
       } else if (canAnalyzeLocal()) {
         // No per-conversation read here: the backend already knows the running job.
         await api("/api/analyze", { method: "POST", body: JSON.stringify({
-          account, user: id, mode: "incremental",
+          account, user: id, mode: "incremental", ...marker,
         }) });
       }
     } catch { /* one broken conversation must not stop the rest */ }
@@ -1086,6 +1118,25 @@ async function backgroundAnalyzeAll() {
     settingsState.sweepBusy = false;
     void loadAnalysisOverview();
   }
+}
+/**
+ * Switching background analysis off has to reach the passes the last sweep already handed over.
+ * Those jobs are already queued in the backend, so clearing the switch alone leaves the model
+ * busy on every requested conversation until they all finish anyway.
+ */
+async function stopBackgroundAnalysis() {
+  const account = chatState.currentAccount;
+  if (!account) return;
+  try {
+    await api("/api/analysis-cancel", { method: "POST", body: JSON.stringify({
+      account, allBackground: true,
+    }) });
+  } catch (error) {
+    console.warn("background analysis stop failed", error);
+    setStripStatus(`停止后台分析失败：${error.message}`);
+    return;
+  }
+  void loadAnalysisOverview();
 }
 // Messages per conversation an API sweep asks for. The bridge picks the ones that still
 // lack labels, so this is a ceiling rather than a batch size.
@@ -1776,8 +1827,9 @@ function settleInlineIntentPending(job) {
   let changed = false;
   const visible = new Map(chatState.messages.map(message => [String(message.id), message]));
   const recentFinished = !!labelState.inlineIntentJobId && job?.recent?.id === labelState.inlineIntentJobId &&
-    ["done", "error"].includes(job.recent.status);
-  const jobFailed = job?.status === "error" && !["queued", "running"].includes(job.recent?.status);
+    ["done", "error", "cancelled"].includes(job.recent.status);
+  const jobFailed = (job?.status === "error" || job?.status === "cancelled") &&
+    !["queued", "running"].includes(job.recent?.status);
   const terminal = recentFinished || jobFailed;
   for (const [id, pendingText] of labelState.inlineIntentPending) {
     const state = fineMessageResult(labelState.results[id]) ? labelState.results[id].state : null;
@@ -2252,8 +2304,23 @@ function setIntentActionState(state) {
 function renderRecentAction(job) {
   if (!usingLocalFine()) return;
   if (!settingsState.settings.intent || labelState.intentActionState === "idle" || labelState.manualRecentAwaitingPost) return;
-  if (!job?.recent || labelState.manualRecentJobId && job.recent.id !== labelState.manualRecentJobId) return;
+  if (!job?.recent) {
+    // A cancelled job is dropped from the backend, so the next read is a plain idle job with
+    // no `recent` to report a terminal status. Without this the header button would stay on
+    // "识别中…" with aria-busy set until the conversation is reopened.
+    if (job?.status === "idle" && ["queued", "running"].includes(labelState.intentActionState)) {
+      setIntentActionState("idle");
+    }
+    return;
+  }
+  if (labelState.manualRecentJobId && job.recent.id !== labelState.manualRecentJobId) return;
   const status = job.recent.status;
+  if (status === "cancelled") {
+    // A cancelled pass is not a failure, but leaving the header button on "识别中…" would
+    // keep aria-busy set and swallow the next click until the conversation is reopened.
+    setIntentActionState("idle");
+    return;
+  }
   if (["queued", "running", "done", "error"].includes(status)) setIntentActionState(status);
 }
 function submitManualRecent(userInitiated = false) {
@@ -4084,12 +4151,24 @@ async function loadProfile(member = "", retry = false) {
     }
   } finally { if (token === portraitState.profileGeneration) portraitState.profilePending = false; }
 }
+// 主题色只改 body 上的 data-theme-accent：CSS 变量随之重算，无需刷新或重建 DOM。
+function applyThemeAccent() {
+  const accent = THEME_ACCENTS.includes(settingsState.settings.accent) ? settingsState.settings.accent : "green";
+  document.body.dataset.themeAccent = accent;
+  for (const swatch of document.querySelectorAll(".theme-accent-swatch"))
+    swatch.setAttribute("aria-checked", String(swatch.dataset.accent === accent));
+  const reset = byId("btnResetThemeAccent");
+  if (reset) reset.disabled = accent === "green";
+  text("themeAccentHint", `当前：${THEME_ACCENT_LABELS[accent]}。按钮、链接和高亮即时换色，刷新后保留。`);
+}
 function applySettings() {
   document.body.classList.toggle("theme-light", settingsState.settings.theme === "light");
   document.documentElement.classList.toggle("desktop-host", !!window.desktopHost);
   document.documentElement.style.zoom = settingsState.settings.zoom;
   document.documentElement.style.setProperty("--zoom-inverse", String(1 / Number(settingsState.settings.zoom)));
   window.desktopHost?.setTheme?.(settingsState.settings.theme);
+  // 主题色的应用函数在别处定义；设置被单独测量时（测试桩）允许缺席。
+  if (typeof applyThemeAccent === "function") applyThemeAccent();
   byId("selectThemeMode").value = settingsState.settings.theme;
   byId("selectZoomLevel").value = settingsState.settings.zoom;
   if (typeof applyGuidanceWindow === "function") applyGuidanceWindow();
@@ -6692,6 +6771,19 @@ for (const id of ["inputGuidanceWindow", "selectGuidanceWindowUnit"])
     applyGuidanceWindow();
   });
 for (const [id, key] of [["selectThemeMode", "theme"], ["selectZoomLevel", "zoom"]]) byId(id).addEventListener("change", event => { settingsState.settings[key] = event.target.value; save(); applySettings(); });
+// 主题色：点色点即换色并落盘；"恢复默认"回到绿色。
+byId("themeAccentPicker").addEventListener("click", event => {
+  const swatch = event.target.closest(".theme-accent-swatch");
+  if (!swatch || !THEME_ACCENTS.includes(swatch.dataset.accent)) return;
+  settingsState.settings.accent = swatch.dataset.accent;
+  save();
+  applySettings();
+});
+byId("btnResetThemeAccent").addEventListener("click", () => {
+  settingsState.settings.accent = "green";
+  save();
+  applySettings();
+});
 byId("selectRuntimeProvider").addEventListener("change", event => { void changeRuntime(event.target.value); });
 byId("selectModelSource").addEventListener("change", () => {
   settingsState.modelSourceDraftDirty = true;
@@ -7042,6 +7134,7 @@ byId("btnToggleBackgroundAnalyze").addEventListener("click", () => {
   save();
   applySettings();
   if (settingsState.settings.backgroundAnalyze) void backgroundAnalyzeAll();
+  else void stopBackgroundAnalysis();
 });
 byId("btnApiWorkerMinus").addEventListener("click", () => { void changeApiWorkerSettings(-1); });
 byId("btnApiWorkerPlus").addEventListener("click", () => { void changeApiWorkerSettings(1); });

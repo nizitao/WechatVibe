@@ -676,6 +676,8 @@ class Backend:
             raise RuntimeError("analysis-reset-in-progress")
         if job is not None and job.get("_cancelledByModelSource"):
             raise ModelSourceUnavailable("model source changed")
+        if job is not None and job.get("_cancelledByRequest"):
+            raise RuntimeError("analysis-cancelled")
         if len(scope) == 2 and task_scope is not None and task_scope[:2] == scope:
             scope = task_scope
         if len(scope) > 2:
@@ -1573,7 +1575,8 @@ class Backend:
         return {"account": account, "sourceId": source_id, "results": results, "job": job,
                 "suspended": suspended}
 
-    def start_model_insights(self, requested_account, user, limit, target_ids=None, around=None, *, force=False):
+    def start_model_insights(self, requested_account, user, limit, target_ids=None, around=None, *,
+                             force=False, background=False):
         started = time.perf_counter()
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid API insight limit")
@@ -1629,6 +1632,8 @@ class Backend:
             job_key = (account, user, source_id, uuid.uuid4().hex) if force else (account, user, source_id)
             current = self.api_jobs.get(job_key)
             if current and current["status"] in ("queued", "running"):
+                if not background:
+                    current.pop("_background", None)
                 return {"account": account, "sourceId": source_id, "job": dict(current)}
             pending = list(selected) if force else [item for item in selected if item["id"] not in known]
             wire = []
@@ -1659,6 +1664,8 @@ class Backend:
                    "targetIds": [item["id"] for item in pending],
                    "partialText": "",
                    "timings": {"firstBodyMs": None}}
+            if background:
+                job["_background"] = True
             self.api_jobs[job_key] = job
             for item in pending:
                 self.api_insight_writers[(*job_key[:3], item["id"])] = job["id"]
@@ -1696,7 +1703,11 @@ class Backend:
                 self._run_model_insights_bound(job_key, job, scope, store, config, api_key, wire, pending)
         except Exception:
             with self.api_lock:
-                job.update(status="error", error="model-source-changed")
+                if job.get("_cancelledByRequest"):
+                    job.update(status="cancelled")
+                    job.pop("error", None)
+                else:
+                    job.update(status="error", error="model-source-changed")
         finally:
             with self.api_lock:
                 for message in pending:
@@ -1709,6 +1720,10 @@ class Backend:
         self._assert_api_job(self.api_jobs, job_key, job, scope, store)
 
     def _assert_api_job(self, jobs, job_key, job, scope, store):
+        # Checked before the map lookup: cancellation removes the job from `jobs`, and the
+        # caller must not report that as a model-source change.
+        if job.get("_cancelledByRequest"):
+            raise RuntimeError("analysis-cancelled")
         with self.api_lock:
             if (self.closing or self.active_model_source_mode != "api" or
                     self.active_model_source_id != job_key[2] or
@@ -2402,6 +2417,122 @@ class Backend:
             store.resume_cache(account, source_id)
         self._assert_scope((account, workdir))
         return {"resumed": True, "account": account, "sourceId": source_id}
+
+    def cancel_conversation_analysis(self, requested_account, user):
+        """Stop the running or queued analysis of one conversation.
+
+        Taking a contact off the sidebar request list only suppresses *future* passes: the
+        job that is already queued, or decoding a chunk right now, keeps walking that
+        conversation's history. This marks the live job object and drops it from every queue,
+        so the worker stops at its next scope check instead of finishing the whole history.
+        Saved results stay valid; a later request resumes from the stored cursor.
+        """
+        _session_id(user)
+        account, workdir, store = self._scoped_identity()
+        if account != requested_account:
+            raise AccountChangedError()
+        cancelled = self._cancel_local_analysis(account, user)
+        cancelled += self._cancel_api_analysis(account, user)
+        self._assert_scope((account, workdir))
+        return {"account": account, "user": user, "cancelled": cancelled}
+
+    def cancel_background_analysis(self, requested_account):
+        """Stop only the passes the background sweep started.
+
+        Switching background analysis off used to suppress the *next* sweep only: every job
+        the previous sweep had already handed to the backend kept decoding its conversation,
+        so the switch looked like it did nothing. Passes started by clicking an avatar stay
+        untouched here — those are explicit requests, not background work.
+        """
+        account, workdir, _store = self._scoped_identity()
+        if account != requested_account:
+            raise AccountChangedError()
+        with self.jobs_lock:
+            users = {key[2] for key, job in self.jobs.items()
+                     if key[0] == account and job.get("_background")}
+            users |= {key[2] for key, state in self.recent_windows.items()
+                      if key[0] == account and (state.get("job") or {}).get("_background")}
+        with self.api_lock:
+            users |= {key[1] for key, job in self.api_jobs.items()
+                      if key[0] == account and job.get("_background")}
+        cancelled = 0
+        for user in sorted(users):
+            cancelled += self._cancel_local_analysis(account, user)
+            cancelled += self._cancel_api_analysis(account, user)
+        self._assert_scope((account, workdir))
+        return {"account": account, "cancelled": cancelled, "conversations": len(users)}
+
+    def _cancel_local_analysis(self, account, user):
+        """Mark every local job of this conversation and empty its scheduling state."""
+        cancelled = 0
+        seen = set()
+
+        def stop(job):
+            nonlocal cancelled
+            if not isinstance(job, dict) or id(job) in seen:
+                return
+            seen.add(id(job))
+            job["_cancelledByRequest"] = True
+            if job.get("status") in ("queued", "running"):
+                cancelled += 1
+            job["status"] = "cancelled"
+            job.pop("error", None)
+            if isinstance(job.get("recent"), dict):
+                # The header button reads `recent.status`; leaving it on "queued" keeps the
+                # control busy even though nothing is going to run for this conversation.
+                job["recent"] = {**job["recent"], "status": "cancelled"}
+
+        with self.jobs_lock:
+            # Every version, not only the current model's: a version bump while a job waits
+            # in the queue must not leave an orphaned turn that still decodes this contact.
+            for key in [item for item in self.jobs if item[0] == account and item[2] == user]:
+                stop(self.jobs.pop(key))
+            for key in [item for item in self.recent_windows
+                        if item[0] == account and item[2] == user]:
+                stop(self.recent_windows.pop(key).get("job"))
+            for key in [item for item in self.priority_recent
+                        if item[0] == account and item[2] == user]:
+                del self.priority_recent[key]
+            self.incremental_recheck = {item for item in self.incremental_recheck
+                                        if not (item[0] == account and item[2] == user)}
+            if self.batch_engine is not None:
+                for key in [item for item in self.batch_engine.member_jobs
+                            if item[0] == account and item[2] == user]:
+                    stop(self.batch_engine.member_jobs.pop(key))
+        # Iterators are dropped, never closed: another worker may be inside one right now, and
+        # closing a running generator raises in that thread instead of stopping it. The mark
+        # above is what makes its next `next()` return. Done outside `jobs_lock` because
+        # `_run_one_bound` touches these maps from both sides and dict mutation while another
+        # thread iterates would raise there.
+        for key in [item for item in self.history_iterators
+                    if item[0] == account and item[2] == user]:
+            self.history_iterators.pop(key, None)
+            self.history_iterator_modes.pop(key, None)
+        for key in [item for item in self.quoted_backfill_iterators
+                    if item[0] == account and item[2] == user]:
+            self.quoted_backfill_iterators.pop(key, None)
+        # `message_jobs` is deliberately untouched: those are single-message re-runs the user
+        # asked for by hand ("recompute this message"), not part of the conversation pass.
+        return cancelled
+
+    def _cancel_api_analysis(self, account, user):
+        """Same for the API path, whose jobs run on their own thread, not the worker pool."""
+        cancelled = 0
+        with self.api_lock:
+            for key in [item for item in self.api_jobs
+                        if item[0] == account and item[1] == user]:
+                job = self.api_jobs.pop(key, None)
+                if job is None:
+                    continue
+                if job.get("status") in ("queued", "running"):
+                    cancelled += 1
+                job["_cancelledByRequest"] = True
+                job["status"] = "cancelled"
+                job.pop("error", None)
+            for key in [item for item in self.api_insight_writers
+                        if item[0] == account and item[1] == user]:
+                self.api_insight_writers.pop(key, None)
+        return cancelled
 
     def analysis_scope_clear(self, requested_account, user, source_id, kind, member=None):
         _session_id(user)
@@ -3282,7 +3413,8 @@ class Backend:
         job["recent"] = {"id": uuid.uuid4().hex, "status": "queued", "total": 0, "processed": 0}
         self._enqueue((key, "recent-window", limit, store, job, scope), interactive=True)
 
-    def start(self, user, mode, limit, expected_account=None, target_ids=None, message_id=None):
+    def start(self, user, mode, limit, expected_account=None, target_ids=None, message_id=None,
+              background=False):
         account, workdir, store = self._scoped_identity()
         scope = self._capture_scope(account, workdir)
         with self.api_lock:
@@ -3327,6 +3459,10 @@ class Backend:
             self._check_analysis_reset(account, user, LOCAL_SOURCE_ID)
             current = self.jobs.get(key)
             if current and (current["status"] in ("queued", "running") or key in self.recent_windows):
+                if not background:
+                    # A hand request always outranks the sweep: switching background analysis
+                    # off must never stop a pass the user asked for by clicking the avatar.
+                    current.pop("_background", None)
                 if mode == "recent":
                     self._schedule_recent(key, store, current, scope, limit, selected=selected)
                     return dict(current)
@@ -3353,6 +3489,10 @@ class Backend:
                 return dict(current)
             job = {"id": uuid.uuid4().hex, "status": "queued", "total": 0, "processed": 0,
                    "requested": {"mode": mode, "limit": limit}}
+            if background:
+                # The background sweep and a hand click both end up here. Only the sweep's
+                # passes may be stopped by switching the background switch off.
+                job["_background"] = True
             self.jobs[key] = job
             if mode == "recent":
                 self._schedule_recent(key, store, job, scope, limit, standalone=True, selected=selected)
@@ -4145,6 +4285,13 @@ class Backend:
                 background_pending = state is not None and state["job"] is job and state["background_pending"]
                 if state is not None and state["job"] is job:
                     del self.recent_windows[key]
+                if job.get("_cancelledByRequest"):
+                    # A cancel must not read as a failure: the UI would offer a retry that
+                    # the user explicitly just refused.
+                    job["recent"] = {**job.get("recent", {}), "status": "cancelled"}
+                    job["status"] = "cancelled"
+                    job.pop("error", None)
+                    return
                 job["recent"] = {**job.get("recent", {}), "status": "error", "error": str(exc)[:200]}
                 if job["requested"]["mode"] == "recent" or background_pending:
                     job["status"] = "error"
@@ -4338,22 +4485,34 @@ class Backend:
                 entered = True
                 return self._run_one_bound(task)
         except Exception as exc:
-            cancelled = task[4].get("_cancelledByReset") or task[4].get("_cancelledByModelSource")
-            task[4].update(status="cancelled" if cancelled else "error",
-                           error=str(exc)[:200])
-            if isinstance(task[4].get("recent"), dict):
-                task[4]["recent"].update(status=task[4]["status"], error=str(exc)[:200])
+            job = task[4]
+            cancelled = (job.get("_cancelledByReset") or job.get("_cancelledByModelSource")
+                         or job.get("_cancelledByRequest"))
+            if cancelled:
+                job.update(status="cancelled")
+                job.pop("error", None)
+            else:
+                job.update(status="error", error=str(exc)[:200])
+            if isinstance(job.get("recent"), dict):
+                job["recent"].update(status=job["status"], error=job.get("error", ""))
             if task[1] != "message":
-                self.history_iterators.pop(task[0], None)
-                self.history_iterator_modes.pop(task[0], None)
-                self.recent_windows.pop(task[0], None)
+                # Only the job that still owns this conversation may drop its state. After a
+                # cancel the user can restart immediately, and the stale turn must not delete
+                # the fresh job's iterator or recent-window state on its way out.
+                with self.jobs_lock:
+                    recent = self.recent_windows.get(task[0]) or {}
+                if (self.jobs.get(task[0]) is job) or (recent.get("job") is job):
+                    self.history_iterators.pop(task[0], None)
+                    self.history_iterator_modes.pop(task[0], None)
+                    self.recent_windows.pop(task[0], None)
             if not entered:
                 self.tasks.task_done()
 
     def _run_one_bound(self, task):
         key, mode, limit, store, job, source_scope = task
         try:
-            if job.get("_cancelledByReset") or job.get("_cancelledByModelSource"):
+            if (job.get("_cancelledByReset") or job.get("_cancelledByModelSource") or
+                    job.get("_cancelledByRequest")):
                 job["status"] = "cancelled"
                 return
             if store.cache_suspended(key[0], LOCAL_SOURCE_ID):
@@ -4453,8 +4612,12 @@ class Backend:
                 raise RuntimeError("unsupported analysis mode")
             except Exception as exc:
                 with self.jobs_lock:
-                    job["status"] = "error"
-                    job["error"] = str(exc)[:200]
+                    if job.get("_cancelledByRequest"):
+                        job["status"] = "cancelled"
+                        job.pop("error", None)
+                    else:
+                        job["status"] = "error"
+                        job["error"] = str(exc)[:200]
             finally:
                 if terminal:
                     self.history_iterators.pop(key, None)

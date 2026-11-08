@@ -234,6 +234,15 @@
 
 落点：`analysis.ts` 新增 `analyzeMessageTargetsBatched()`（复用 `agent.prepare` + `collate`，只是把多条消息的 `PreparedItem` 拼进同一个 batch），`analysis_server.ts` 增加对应命令；`_run_fine_recent` 改为一次提交整个窗口的 targetIds。数值上必须与逐条一致（同一 padding/attention mask 语义）。若首版只想改 Python 侧，可先让 `_analyze_item` 一次传多个 targetId（减少 IPC 往返），再逐步下移到 runner。
 
+> **2026-11-07 实测更正**：跨消息行合并的收益被高估，且不是数值无损的。在同一 ONNX 图上用
+> 120 条 `relationship` 单题做 A/B：WebGPU 逐行 15.7~20.0 s（120 次 run），16 行/批
+> 10.4~11.9 s（8 次 run），仅 1.3~1.9×，且 **3/120 分类结果变化、最大概率差 0.103**；
+> CPU 逐行 54.0 s、批量 71.5 s（0.76×，更慢）。`predictBatch(rows=1)` 与逐条 `predict`
+> 完全一致（0 mismatch / 0 delta），说明差异来自 batch 内 padding 到最长序列，不是切片实现。
+> 因此 §1.1 #4a 的窗口合并路径如用于正式标签，必须重做真实模型的数值等价性复核，
+> 不要直接引用本节「4~7×」的推算。训练脚本已默认保持逐行，详见
+> `docs/laya-scoring-calibration.md` §7.1。
+
 **b. 窗口级批量提交（低风险，先做）**
 新增 `ResultStore.save_fine_many(rows)`：单事务、`executemany`，并把 `keyword_counts` 与 summary 增量计算移到事务内一次完成；`_analyze_item` 增加 `defer` 分支（已有该模式，见 `_analyze_item` 的 `defer=True` 用法）暂存结果，窗口结束统一提交。提交移出 `_scope_commit` 的 fsync 临界区。
 

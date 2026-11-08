@@ -14,6 +14,13 @@
   function stored(key, fallback) {
     try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
   }
+  // 沙箱窗口不加载主界面样式表，主题色要随握手/变更消息一起带过去。
+  const FRAME_ACCENTS = ["green", "blue", "yellow", "red"];
+  function frameThemePayload() {
+    const accent = document.body.dataset.themeAccent;
+    return { theme: document.body.classList.contains("theme-light") ? "light" : "dark",
+      accent: FRAME_ACCENTS.includes(accent) ? accent : "green" };
+  }
   function storedObject(key) {
     try { const value = JSON.parse(stored(key, "{}")); return object(value) ? value : {}; } catch { return {}; }
   }
@@ -665,7 +672,7 @@ function validThread(value, scope) {
         thread: projection.thread, run: projection.run,
         draft: this.getDraft(this.currentAccount, this.currentUser, this.activeAgentId), catalogReady: this.catalogReady,
         engineState: this.catalogReady ? this.catalog.engine.state : "unknown",
-        theme: document.body.classList.contains("theme-light") ? "light" : "dark" });
+        ...frameThemePayload() });
     },
     validFrameRequest(data) {
       if (!object(data) || data.envelope !== "advisor" || data.nonce !== this.handshakeNonce || !object(data.payload)) return false;
@@ -897,9 +904,8 @@ function validThread(value, scope) {
     init() {
       this.setupFrameCommunication(); void this.loadCatalog();
       if (typeof window.MutationObserver === "function") {
-        new window.MutationObserver(() => this.postToFrame("ADVISOR_THEME", {
-          theme: document.body.classList.contains("theme-light") ? "light" : "dark"
-        })).observe(document.body, { attributes: true, attributeFilter: ["class"] });
+        new window.MutationObserver(() => this.postToFrame("ADVISOR_THEME", frameThemePayload()))
+          .observe(document.body, { attributes: true, attributeFilter: ["class", "data-theme-accent"] });
       }
     }
   };

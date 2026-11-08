@@ -364,6 +364,7 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                                  "/api/runtime", "/api/local-model", "/api/model-insights",
                                  "/api/model-portrait", "/api/model-guidance", "/api/analysis-cache/clear",
                                  "/api/analysis-scope/clear",
+                                 "/api/analysis-cancel",
                                  "/api/analysis-target/forget",
                                  "/api/analysis-cache/resume", "/api/conversation-selection",
                                  "/api/data-root", "/api/data-root/clear",
@@ -475,8 +476,12 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                     # batches.
                     limit = integer(request.get("limit"), 500, 500)
                     around = request.get("around")
+                    background = request.get("background", False)
+                    if type(background) is not bool:
+                        raise ValueError("invalid background flag")
                     return self.send(202, backend.start_model_insights(
-                        account, user, limit, request.get("targetIds"), around))
+                        account, user, limit, request.get("targetIds"), around,
+                        background=background))
                 if endpoint == "/api/model-portrait":
                     if set(request) not in ({"account", "user"},
                                             {"account", "user", "member"},
@@ -516,6 +521,16 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                             return self.send(409, {"error": "guidance-busy",
                                                    "message": "上一条建议仍在生成，请完成后再试"})
                         raise
+                if endpoint == "/api/analysis-cancel":
+                    # Removing a contact from the sidebar request list has to stop the job
+                    # that is already queued, otherwise the background pass keeps decoding it.
+                    if set(request) == {"account", "allBackground"} and request["allBackground"] is True:
+                        return self.send(200, backend.cancel_background_analysis(
+                            user_value(request["account"])))
+                    if set(request) != {"account", "user"}:
+                        raise ValueError("invalid analysis cancel request")
+                    return self.send(200, backend.cancel_conversation_analysis(
+                        user_value(request["account"]), user_value(request["user"])))
                 if endpoint == "/api/analysis-scope/clear":
                     if (set(request) not in ({"account", "user", "sourceId", "kind"},
                                             {"account", "user", "sourceId", "kind", "member"}) or
@@ -593,8 +608,12 @@ def make_handler(backend, accounts=None, control_token=None, profile=None):
                          "all" if mode == "history" and request.get("limit") == "all" else
                          integer(request.get("limit"), 80 if mode == "recent" else 500,
                                  80 if mode == "recent" else 5000))
+                background = request.get("background", False)
+                if type(background) is not bool:
+                    raise ValueError("invalid background flag")
                 return self.send(202, {"job": backend.start(user, mode, limit,
                                                              expected_account=expected_account,
+                                                             background=background,
                                                              **({"target_ids": target_ids} if target_ids is not None else {}))})
             except ForecastRequestError as exc:
                 return self.send(exc.status, {**echo, "error": exc.code, "message": exc.message})

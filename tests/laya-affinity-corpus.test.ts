@@ -8,14 +8,15 @@ import { it } from "node:test";
 const LABELS = ["rejecting", "distant", "neutral", "warm", "romantic"] as const;
 const SPLITS = ["train", "validation", "test"] as const;
 /**
- * Per-label row count in each split. The test split is frozen and still balanced 4/class.
- * Warm/romantic are deliberately enriched on train/validation (positive-only supplement);
- * metrics in the trainer therefore use macro averages instead of raw accuracy.
+ * Per-label row count in each split. Warm/romantic are deliberately enriched on
+ * train/validation (positive-only supplement); metrics in the trainer therefore use
+ * macro averages instead of raw accuracy. Test is strictly 60/class across five
+ * batches: the original 4, r4 (+16), r6 (+20), r7 (+10 dev) and r8 (+10 blind).
  */
 const EXPECTED: Record<(typeof SPLITS)[number], Record<(typeof LABELS)[number], number>> = {
-  train: { rejecting: 56, distant: 60, neutral: 58, warm: 92, romantic: 89 },
-  validation: { rejecting: 16, distant: 16, neutral: 16, warm: 24, romantic: 24 },
-  test: { rejecting: 20, distant: 20, neutral: 20, warm: 20, romantic: 20 },
+  train: { rejecting: 84, distant: 88, neutral: 86, warm: 120, romantic: 117 },
+  validation: { rejecting: 24, distant: 24, neutral: 24, warm: 32, romantic: 32 },
+  test: { rejecting: 60, distant: 60, neutral: 60, warm: 60, romantic: 60 },
 };
 
 it("keeps the hand-authored affinity corpus balanced and leak-free", () => {
@@ -23,7 +24,7 @@ it("keeps the hand-authored affinity corpus balanced and leak-free", () => {
   const rows = readFileSync(file, "utf8").trim().split(/\r?\n/u).map((line) => JSON.parse(line) as {
     id: string; text: string; label: string; target: number; split: string;
   });
-  assert.equal(rows.length, 551);
+  assert.equal(rows.length, 931);
   assert.equal(new Set(rows.map((row) => row.id)).size, rows.length);
   assert.equal(new Set(rows.map((row) => row.text)).size, rows.length);
   for (const split of SPLITS) {

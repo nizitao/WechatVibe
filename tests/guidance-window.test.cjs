@@ -10,7 +10,7 @@ const html = read("chatui", "index.html");
 const css = read("chatui", "style.css");
 
 it("defaults to one day and clamps anything outside one hour .. thirty days", () => {
-  assert.match(app, /guidanceWindowMinutes: 1440 \};/);
+  assert.match(app, /guidanceWindowMinutes: 1440, accent: "green" \};/);
   assert.match(app, /const GUIDANCE_WINDOW_MIN = 60, GUIDANCE_WINDOW_MAX = 43200;/);
   assert.match(app, /return Math\.min\(GUIDANCE_WINDOW_MAX, Math\.max\(GUIDANCE_WINDOW_MIN, value\)\);/);
 });

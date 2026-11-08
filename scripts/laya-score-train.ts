@@ -4,15 +4,25 @@
 //   npx tsx scripts/laya-score-train.ts
 //   npx tsx scripts/laya-score-train.ts --json
 //   npx tsx scripts/laya-score-train.ts --provider=webgpu  # GPU (Windows WebGPU)
+//   npx tsx scripts/laya-score-train.ts --provider=cpu     # explicit CPU fallback
 //
 // CUDA note: onnxruntime-node's Windows package ships CPU, DirectML and WebGPU only. CUDA is
 // Linux-only in that binding, and the upstream graph fails DirectML's Reshape probe. WebGPU is
 // therefore the supported GPU path here; `cuda` is rejected with an explicit message.
+// The default provider is `auto` (WebGPU first on Windows, CPU fallback). Set
+// LAYA_TRAIN_PROVIDER or pass --provider=cpu to force the CPU path.
 //
 // The ONNX classifier is fixed (no training-side repository). "Training" here means selecting
 // the relationship prompt and the recency half-life against a labelled corpus, then confirming
 // the selected pair on validation and a held-out test split. The test split is never used to pick
-// a candidate; it is evaluated once for the winner.
+// a candidate; it is decoded only for the winner and the v1 baseline.
+//
+// All rows go through LayaAgent.predictBatch, but the default batch size is 1 so every row is
+// decoded in exactly the same shaped forward pass as the legacy per-row script. Measured on
+// 120 rows (see docs/laya-scoring-calibration.md §7): packing 16 rows is only 1.3-1.9x faster
+// on WebGPU and CHANGES 3/120 answers (max probability delta 0.103); on CPU it is 0.76x, i.e.
+// slower. LAYA_TRAIN_BATCH_SIZE > 1 is therefore a preview-only knob, never a report default.
+// The real, lossless speedups are the GPU provider and decoding fewer rows (stage A/B split).
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
@@ -27,7 +37,7 @@ import { toInternal } from "../electron/laya/questions";
 import { NodeOnnxRunner } from "../electron/laya/runner";
 import { messageScore, relationshipConfidence, type MessageSignal } from "../electron/laya/scoring";
 import { LayaTokenizer } from "../electron/laya/tokenizer";
-import type { AgentConfig, Question } from "../electron/laya/types";
+import type { AgentConfig, Batch, Question } from "../electron/laya/types";
 
 type Label = "rejecting" | "distant" | "neutral" | "warm" | "romantic";
 type Split = "train" | "validation" | "test";
@@ -175,9 +185,9 @@ const CORPUS_PATH = path.resolve("tests/fixtures/laya-affinity-corpus.jsonl");
  * Warm/romantic are intentionally positive-enriched on train/validation; test stays 4/class.
  */
 const EXPECTED: Record<Split, Record<Label, number>> = {
-  train: { rejecting: 56, distant: 60, neutral: 58, warm: 92, romantic: 89 },
-  validation: { rejecting: 16, distant: 16, neutral: 16, warm: 24, romantic: 24 },
-  test: { rejecting: 20, distant: 20, neutral: 20, warm: 20, romantic: 20 },
+  train: { rejecting: 84, distant: 88, neutral: 86, warm: 120, romantic: 117 },
+  validation: { rejecting: 24, distant: 24, neutral: 24, warm: 32, romantic: 32 },
+  test: { rejecting: 60, distant: 60, neutral: 60, warm: 60, romantic: 60 },
 };
 
 function loadCorpus(): CorpusCase[] {
@@ -362,6 +372,8 @@ async function main(): Promise<void> {
   const dryRun = process.argv.includes("--dry-run");
   const json = process.argv.includes("--json");
   const budget = process.argv.includes("--budget");
+  // `--json` must stay machine-readable: status lines go to stderr instead of stdout.
+  const status = (message: string) => { if (json) console.error(message); else console.log(message); };
   const startedAt = Date.now();
   const corpus = loadCorpus();
   const counts = splitCounts(corpus);
@@ -411,7 +423,7 @@ async function main(): Promise<void> {
   }
 
   const providerArg = process.argv.find((arg) => arg.startsWith("--provider="))?.split("=")[1]
-    ?? process.env.LAYA_TRAIN_PROVIDER ?? "cpu";
+    ?? process.env.LAYA_TRAIN_PROVIDER ?? "auto";
   if (providerArg === "cuda")
     throw new Error("onnxruntime-node 的 Windows 包不支持 CUDA；请用 --provider=webgpu（Linux 可换 CUDA 版运行时）");
   if (!["cpu", "gpu", "webgpu", "auto"].includes(providerArg))
@@ -424,54 +436,128 @@ async function main(): Promise<void> {
     JSON.parse(readFileSync(path.join(dir, "tokenizer/tokenizer_config.json"), "utf8")),
   );
   const runner = await NodeOnnxRunner.create(path.join(dir, "model.onnx"), { executionProvider: provider });
-  console.log(`推理后端：${runner.provider}${provider === "webgpu" ? " (GPU)" : ""}`);
-  const agent = new LayaAgent({ config, tokenizer, runner, batchSize: 8 });
+  status(`推理后端：${runner.provider}${provider === "webgpu" ? " (GPU)" : ""}`);
+
+  // Keep one row per forward pass by default. A larger batch pads every row to the longest
+  // sequence in the chunk; on this graph that changes WebGPU logits and is slower on CPU.
+  // Preview runs may raise it, but the resulting numbers are not comparable to reports.
+  const batchSize = Number(process.env.LAYA_TRAIN_BATCH_SIZE ?? 1);
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 128)
+    throw new Error(`invalid LAYA_TRAIN_BATCH_SIZE: ${batchSize}`);
+  if (batchSize > 1)
+    status(`警告：LAYA_TRAIN_BATCH_SIZE=${batchSize} 会改变 padding 与 WebGPU 数值，` +
+      `仅用于预览，不可与逐行报告比较`);
+  let runCount = 0;
+  let decodedRows = 0;
+  const countingRunner = {
+    run: (batch: Batch) => { runCount += 1; return runner.run(batch); },
+  };
+  const agent = new LayaAgent({ config, tokenizer, runner: countingRunner, batchSize });
+
+  const trainOnly = process.argv.includes("--train-only");
+  const selectArg = process.argv.find((arg) => arg.startsWith("--select="))?.split("=")[1];
+  // Smoke-test knob: take at most N rows PER LABEL from each split. Stratified so the scenario
+  // tables still have every label. Never use the resulting metrics as a report.
+  const limitPerLabel = Number(process.env.LAYA_TRAIN_LIMIT ?? 0);
+  if (!Number.isInteger(limitPerLabel) || limitPerLabel < 0)
+    throw new Error(`invalid LAYA_TRAIN_LIMIT: ${limitPerLabel}`);
+  const stratify = (rows: CorpusCase[]): CorpusCase[] => {
+    if (!limitPerLabel) return rows;
+    const byKey = new Map<string, CorpusCase[]>();
+    for (const row of rows) {
+      const key = `${row.split}:${row.label}`;
+      byKey.set(key, [...(byKey.get(key) ?? []), row]);
+    }
+    const splits = [...new Set(rows.map((row) => row.split))];
+    return splits.flatMap((split) => (Object.keys(BANDS) as Label[])
+      .flatMap((label) => (byKey.get(`${split}:${label}`) ?? []).slice(0, limitPerLabel)));
+  };
+  if (limitPerLabel)
+    status(`警告：LAYA_TRAIN_LIMIT=${limitPerLabel}（每类），仅用于冒烟，指标不可用于正式报告`);
+  const selectionRows = stratify(corpus.filter((row) => row.split !== "test"));
+  const heldOutRows = stratify(corpus.filter((row) => row.split === "test"));
+  const questionFor = (variant: Variant): Question => ({
+    type: "choice",
+    instructions: variant.instructions,
+    criteria: variant.criteria ? { ...variant.criteria } : [...RELATIONSHIP_OPTIONS],
+  });
+  const stateFor = (item: CorpusCase) =>
+    buildTargetState([{ id: item.id, side: "other", text: item.text, time: 1 }], 0);
+
+  /** Decode a whole split in packed forward passes instead of one `session.run` per row. */
+  const observe = async (variant: Variant, rows: CorpusCase[]): Promise<Observed[]> => {
+    if (!rows.length) return [];
+    const question = questionFor(variant);
+    const predictions = await agent.predictBatch(rows.map((item) =>
+      ({ state: stateFor(item), questions: { relationship: question } })));
+    if (predictions.length !== rows.length)
+      throw new Error(`batched inference returned ${predictions.length} / ${rows.length} rows`);
+    decodedRows += rows.length;
+    return rows.map((item, index) => {
+      const answer = predictions[index]!.answers.relationship;
+      if (answer?.type !== "choice") throw new Error(`missing relationship answer: ${item.id}`);
+      return { ...item, distribution: answer.probabilities,
+        score: Math.round(50 + 50 * messageScore({ relationship: answer.probabilities })),
+        choice: answer.choice };
+    });
+  };
+
   const observations = new Map<string, Observed[]>();
+  interface Report { variant: string; train: ReturnType<typeof metrics>; validation: ReturnType<typeof metrics> }
+  let reports: Report[] = [];
+  let winnerVariant = "";
   try {
+    // Stage A: every candidate prompt sees train + validation only. The test split is not
+    // decoded here, so it can never influence prompt or half-life selection.
     for (const variant of VARIANTS) {
-      const question: Question = {
-        type: "choice",
-        instructions: variant.instructions,
-        criteria: variant.criteria ? { ...variant.criteria } : [...RELATIONSHIP_OPTIONS],
-      };
+      const budget = headBudget(tokenizer, questionFor(variant), config.head_max_len);
       // A truncated variant is not comparable: part of its instruction never reached the model.
-      const budget = headBudget(tokenizer, question, config.head_max_len);
       if (budget.truncated)
-        console.log(`警告：${variant.name} 的指令被截断（${budget.head} → ${budget.kept} token），结果不可比`);
-      const rows: Observed[] = [];
-      for (const item of corpus) {
-        const state = buildTargetState([{ id: item.id, side: "other", text: item.text, time: 1 }], 0);
-        const prediction = await agent.predict(state, { relationship: question });
-        const answer = prediction.answers.relationship;
-        if (answer?.type !== "choice") throw new Error(`missing relationship answer: ${item.id}`);
-        rows.push({ ...item, distribution: answer.probabilities,
-          score: Math.round(50 + 50 * messageScore({ relationship: answer.probabilities })),
-          choice: answer.choice });
+        status(`警告：${variant.name} 的指令被截断（${budget.head} → ${budget.kept} token），结果不可比`);
+      observations.set(variant.name, await observe(variant, selectionRows));
+    }
+    reports = VARIANTS.map((variant) => {
+      const rows = observations.get(variant.name)!;
+      return { variant: variant.name,
+        train: metrics(rows.filter((row) => row.split === "train")),
+        validation: metrics(rows.filter((row) => row.split === "validation")) };
+    });
+    // Prompt selection uses train only. Macro averages keep the positive-only enrichment from
+    // turning the warm/romantic majority into a selection advantage.
+    reports.sort((a, b) => b.train.macroBandHit - a.train.macroBandHit ||
+      b.train.macroRecall - a.train.macroRecall || a.train.mae - b.train.mae);
+    // `--select=` only reports test for a configuration that was already chosen by
+    // train/validation (e.g. the prompt that ships). It must not pick between candidates.
+    winnerVariant = selectArg
+      ? reports.find((row) => row.variant === selectArg)?.variant
+        ?? (() => { throw new Error(`unknown --select: ${selectArg}`); })()
+      : reports[0]!.variant;
+
+    // Stage B: decode test once, only for the selected prompt and the v1 baseline.
+    if (!trainOnly) {
+      for (const name of new Set([winnerVariant, "baseline"])) {
+        const variant = VARIANTS.find((item) => item.name === name)!;
+        const rows = observations.get(name) ?? [];
+        observations.set(name, rows.concat(await observe(variant, heldOutRows)));
       }
-      observations.set(variant.name, rows);
     }
   } finally {
     tokenizer.clearEncodeCache();
     await runner.dispose();
   }
 
-  const reports = VARIANTS.map((variant) => {
-    const rows = observations.get(variant.name)!;
-    return { variant: variant.name,
-      train: metrics(rows.filter((row) => row.split === "train")),
-      validation: metrics(rows.filter((row) => row.split === "validation")) };
-  });
-  // Prompt selection uses train only. Macro averages keep the positive-only enrichment from
-  // turning the warm/romantic majority into a selection advantage.
-  reports.sort((a, b) => b.train.macroBandHit - a.train.macroBandHit ||
-    b.train.macroRecall - a.train.macroRecall || a.train.mae - b.train.mae);
-  // `--select=` only reports test for a configuration that was already chosen by train/validation
-  // (e.g. the prompt that ships). It must never be used to pick between candidates.
-  const selectArg = process.argv.find((arg) => arg.startsWith("--select="))?.split("=")[1];
-  const winner = selectArg
-    ? reports.find((row) => row.variant === selectArg)
-      ?? (() => { throw new Error(`unknown --select: ${selectArg}`); })()
-    : reports[0]!;
+  const winner = { variant: winnerVariant };
+  const inference = {
+    provider: runner.provider, batchSize, runCount, decodedRows,
+    selectionRows: selectionRows.length,
+    heldOutRows: trainOnly ? 0 : heldOutRows.length,
+    limitPerLabel,
+  };
+  const inferenceLine = `推理：${inference.decodedRows} 行 / ${inference.runCount} 次前向，` +
+    `batch ${inference.batchSize}，平均 ` +
+    `${(inference.decodedRows / Math.max(1, inference.runCount)).toFixed(1)} 行/次` +
+    (limitPerLabel ? `；LIMIT=${limitPerLabel}/类，指标不可用于正式报告` : "") +
+    (batchSize > 1 ? "；批量预览，数值不可比" : "");
   const winnerRows = observations.get(winner.variant)!;
   const baselineRows = observations.get("baseline")!;
   const trainParams = parameterTable(winnerRows.filter((row) => row.split === "train"));
@@ -484,11 +570,12 @@ async function main(): Promise<void> {
   const selected = validationParams[0]!;
   const trainSelected = trainParams.find((row) => row.halfLife === selected.halfLife)!;
 
-  // `--train-only` exists so prompt work can iterate without ever reading the test split.
-  if (process.argv.includes("--train-only")) {
+  // `--train-only` skips stage B entirely: test rows are never decoded.
+  if (trainOnly) {
     console.log(`\n训练语料：${counts.train} train / ${counts.validation} validation；` +
-      `后端 ${runner.provider}；` +
+      `后端 ${inference.provider}；` +
       `耗时 ${((Date.now() - startedAt) / 1000).toFixed(1)}s（--train-only，跳过 test 集）`);
+    console.log(inferenceLine);
     console.log("提示词            训练宏区间  训练宏召回  训练MAE   验证宏区间  验证宏召回");
     for (const row of reports) {
       console.log(`${row.variant.padEnd(18)}${fmt(row.train.macroBandHit).padEnd(12)}` +
@@ -522,6 +609,7 @@ async function main(): Promise<void> {
   const output = {
     provider: runner.provider,
     elapsedMs: Date.now() - startedAt,
+    inference,
     corpus: { total: corpus.length, ...splitCounts(corpus) },
     candidates: reports.map((row) => ({ variant: row.variant, train: row.train,
       validation: row.validation })),
@@ -541,6 +629,7 @@ async function main(): Promise<void> {
   console.log(`\n训练语料：${counts.train} train / ${counts.validation} validation / ` +
     `${counts.test} test；测试集不参与选择；` +
     `后端 ${output.provider}；耗时 ${(output.elapsedMs / 1000).toFixed(1)}s`);
+  console.log(inferenceLine);
   console.log("提示词            训练宏区间  训练宏召回  训练MAE   验证宏区间  验证宏召回");
   for (const row of reports) {
     console.log(`${row.variant.padEnd(18)}${fmt(row.train.macroBandHit).padEnd(12)}` +

@@ -29,68 +29,57 @@
 
 ## 2. 手写训练语料
 
-`tests/fixtures/laya-affinity-corpus.jsonl`，551 条中文消息，**全部手写合成，不含用户聊天**：
+`tests/fixtures/laya-affinity-corpus.jsonl`，931 条中文消息，**全部手写合成，不含用户聊天**：
 
 | 类别 | 每类条数 | 每类 train / validation / test |
 | --- | ---: | --- |
-| rejecting | 92 | 56 / 16 / 20 |
-| distant | 96 | 60 / 16 / 20 |
-| neutral | 94 | 58 / 16 / 20 |
-| warm | 136 | 92 / 24 / 20 |
-| romantic | 133 | 89 / 24 / 20 |
-| 合计 | 551 | 355 / 96 / 100 |
+| rejecting | 168 | 84 / 24 / 60 |
+| distant | 172 | 88 / 24 / 60 |
+| neutral | 170 | 86 / 24 / 60 |
+| warm | 212 | 120 / 32 / 60 |
+| romantic | 209 | 117 / 32 / 60 |
+| 合计 | 931 | 495 / 136 / 300 |
 
-2026-11-01 分四轮扩充：
+扩充历史（2026-11-01 ~ 11-07，共六轮）：
 
-1. 每类 20 → 56 条（总 100 → 280）；train 40、validation 12，test 4 冻结。
-2. 每类 56 → 76 条（总 280 → 380），追加 100 条；只加 train 80 + validation 20。
-3. 正面增补（总 380 → 460），追加 **warm 40 + romantic 40**；只加 train 64 + validation 16。
-4. 独立测试集与边界修正（总 460 → 551）：
-   - 新增 test 80 条（每类 16），旧 test 20 条保留，test 合计 100 条；
-   - 根据 validation 错误补 11 条 train：distant 4、neutral 2、warm 4、romantic 1。
+1. 每类 20 → 56 条（100 → 280）；只扩 train/validation，test 4/类冻结。
+2. 每类 56 → 76 条（280 → 380）；追加 100 条 train/validation。
+3. 正面增补（380 → 460）：warm 40 + romantic 40，**有意打破五类等量**，因此提示词选型改用 5 类宏平均。
+4. 独立测试集（460 → 551）：新增 test 80 条（每类 16），另按 validation 错误补 11 条 train；test 合计 100 条。
+5. v2 模型首轮（551 → 731）：新增 train 60、validation 20、独立 test 100（r6）；test 合计 200 条。
+6. 泛化修正与最终盲测（731 → 931）：r7 盲测 50 条暴露含蓄表达缺口后，
+   补 train 80 + validation 20 条弱关键词语料，再新增 r8 盲测 50 条；test 合计 300 条。
 
-第三轮**有意打破五类等量**：用户要求补充正面语料，因此不再同时堆叠拒绝/疏离样本。
-最终训练集正面类 181/355（51%）；test 仍严格 20/类，不受训练集偏斜影响。
-
-第三轮新增覆盖：
-
-| 类别 | 新增场景 |
-| --- | --- |
-| warm | 替班、协作收尾、资料整理、方案讲解、带路、照顾家中植物、聚餐安排、耐心倾听、工作把关 |
-| romantic | 周末与节日、分享好消息、共同旅行、见家人、挑房、养宠物、日常早安、余生陪伴、未来规划 |
-
-前两轮的新增覆盖：
-
-| 类别 | 新增场景 |
-| --- | --- |
-| rejecting | 退回礼物、搬家断联、拒绝复合、已有伴侣、托人传话、楼下蹲守、社交圈切割 |
-| distant | 退出聚会、降低聊天频率、只保留同事关系、需要独处、延迟回应、暂停周末安排 |
-| neutral | 取件码、燃气费、排班、消防演练、车次/登机口、体检报告、物业费、会议链接 |
+test 由五批组成：原始 4/类、r4 +16/类、r6 +20/类、r7 +10/类（开发测试）、
+r8 +10/类（最终盲测）。每一批内部严格类别均衡，因此普通准确率与宏平均等价。
 
 近重复校验：
 
-- 第三轮 80 条与原有 380 条：最高 `SequenceMatcher` 相似度 **0.727**，平均最近邻 **0.557**。
-- 第四轮 80 条 test 与其余 471 条：最高相似度 **0.727**，平均最近邻 **0.52**，
-  没有 ≥0.75 的近似对，新增文本 **52.7%** 的字符二元组此前未出现。
+- r6 与其余语料：最高 `SequenceMatcher` 0.667，平均最近邻 0.500。
+- r7 与其余语料：最高 0.696，平均 0.509。
+- r8 与其余语料：最高 0.700，平均 0.541，无 ≥0.75 的近似对。
+- 全库字符二元组 Jaccard 最高 **0.538**；测试闸门 < 0.65。
 
-文本全局唯一；测试加入字符二元组 Jaccard < 0.65 的近重复闸门，并为每类设置独立数量断言。
+文本全局唯一；`tests/laya-affinity-corpus.test.ts` 固定每类计数、唯一性、
+无 split 泄漏与近重复闸门。
 
-> 训练集正负样本不再等量，`scripts/laya-score-train.ts` 的提示词选择使用
-> **5 类宏平均区间命中 + 宏平均召回**，避免 warm/romantic 多数类带来虚假优势。
-> test 严格 20/类，普通准确率与宏平均等价。
+> 训练集中 warm/romantic 有意偏多，`scripts/laya-score-train.ts` 的提示词选择使用
+> **5 类宏平均区间命中 + 宏平均召回**，避免多数类带来虚假优势。
 
 每条包含 `id`、`text`、`label`、`target`（目标分）和 `split`。语料刻意覆盖容易混淆的边界：
-事务通知、简短确认、礼貌拒绝、减少互动的疏离、含蓄暧昧。它不是心理测量数据，只用于工程标定。
+事务通知、简短确认、礼貌拒绝、减少互动的疏离、含蓄暧昧与含蓄拒绝。
+它不是心理测量数据，只用于工程标定。
 
 > 注意：下文 §5-§6 的 Laya 提示词实测指标来自 280 条语料池，是历史对照。
-> 当前生产关系分类已换成训练好的 `relationship-nb`（551 条语料，test 95%），
-> 见 `docs/laya-relationship-nb.md`。不要再把 280 条时代的 55% 当作当前准确率。
+> 当前生产关系分类已换成训练好的 **`relationship-linear-v2-35a840fb`**（931 条语料，
+> 300 条 test 90.67%，50 条独立盲测 90%），见 `docs/laya-relationship-linear.md`。
+> 不要再把 280 条时代的 55% 或 v1 NB 的 95% 当作当前准确率。
 
 ## 3. 训练方法
 
 脚本：`scripts/laya-score-train.ts`
 
-1. 对每个候选提示词各跑 551 条真实 Laya 推理；
+1. 对每个候选提示词各跑 931 条真实 Laya 推理（历史评测脚本，当前生产关系分类已由 v2 模型接管）；
 2. 按 **train** 的区间命中、分类准确率、MAE 选提示词；
 3. 用选中的提示词构造 10 个对话场景，在 **validation** 上选半衰期；
 4. 用 **test 只评估最终的一组配置**，不做二次选择。
@@ -99,18 +88,27 @@
 提示词候选：旧英文 baseline、现网中文 production-v2、英文 guardrails、英文 precise，以及 §6.1 的
 边界候选。所有候选都保留在脚本中，便于以后用真实标注集重跑。
 
-训练命令：
+训练命令（2026-11-07 起默认 `auto`：Windows 先试 WebGPU，失败回 CPU）：
 
 ```bash
-# CPU
+# 默认：GPU 优先；test 只在选中提示词与 baseline 上解码
 npm run train:laya-score
 
-# Windows 显卡（WebGPU）
-node --import tsx scripts/laya-score-train.ts --provider=webgpu
+# 显式 CPU（历史口径，约慢 3~4 倍）
+node --import tsx scripts/laya-score-train.ts --provider=cpu
+
+# 只跑 train/validation，完全不解码 test（迭代提示词用）
+node --import tsx scripts/laya-score-train.ts --train-only
+
+# 冒烟：每个 split×类别最多取 N 条，指标不可用于正式报告
+LAYA_TRAIN_LIMIT=3 node --import tsx scripts/laya-score-train.ts --train-only
 
 # 只校验语料均衡，不加载模型
 node --import tsx scripts/laya-score-train.ts --dry-run
 ```
+
+`LAYA_TRAIN_PROVIDER` / `--provider` 选后端；`LAYA_TRAIN_BATCH_SIZE` 默认 **1**（逐行，
+数值与历史报告一致），调大仅作预览，见 §7.1。`--json` 的状态日志走 stderr，stdout 保持纯 JSON。
 
 ## 4. 实际改动
 
@@ -291,6 +289,41 @@ test 的区间/分类/MAE 可比。
   选中配置和最终测试指标一致（浮点输出有微小差异）。
 - 要使用真正的 CUDA，需要在 Linux 或 Python `onnxruntime-gpu` 环境重跑；当前 Node 训练入口
   会明确拒绝 `--provider=cuda`，不会静默退回 CPU。
+
+### 7.1 2026-11-07 训练脚本加速实测
+
+改造落在 `scripts/laya-score-train.ts`：
+
+1. 默认 provider `cpu` → `auto`（Windows WebGPU 优先，probe 失败回 CPU）。
+2. 推理拆成两阶段：阶段 A 所有候选只解码 train+validation；阶段 B 只对 winner 与 baseline
+   解码 test。`--train-only` 在阶段 A 后直接返回，不再「跑完全量才跳过 test」。
+3. 默认 batch 保持 1；`LAYA_TRAIN_BATCH_SIZE` 可调，但仅作预览。
+4. 新增 `runCount` / `decodedRows` / `batchSize` / `limitPerLabel` 度量；`--json` 状态日志改走 stderr。
+5. `LAYA_TRAIN_LIMIT=N` 按 split × 类别分层取 N 条，用于冒烟。
+
+解码行数（931 条语料、10 个候选）：
+
+| 口径 | 解码行数 |
+| --- | ---: |
+| 改造前完整运行 | 9310 |
+| 改造后完整运行 | 6910（−26%） |
+| 改造后 `--train-only` | 6310（−32%） |
+
+A/B 实测（120 条 train，同一 ONNX 模型，`relationship` 单题）：
+
+| 后端 | 逐行 1 行/次 | 批量 16 行/次 | 批量结果一致性 |
+| --- | ---: | ---: | --- |
+| WebGPU | 15.7~20.0s / 120 次 run | 10.4~11.9s / 8 次 run | **3/120 分类变化，最大概率差 0.103** |
+| CPU | 54.0s / 120 次 run | 71.5s / 8 次 run | 0 分类变化，最大差 0.0036 |
+
+`predictBatch(rows=1)` 与逐条 `predict` 完全一致（0 mismatch / 0 delta），说明差异来自
+batch 内 padding 到最长序列，不是 `formatAnswers` 的切片实现。
+
+端到端复核（`LAYA_TRAIN_LIMIT=3`，阶段 A 共 300 行）：**CPU 147.1s → WebGPU 47.4s，3.10×**，
+两次都选中 `production`，无分类差异。
+
+结论：**不要用大 batch 生成正式报告**。WebGPU 收益仅 1.3~1.9× 且改变答案，CPU 是负收益。
+真正无损的加速是换后端（CPU 450 ms/行 → WebGPU 131 ms/行，端到端 3.10×）和少解码 26~32% 的行。
 
 ## 8. 验证与回滚
 

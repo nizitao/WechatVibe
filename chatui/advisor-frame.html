@@ -5,6 +5,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none';">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Advisor Frame</title>
+  <link rel="stylesheet" href="theme-accent.css">
   <link rel="stylesheet" href="advisor.css">
   <link rel="stylesheet" href="advisor-timeline.css">
 </head>
@@ -53,14 +54,6 @@
             <span id="historyLabel">历史</span>
           </button>
           <div class="advisor-history-menu" id="historyMenu" role="menu" aria-label="历史会话" hidden></div>
-        </div>
-        <div class="advisor-model-control">
-          <button type="button" class="advisor-model-chip" id="btnModelMenu" aria-expanded="false" aria-controls="modelMenu"
-            aria-haspopup="menu" title="选择聊天助手使用的模型">
-            <span class="advisor-model-label" id="modelName" aria-live="polite">模型</span>
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-          </button>
-          <div class="advisor-model-menu" id="modelMenu" role="menu" aria-label="聊天助手模型" hidden></div>
         </div>
       </div>
       <div class="advisor-send-group">

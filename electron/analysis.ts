@@ -42,8 +42,9 @@ import { GENERAL_LABEL_SCHEMA, generalIntentQuestion, generalIntentScores } from
 import { fineMessageInsight, fineMessageQuestions, generateFineMessageInsight } from "./local-message-insights";
 import { groundedIntentWithContext, type GroundedIntent } from "./laya/grounded-intent";
 import { classifyNextReply, REPLY_FORECAST_QUESTION, type ReplyForecastCandidate, type ForecastBudget } from "./laya/forecast";
-import { MBTI_QUESTION_VERSION, PERSONALITY_QUESTIONS, personalityEvidenceFromAnswers, type PersonalityEvidence } from "./laya/personality";
-import { RELATIONSHIP_NB_VERSION, relationshipTextProbabilities } from "./laya/relationship-nb";
+import { MBTI_LINEAR_VERSION, mbtiEvidenceForText } from "./laya/mbti-linear";
+import { MBTI_QUESTION_VERSION, PERSONALITY_QUESTIONS, type PersonalityEvidence } from "./laya/personality";
+import { RELATIONSHIP_LINEAR_VERSION, relationshipTextProbabilities } from "./laya/relationship-linear";
 import { STYLE_QUESTIONS, styleEvidenceFromAnswers } from "./laya/style";
 import {
   AFFINITY_CALIBRATION,
@@ -91,7 +92,7 @@ const MAX_PORTRAIT_CONTEXT_TOKENS = 40;
 const MAX_CACHE_ENTRIES = 5000;
 // This value keys saved portrait progress. Keep it stable for the generic-v4 label rollout;
 // per-message labelSchema selects which fine results need an individual refresh.
-export const ANALYSIS_VERSION = `${CATALOG_VERSION}+routing-v4-style-v1+${MBTI_QUESTION_VERSION}+message-state-v2+expression-route-v2+social-intent-route-v2+${RELATIONSHIP_QUESTION_VERSION}+${RELATIONSHIP_NB_VERSION}+${AFFINITY_CALIBRATION.version}`;
+export const ANALYSIS_VERSION = `${CATALOG_VERSION}+routing-v4-style-v1+${MBTI_QUESTION_VERSION}+message-state-v2+expression-route-v2+social-intent-route-v2+${RELATIONSHIP_QUESTION_VERSION}+${RELATIONSHIP_LINEAR_VERSION}+${MBTI_LINEAR_VERSION}+${AFFINITY_CALIBRATION.version}`;
 
 const clamp = (value: number, min: number, max: number): number =>
   value < min ? min : value > max ? max : value;
@@ -304,7 +305,8 @@ function inspectModelFiles(dir: string): FilesInspection {
 }
 
 function readyStatus(): ModelStatus {
-  const runtime = loaded?.runner.provider === "webgpu" ? "WebGPU" : "CPU，4 线程";
+  const runtime = loaded?.runner.provider === "webgpu"
+    ? "WebGPU" : `CPU，${loaded?.runner.intraOpThreads ?? 4} 线程`;
   return {
     state: "ready",
     progress: 1,
@@ -369,6 +371,8 @@ async function ensureModel(): Promise<LoadedModel> {
       loadProgress = 0.1;
       const runner = await NodeOnnxRunner.create(path.join(dir, MODEL_FILES.model), {
         executionProvider: requestedRuntimeProvider === "cpu" ? "cpu" : "auto",
+        // Benchmark CPU intra-op thread counts once per model/runtime, then reuse the winner.
+        adaptiveThreads: true,
       });
       if (myGeneration !== generation) {
         await runner.dispose().catch(() => {});
@@ -651,7 +655,7 @@ async function classifyMessage(engine: AnalysisEngine, state: State, side: Messa
     styleEvidence: side === "other" ? styleEvidenceFromAnswers(prediction.answers) : null,
     relationship: side === "other"
       ? relationshipScoresForText(targetText, toLabelScores(prediction.answers.relationship)) : [],
-    personalityEvidence: side === "other" ? personalityEvidenceFromAnswers(prediction.answers) : null,
+    personalityEvidence: side === "other" ? mbtiEvidenceForText(targetText) : null,
   };
 }
 

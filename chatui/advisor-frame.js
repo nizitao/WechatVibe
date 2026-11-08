@@ -3,6 +3,7 @@
 (function () {
   const object = value => value !== null && typeof value === "object" && !Array.isArray(value);
   const text = (value, limit) => typeof value === "string" && value.length <= limit;
+  const ACCENTS = ["green", "blue", "yellow", "red"];
   const terminal = new Set(["done", "error", "stopped", "cancelled"]);
   const byId = id => document.getElementById(id);
   const agentName = byId("agentName"), agentMenu = byId("agentMenu"), menuButton = byId("btnAgentMenu");
@@ -467,8 +468,8 @@
   function validPayload(type, payload) {
     if (!object(payload)) return false;
     const permitted = {
-      ADVISOR_INIT: ["activeAgentId", "enabledTemplates", "thread", "draft", "catalogReady", "engineState", "theme", "run"],
-      ADVISOR_THEME: ["theme"], ADVISOR_SET_TEMPLATES: ["enabledTemplates", "activeAgentId", "catalogReady", "engineState"],
+      ADVISOR_INIT: ["activeAgentId", "enabledTemplates", "thread", "draft", "catalogReady", "engineState", "theme", "accent", "run"],
+      ADVISOR_THEME: ["theme", "accent"], ADVISOR_SET_TEMPLATES: ["enabledTemplates", "activeAgentId", "catalogReady", "engineState"],
       ADVISOR_SET_THREAD: ["thread", "run", "agentId", "draft"],
       ADVISOR_STREAM_UPDATE: ["threadId", "run", "messages"],
       ADVISOR_PROBLEM: ["error", "retryKind"], ADVISOR_SUBMIT_STATE: ["pending"], ADVISOR_STOP_STATE: ["pending"],
@@ -490,7 +491,11 @@
     }
     if (type === "ADVISOR_STREAM_UPDATE" && (!text(payload.threadId, 240) || !Array.isArray(payload.messages) ||
       payload.messages.length > 200 || !payload.messages.every(validMessage) || !validRun(payload.run))) return false;
-    if (["ADVISOR_INIT", "ADVISOR_THEME"].includes(type) && !["light", "dark"].includes(payload.theme)) return false;
+    if (["ADVISOR_INIT", "ADVISOR_THEME"].includes(type)) {
+      if (!["light", "dark"].includes(payload.theme)) return false;
+      // 旧版主窗口的消息没有 accent，缺省回落绿色。
+      if (payload.accent !== undefined && !ACCENTS.includes(payload.accent)) return false;
+    }
     if (type === "ADVISOR_PROBLEM" && (!text(payload.error, 20000) || !["send", "poll", "load", "catalog"].includes(payload.retryKind))) return false;
     if (["ADVISOR_SUBMIT_STATE", "ADVISOR_STOP_STATE"].includes(type) && typeof payload.pending !== "boolean") return false;
     if (type === "ADVISOR_COPY_RESULT" && typeof payload.copied !== "boolean") return false;
@@ -598,6 +603,7 @@
       sessionNonce = data.nonce; scope = data.scope; templates = data.payload.enabledTemplates;
       catalogReady = data.payload.catalogReady; engineState = data.payload.engineState;
       document.body.className = `advisor-frame-body theme-${data.payload.theme}`;
+      document.body.dataset.themeAccent = ACCENTS.includes(data.payload.accent) ? data.payload.accent : "green";
       renderTemplates(); renderThread(data.payload.thread, data.payload.run, data.payload.draft);
       sendToParent("ADVISOR_FRAME_READY"); return;
     }
@@ -624,6 +630,7 @@
     else if (data.type === "ADVISOR_THEME") {
       document.body.classList.toggle("theme-light", payload.theme === "light");
       document.body.classList.toggle("theme-dark", payload.theme === "dark");
+      document.body.dataset.themeAccent = ACCENTS.includes(payload.accent) ? payload.accent : "green";
     }
     else if (data.type === "ADVISOR_PROBLEM") {
       problem = payload.error; retryKind = payload.retryKind;

@@ -1,4 +1,4 @@
-// Contract checks for the trained char-ngram relationship classifier.
+// Contract checks for the trained linear relationship classifier.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -6,23 +6,33 @@ import path from "node:path";
 import { it } from "node:test";
 
 import {
-  RELATIONSHIP_NB_LABELS,
-  RELATIONSHIP_NB_VERSION,
+  RELATIONSHIP_LINEAR_LABELS,
+  RELATIONSHIP_LINEAR_VERSION,
   relationshipTextProbabilities,
-} from "../electron/laya/relationship-nb";
+} from "../electron/laya/relationship-linear";
 
 const model = JSON.parse(readFileSync(
-  path.resolve("electron/laya/relationship-nb-model.json"), "utf8")) as {
-  version: string; corpusSha256: string; temperature: number;
+  path.resolve("electron/laya/relationship-linear-model.json"), "utf8")) as {
+  version: string; corpusSha256: string; temperature: number; features: string;
+  testAccuracy: number; weights: Record<string, number[]>;
+};
+const report = JSON.parse(readFileSync(
+  path.resolve("docs/laya-relationship-linear-report.json"), "utf8")) as {
+  test: { accuracy: number }; version: string; passed: boolean;
 };
 
 it("ships a model trained from the current corpus", () => {
   const digest = createHash("sha256")
     .update(readFileSync(path.resolve("tests/fixtures/laya-affinity-corpus.jsonl")))
     .digest("hex");
-  assert.equal(model.corpusSha256, digest, "corpus changed; rerun scripts/train-relationship-nb.py");
-  assert.equal(RELATIONSHIP_NB_VERSION, model.version);
+  assert.equal(model.corpusSha256, digest,
+    "corpus changed; rerun scripts/train-relationship-linear.py");
+  assert.equal(RELATIONSHIP_LINEAR_VERSION, model.version);
+  assert.equal(report.version, model.version);
+  assert.equal(report.passed, true);
+  assert.equal(model.features, "boundary-unicode-char-ngram-1-4-binary");
   assert.ok(model.temperature > 0 && Number.isFinite(model.temperature));
+  assert.ok(Object.keys(model.weights).length > 1000);
 });
 
 it("holds the held-out accuracy gate through the shipped TypeScript path", () => {
@@ -30,6 +40,7 @@ it("holds the held-out accuracy gate through the shipped TypeScript path", () =>
     .trim().split(/\r?\n/u).map((line) => JSON.parse(line) as {
       text: string; label: string; split: string;
     }).filter((row) => row.split === "test");
+  assert.equal(rows.length, 300);
   let correct = 0;
   for (const row of rows) {
     const best = Object.entries(relationshipTextProbabilities(row.text))
@@ -38,6 +49,9 @@ it("holds the held-out accuracy gate through the shipped TypeScript path", () =>
   }
   const accuracy = correct / rows.length;
   assert.ok(accuracy >= 0.9, `TS model accuracy ${accuracy} below 90%`);
+  assert.ok(Math.abs(accuracy - model.testAccuracy) < 1e-9,
+    `Python/TypeScript predictions diverged: ${accuracy} vs ${model.testAccuracy}`);
+  assert.ok(Math.abs(accuracy - report.test.accuracy) < 1e-9);
 });
 
 it("returns normalized probabilities and separates representative relationship signals", () => {
@@ -50,7 +64,7 @@ it("returns normalized probabilities and separates representative relationship s
   ];
   for (const [text, expected] of cases) {
     const probabilities = relationshipTextProbabilities(text);
-    assert.deepEqual(Object.keys(probabilities).sort(), [...RELATIONSHIP_NB_LABELS].sort());
+    assert.deepEqual(Object.keys(probabilities).sort(), [...RELATIONSHIP_LINEAR_LABELS].sort());
     const total = Object.values(probabilities).reduce((sum, value) => sum + value, 0);
     assert.ok(Math.abs(total - 1) < 1e-9, `${text}: ${total}`);
     const best = Object.entries(probabilities).sort((a, b) => b[1] - a[1])[0]![0];

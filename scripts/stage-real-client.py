@@ -50,7 +50,8 @@ LAYA = (
     "agent.ts", "calibration.ts", "catalog.ts", "context.ts", "expression.ts",
     "forecast.ts", "general-intent.ts", "grounded-intent.ts", "intent-context.ts", "index.ts", "LICENSE",
     "message-batch.ts", "NOTICE", "options.ts", "personality.ts", "prompt.ts",
-    "pyjson.ts", "questions.ts", "relationship-nb.ts", "relationship-nb-model.json",
+    "pyjson.ts", "questions.ts", "mbti-linear.ts", "mbti-linear-model.json",
+    "relationship-linear.ts", "relationship-linear-model.json", "thread-tuning.ts",
     "runner.ts", "scoring.ts", "social-cues.ts",
     "social-intents.ts", "style.ts", "tokenizer.ts", "types.ts",
 )

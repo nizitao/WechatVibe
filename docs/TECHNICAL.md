@@ -374,7 +374,8 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | 路径 | 请求体 | 说明 |
 | --- | --- | --- |
 | `/api/control/shutdown` | 无 body（`Content-Length: 0`）+ 头 `X-WechatVibe-Control-Token` | 202 `{stopping:true}`；唯一需要令牌的端点 |
-| `/api/analyze` | `{account,user,mode:recent\|history\|incremental,limit,targetIds?}` | 202 `{job}`；recent ≤80、history ≤5000 或 `"all"`；`targetIds` 只允许配 `mode:"recent"`，只分析列出的消息（见 §6.2 / §12.14） |
+| `/api/analyze` | `{account,user,mode:recent\|history\|incremental,limit,targetIds?,background?}` | 202 `{job}`；recent ≤80、history ≤5000 或 `"all"`；`targetIds` 只允许配 `mode:"recent"`，只分析列出的消息（见 §6.2 / §12.14）；`background:true` 标记该任务由后台扫描发起，仅这类任务能被「关闭后台分析」停掉 |
+| `/api/analysis-cancel` | `{account,user}` 或 `{account,allBackground:true}` | 停止该会话已排队或正在跑的分析任务（本地 worker 与 API 两条链都覆盖）。只把会话移出分析名单只影响**后续**轮次，所以侧边栏取消必须调这里；`allBackground` 只停后台扫描发起的任务，手动点开的分析不受影响。已保存的结果保留，再次请求从存档游标续跑 |
 | `/api/messages/batch` | `{account, users[1..64]}` | 多会话窗口 |
 | `/api/predict-reply` | `{user,account,requestId,draft≤2000,expectedLastMessageId?,member?}` | 续写预测；错误 409/422 |
 | `/api/runtime` | `{provider}` | 切 CPU/GPU |
@@ -385,7 +386,7 @@ shared/*.ts（跨层契约，仅被 TS 侧 import；前端未复用，见 §11.3
 | `/api/api-workers` | `{workers?:1..4}` | 落盘 `api-workers.json` |
 | `/api/analysis-cache/clear` / `/resume` | `{account,sourceId}` | 清/恢复某来源缓存 |
 | `/api/analysis-target/forget` | `{account,user,sourceId,messageId}` | 只忘掉这一条的已存结果（右键「重新算」的前半步）；不取消任务、不动 progress/画像 |
-| `/api/model-insights` | `{account,user,limit≤500,targetIds?,around?}` | 202 任务 |
+| `/api/model-insights` | `{account,user,limit≤500,targetIds?,around?,background?}` | 202 任务；`background:true` 表示由后台扫描发起 |
 | `/api/model-portrait` | `{account,user,member?,refreshAxes?}` | 202 任务（先注册 job 再准备，全历史扫描可能数分钟） |
 | `/api/model-guidance` | `{account,user,member?,scenario,analyzeSelf,feedback}` | 202 任务 |
 | `/api/model-source/list` \| `test` \| `activate` \| `clear-key` | `{protocol,baseUrl,apiKey,model?,contextTokens?}` | 模型发现/探测/启用/清 key |
@@ -824,18 +825,22 @@ MIN_AXIS_MARGIN          = 0.2   # 两侧份额差值下限
 附加信息：`basis:"chat-inference"`、`theory:"MBTI preferences"`、每轴证据数、`sources`（myersbriggs.org / themyersbriggs.com）。
 **群整体不生成个人 MBTI**；群成员画像正常生成。
 
-模型侧（`personality.personalityEvidenceFromAnswers`）：先过 **scope 门槛**（"sender states a recurring personal preference" 概率 > "no enduring preference stated"），否则整体弃权；每维返回 `{left, right, insufficient}` 三元分布，**不产出 MBTI 字母**。
+模型侧（**本地分析链**）：`electron/laya/mbti-linear.ts` 的 4 头线性分类器直接对目标文本产出
+`{left, right, insufficient}` 三元分布，经 `mbtiEvidenceForText` 的弃权闸后写入
+`PersonalityEvidence`；**不产出 MBTI 字母**。模型由 `scripts/train-mbti-linear.py` 训练，
+`MBTI_LINEAR_VERSION` 进入 `ANALYSIS_VERSION`，模型更新即让本地画像缓存重建。
+详见 `docs/laya-mbti-linear.md`。
 
-**两套题面（有意设计，非重复代码）**：
+**API 画像链仍走 LLM 题面**：`api-portrait-classifier.ts` 保留同一份 `PERSONALITY_QUESTIONS`
+（4 题），由 `personalityEvidenceFromAnswers` 做数值转换。这与关系模型的架构一致
+（本地用训练模型、API 用固定题面）。`API_PORTRAIT_CLASSIFIER_VERSION` 只含
+`MBTI_QUESTION_VERSION`、不含 `MBTI_LINEAR_VERSION`，因此本地模型更新不会触发 API 画像重建。
 
-| | `PERSONALITY_QUESTIONS`（本地 Laya） | `API_PERSONALITY_QUESTIONS`（API 分类器） |
-| --- | --- | --- |
-| 版本串 | `MBTI_QUESTION_VERSION = "mbti-chat-evidence-v3"` | `API_MBTI_QUESTION_VERSION = "mbti-api-context-v2"` |
-| scope 题判定 | 仅接受「本人明确说出偏好」 | 「本人明确说出，**或在整批消息里反复表现出同一倾向**」；判定的是**存在性**——任一轴有反复模式即选是 |
-| 选项标签 | `[不足, 左极, 右极]` | **完全相同**（因此共享转换函数与已落库的 evidence 契约不变） |
-
-原因：聊天记录里极少出现教科书式的自我描述，坚持「必须明说」会让所有轴永久未定。API 题面每轴都指明要看什么（谁发起话题、自愿带来什么信息、争执时给出的理由、计划如何收口），并明确排除角色责任、话题类型与单次情绪。
-**版本隔离**：`API_MBTI_QUESTION_VERSION` 只进入 `API_PORTRAIT_CLASSIFIER_VERSION`，因此版本变化只会让 **API 画像**标记为 `needsRebuild`，**本地 Laya 画像缓存不受影响**。
+两条链共享同一 wire 契约 `PersonalityEvidence` 与 Python 累积/聚合
+（`profile_state.py` / `backend_contracts.py`），上述差异不影响落库或推导门槛。
+聊天记录里极少有教科书式自我描述，模型与题面都使用 `insufficient` 弃权选项，
+避免把单次情绪或事务消息当成偏好。`mbti_scope` 题已移除，不再有全局 scope 门槛；
+每轴独立判定。
 
 ### 7.6 雷达六维与摘要
 
@@ -963,7 +968,7 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 
 ### 8.3 关键常量与阈值
 
-**本地推理**：`BATCH_SIZE=8`、`MAX_CACHE_ENTRIES=5000`、`DEFAULT_INTRA_OP_THREADS=4`、`interOpNumThreads=1`、`executionMode=sequential`、`graphOptimizationLevel="all"`、`MAX_PORTRAIT_CONTEXT_CODEPOINTS=120`、`MAX_PORTRAIT_CONTEXT_TOKENS=40`、`MAX_OBSERVED_CHARS=4000`、`FINE_HINT_MESSAGES=3`、`FINE_HINT_CODEPOINTS=240`、`DEFAULT_CONTEXT_WINDOW=6`、`MAX_FORECAST_CONTEXT_MESSAGES=8`、`MAX_OPTIONS=10/MIN_OPTIONS=8`、`ENCODE_CACHE_LIMIT=256`、`ENCODE_CACHE_MAX_IDS=4096`、每选项 48 token / head 下限 8 / 选项下限 4。
+**本地推理**：`BATCH_SIZE=8`、`MAX_CACHE_ENTRIES=5000`、`DEFAULT_INTRA_OP_THREADS=4`（CPU 自适应可覆盖，见 §10.2）、`interOpNumThreads=1`、`executionMode=sequential`、`graphOptimizationLevel="all"`、`MAX_PORTRAIT_CONTEXT_CODEPOINTS=120`、`MAX_PORTRAIT_CONTEXT_TOKENS=40`、`MAX_OBSERVED_CHARS=4000`、`FINE_HINT_MESSAGES=3`、`FINE_HINT_CODEPOINTS=240`、`DEFAULT_CONTEXT_WINDOW=6`、`MAX_FORECAST_CONTEXT_MESSAGES=8`、`MAX_OPTIONS=10/MIN_OPTIONS=8`、`ENCODE_CACHE_LIMIT=256`、`ENCODE_CACHE_MAX_IDS=4096`、每选项 48 token / head 下限 8 / 选项下限 4。
 
 **网络**：`MAX_RESPONSE_BYTES=2 MiB`、`MAX_PROMPT_BYTES=3 MiB`、`MAX_MODELS=200`、`LIST_TIMEOUT_MS=12 s`、生成请求默认不设超时（交给 provider）、所有 SDK `maxRetries=0`、同源校验 + `redirect:"error"`。
 
@@ -1030,7 +1035,8 @@ chatui/data/analysis-catalog.json（构建期被 electron/*.ts 静态 import，�
 ### 10.2 性能
 
 - 本地推理并发恒为 1；14 题 OTHER 消息还要多次 detail 前向。实测（同一进程内交替，28 条中文消息 / 172 次 session.run）：**WebGPU ≈ 143 ms/次（24.8 s 总计），CPU ≈ 611 ms/次（105.3 s 总计），WebGPU 快约 4.3 倍**。CPU 与 WebGPU 输出 affinity 存在 1 个点差异（36 vs 35），属正常浮点差异。剩余提速手段只有 int8 量化模型。
-- WebGPU EP 会忽略 `intraOpNumThreads`，调线程数对默认路径无影响。
+- WebGPU EP 会忽略 `intraOpNumThreads`。CPU 路径的线程数由 `electron/laya/thread-tuning.ts` 自适应：默认按 `min(8, cores-1)` 零开销选取；`npm run benchmark:laya-threads` 做一次性真实形状校准，结果缓存到 `.local/real-client-runtime/laya-threads.json`，之后启动直接命中（约 3 s，无测速）。状态栏显示实际线程数，不再是硬编码「4 线程」。
+- **不要把线程测速放进启动路径**：真实形状（8 行 × 256 token）单次 CPU 前向约 6–9 s，两档校准需 56–86 s；缩小到 2×64 虽降到亚秒级，却会反转 4-vs-8 的结论。三次同机校准结果分别为 8 快 14% / 4 快 42% / 8 快 9.5%，噪声大于真实差异。因此判定规则把 <20% 的差距视为平手并保留较少线程，三次一致收敛到 4。
 - 切换 provider 时新旧两个 ONNX session 会短暂共存 → 峰值内存翻倍；模型本身约 647 MB/进程。
 - 前端 `renderMessages` 的 appendOnly 判定是 O(n²)；画像卡片每次全量 `replaceChildren` 重建 SVG（靠 signature memo 缓解）；无虚拟滚动。
 - 常驻轮询：消息 4 s、会话 15 s、全账号分析 20 s（→10 min 间隔）、总览 8 s（→60 s）、worker 设置 9 s、API 标签 0.4-2 s 退避、画像/建议 2.2 s；`document.hidden` 是唯一节流手段。

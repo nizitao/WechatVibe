@@ -174,6 +174,17 @@
 Python 侧注意 `scripts/run-python-tests.py` 是**串行遇错即停**，要用 `--only` 逐个文件确认其余文件真的跑过。
 v1.2.0 上那份原始补丁仍原样存档在 [`selfuse/v1.2.0`](https://github.com/silicon-sbt/WechatVibe/tree/selfuse/v1.2.0) 分支，仅作历史对照，不再维护。
 
+### 十四、可自定义的主题色
+
+设置 → 通用设置里多了一行「主题色」：绿（默认）、蓝、黄、红四个色点，外加「恢复默认」。点色点只改 `body[data-theme-accent]`，按钮、链接、高亮、导航选中态、开关和消息气泡立刻换色，无需刷新；选择写进既有的 `real-ui-settings-1`，旧配置缺这个键时按绿色处理，手改坏了也回落绿色。
+
+- 颜色不是逐个组件改的，而是抽成 `--theme-accent` / `-strong` / `-deep` / `-rgb` / `-contrast` 五个令牌，全表 170 多处引用，原来散落的 `#07c160`、`#398da0`、`rgba(7,193,96,…)` 都已换成 `var()`。
+- 令牌与 4 色 × 深浅共 8 组预设放在共享的 `chatui/theme-accent.css`，主窗口 `index.html` 和沙箱窗口 `advisor-frame.html` 都引用它；沙箱窗口刻意不加载 `style.css`，否则会破坏它自己的灰阶配色。
+- 历史别名 `--color-green` 必须在 `body` 上重新声明：自定义属性在声明处解析，只写在 `:root` 会固化成默认绿，`body` 上的预设就影响不到它。气泡同理，用 `color-mix()` 和当前底色混合，日夜两套自动适配。
+- 助手仓库（`advisor.css` / `advisor-timeline.css`）的按钮、 badge、技能标签、开关、启用卡片描边、历史会话选中态、引用块边框也全部走令牌；主按钮文字用 `--theme-accent-contrast`。沙箱窗口不共享 DOM，主题色由 `ADVISOR_INIT` / `ADVISOR_THEME` 消息带上 accent，主窗口 `body` 的 `data-theme-accent` 变化也会通过 MutationObserver 推过去；旧消息没有该字段时回落绿色。
+- 深浅模式各有独立色值（浅色下绿色 `#2a8a5c`、黄色 `#a97b08` 保证白底可读），黄色等亮色配深色文字（`--theme-accent-contrast`）。
+- 回归：`tests/theme-accent.test.cjs`（预设齐全、令牌齐全、四个样式表禁止再写死主题色、助手仓库与沙箱窗口接线、默认值/校验/持久化/恢复默认）。
+
 ## 可以单独用的修复分支（基于上游 main，不含自用改动）
 
 这两个分支从 `origin/main`（上游）切出，各自只带一个提交、**没有夹带本 fork 的自用改动**，可以直接构建来救急；正式合并仍走上游 PR。
