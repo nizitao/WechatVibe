@@ -1985,7 +1985,10 @@ function historyAnchor(fromEnd = false) {
   const node = fromEnd ? visible.at(-1) : visible[0];
   return node ? { id: node.dataset.messageId, top: node.getBoundingClientRect().top - bounds.top } : null;
 }
-function maybeAutoLoadOlder(container) {
+function maybeAutoLoadOlder(container, previousTop) {
+  // Buttons appearing/disappearing can move the scroll position without the user scrolling.
+  // Those events must not drag the view into history mode and stop the live message poll.
+  if (previousTop !== undefined && previousTop <= container.scrollTop + 1) return;
   if (container.scrollTop > 80 || chatState.historyController || !chatState.currentUser) return;
   if (!chatState.messages[0]?.historyCursor) return;
   if (chatState.historyState?.hasMoreBefore === false) return;
@@ -2776,6 +2779,24 @@ async function analyzeRecent(user, token, signal, signature, limit, window, targ
     }
   }
 }
+const MESSAGE_LOAD_STUCK_MS = 15000;
+function releaseMessagePending(request) {
+  // A newer load owns the flag now; an older one must not clear it.
+  if (request !== chatState.messageRequest) return false;
+  chatState.messagePending = false;
+  chatState.messagePendingSince = 0;
+  return true;
+}
+function recoverStuckMessageLoad(now = Date.now()) {
+  // Any action that bumps generation/messageRequest without replacing the controller can
+  // leave an in-flight request unresolved. The 4s poll would then return early for ever.
+  if (!chatState.messagePending || !chatState.messagePendingSince ||
+      now - chatState.messagePendingSince < MESSAGE_LOAD_STUCK_MS) return false;
+  chatState.messagePending = false;
+  chatState.messagePendingSince = 0;
+  console.warn("chat message load stalled; restarting the poll");
+  return true;
+}
 async function loadMessages(token = chatState.generation, poll = false, refresh = false) {
   if (!chatState.currentUser || token !== chatState.generation || chatState.historyState) return;
   if (chatState.messagePending) {
@@ -2783,6 +2804,7 @@ async function loadMessages(token = chatState.generation, poll = false, refresh 
     return;
   }
   chatState.messagePending = true;
+  chatState.messagePendingSince = Date.now();
   const request = ++chatState.messageRequest;
   const windowSerial = ++chatState.windowRequestSerial;
   const user = chatState.currentUser;
@@ -2821,12 +2843,11 @@ async function loadMessages(token = chatState.generation, poll = false, refresh 
       else text("stripStatusText", "消息读取失败，请重试");
     }
   } finally {
-    if (token === chatState.generation && request === chatState.messageRequest) {
-      chatState.messagePending = false;
-      if (chatState.messageRefreshQueued) {
-        chatState.messageRefreshQueued = false;
-        void loadMessages(token, true);
-      }
+    // Do not gate this on `token === chatState.generation`: another action may legitimately
+    // advance the generation while this load is in flight, and the flag still belongs to us.
+    if (releaseMessagePending(request) && chatState.messageRefreshQueued) {
+      chatState.messageRefreshQueued = false;
+      void loadMessages(chatState.generation, true);
     }
   }
 }
@@ -4373,6 +4394,9 @@ function cancelGuidancePoll() {
   clearTimeout(portraitState.guidancePollTimer);
   portraitState.guidancePollTimer = null;
   portraitState.guidanceLoadingKey = null;
+  // Guidance owns its controller: aborting it must never cancel chat/analysis/portrait loads.
+  portraitState.guidanceController?.abort();
+  portraitState.guidanceController = null;
 }
 async function loadGuidance() {
   if (chatState.view !== "chat" || !chatState.currentUser || !chatState.currentAccount ||
@@ -4385,10 +4409,13 @@ async function loadGuidance() {
   if (portraitState.guidanceLoadingKey === loadingKey) return;
   portraitState.guidanceLoadingKey = loadingKey;
   const token = ++portraitState.guidanceRequest;
+  portraitState.guidanceController?.abort();
+  const controller = new AbortController();
+  portraitState.guidanceController = controller;
   try {
     const data = await api("/api/model-guidance?" + new URLSearchParams({ user, replyOptions: "true",
       agentId, agentRevision: String(agentRevision) }),
-      {}, chatState.controller?.signal, true);
+      {}, controller.signal, true);
     if (token !== portraitState.guidanceRequest || loadingKey !== guidanceScopeKey()) return;
     if (!data || data.account !== account || data.sourceId !== sourceId ||
         data.subject !== user || data.version !== GUIDANCE_VERSION || data.agentId !== agentId ||
@@ -4405,6 +4432,7 @@ async function loadGuidance() {
       syncGuidanceAction();
     }
   } finally {
+    if (portraitState.guidanceController === controller) portraitState.guidanceController = null;
     if (token === portraitState.guidanceRequest && portraitState.guidanceLoadingKey === loadingKey)
       portraitState.guidanceLoadingKey = null;
   }
@@ -6362,11 +6390,12 @@ async function copyText(value) {
 byId("searchInput").addEventListener("input", renderSessions);
 byId("chatMessages").addEventListener("scroll", event => {
   const container = event.currentTarget;
+  const previousTop = chatState.lastChatScrollTop;
   if (chatState.historyState) {
     chatState.followLatest = false;
     chatState.lastChatScrollTop = container.scrollTop;
     updateHistoryNavigation();
-    maybeAutoLoadOlder(container);
+    maybeAutoLoadOlder(container, previousTop);
     clearTimeout(labelState.apiInsightViewportTimer);
     labelState.apiInsightViewportTimer = setTimeout(() => ensureApiInsights(), 250);
     return;
@@ -6375,7 +6404,7 @@ byId("chatMessages").addEventListener("scroll", event => {
   else if (container.scrollTop < chatState.lastChatScrollTop - 1) chatState.followLatest = false;
   chatState.lastChatScrollTop = container.scrollTop;
   updateHistoryNavigation();
-  maybeAutoLoadOlder(container);
+  maybeAutoLoadOlder(container, previousTop);
   if (settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api" && settingsState.settings.intent) {
     clearTimeout(labelState.apiInsightViewportTimer);
     labelState.apiInsightViewportTimer = setTimeout(() => ensureApiInsights(), 250);
@@ -7338,7 +7367,11 @@ window.addEventListener("wechatvibe-service-restored", () => {
   }
 });
 if (!updateValidationMode) {
-  setInterval(() => { if (updateCommitReady && chatState.currentUser && !document.hidden) loadMessages(chatState.generation, true); }, 4000);
+  setInterval(() => {
+  if (!updateCommitReady || !chatState.currentUser || document.hidden) return;
+  recoverStuckMessageLoad();
+  loadMessages(chatState.generation, true);
+}, 4000);
   setInterval(() => { if (updateCommitReady && !document.hidden) loadSessions(); }, 15000);
   setTimeout(() => { if (updateCommitReady) void backgroundAnalyzeAll(); }, 20000);
   setInterval(() => { if (updateCommitReady) void backgroundAnalyzeAll(); }, 600000);
