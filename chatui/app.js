@@ -124,7 +124,7 @@ chatState.conversationSelectionGeneration = 0;
 chatState.sessionCache = new Map();
 portraitState.profileCache = new Map();
 const sessionCacheMessageLimit = 80;
-const historyWindowLimit = 240;
+const historyWindowLimit = 600;  // ~7 pages of 80 before the newer end is paged back in
 chatState.historyState = null;
 chatState.historyRequest = 0;
 chatState.historyController = null;
@@ -252,6 +252,15 @@ function retryStartup() {
 }
 function sessionCacheKey(account, user) {
   return JSON.stringify([account, user]);
+}
+// Browsed history windows are kept per conversation: sessionCache is capped at 80 messages
+// for a reason (startup cost), but a user who scrolled up must not lose that work on switching.
+const historyWindowCache = new Map();
+function rememberHistoryWindow(account, user, messages, state) {
+  if (typeof historyWindowCache === "undefined" || !account || !user || !state) return;
+  historyWindowCache.set(sessionCacheKey(account, user), {
+    messages: messages.slice(0, historyWindowLimit), historyState: { ...state },
+  });
 }
 function sessionSummarySignature(session) {
   return JSON.stringify(session);
@@ -1976,6 +1985,13 @@ function historyAnchor(fromEnd = false) {
   const node = fromEnd ? visible.at(-1) : visible[0];
   return node ? { id: node.dataset.messageId, top: node.getBoundingClientRect().top - bounds.top } : null;
 }
+function maybeAutoLoadOlder(container) {
+  if (container.scrollTop > 80 || chatState.historyController || !chatState.currentUser) return;
+  if (!chatState.messages[0]?.historyCursor) return;
+  if (chatState.historyState?.hasMoreBefore === false) return;
+  if (!chatState.historyState && chatState.currentHasMoreBefore === false) return;
+  void loadOlderHistory();
+}
 function updateHistoryNavigation() {
   const firstCursor = chatState.messages[0]?.historyCursor;
   const state = chatState.historyState;
@@ -2053,10 +2069,11 @@ async function loadOlderHistory() {
     const anchor = historyAnchor();
     labelState.results = visibleResults({ ...labelState.results, ...(data.results || {}) }, next);
     chatState.historyState.beforeCursor = data.nextCursor || older[0]?.historyCursor || before;
-    chatState.historyState.hasMoreBefore = !!data.hasMoreBefore;
+    chatState.historyState.hasMoreBefore = !!data.hasMoreBefore && older.length > 0;
     chatState.historyState.hasMoreAfter ||= removedFromEnd > 0;
     chatState.historyState.notice = data.hasMoreBefore ? "" : "已到本机最早消息";
     if (older.length) renderMessages(next, null, anchor);
+    rememberHistoryWindow(account, user, next, chatState.historyState);
   } catch (error) {
     if (error.name !== "AbortError" && request === chatState.historyRequest && token === chatState.generation) chatState.historyState.error = "读取失败，请重试";
   } finally {
@@ -2879,6 +2896,12 @@ function switchSession(user, force = false) {
   byId("btnResetPortrait").disabled = byId("btnResetConversationAnalysis").disabled;
   byId("btnChatHistory").disabled = false;
   chatState.currentHasMoreBefore = typeof cached?.hasMoreBefore === "boolean" ? cached.hasMoreBefore : null;
+  const remembered = typeof historyWindowCache !== "undefined" ? historyWindowCache.get(cacheKey) : null;
+  if (remembered && Array.isArray(remembered.messages) && remembered.messages.length) {
+    cached.messages = remembered.messages;
+    chatState.historyState = { ...remembered.historyState };
+    chatState.currentHasMoreBefore = chatState.historyState.hasMoreBefore;
+  }
   chatState.messages = [];
   labelState.results = visibleResults(cached?.results || {}, cached?.messages || []);
   chatState.conversationMood = cached?.mood || null;
@@ -6343,6 +6366,7 @@ byId("chatMessages").addEventListener("scroll", event => {
     chatState.followLatest = false;
     chatState.lastChatScrollTop = container.scrollTop;
     updateHistoryNavigation();
+    maybeAutoLoadOlder(container);
     clearTimeout(labelState.apiInsightViewportTimer);
     labelState.apiInsightViewportTimer = setTimeout(() => ensureApiInsights(), 250);
     return;
@@ -6351,6 +6375,7 @@ byId("chatMessages").addEventListener("scroll", event => {
   else if (container.scrollTop < chatState.lastChatScrollTop - 1) chatState.followLatest = false;
   chatState.lastChatScrollTop = container.scrollTop;
   updateHistoryNavigation();
+  maybeAutoLoadOlder(container);
   if (settingsState.modelSourceResolved && settingsState.modelSourceSnapshot.mode === "api" && settingsState.settings.intent) {
     clearTimeout(labelState.apiInsightViewportTimer);
     labelState.apiInsightViewportTimer = setTimeout(() => ensureApiInsights(), 250);
